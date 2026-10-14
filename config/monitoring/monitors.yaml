@@ -1,0 +1,62 @@
+# Requires Prometheus Operator and a short-lived metrics-scrape-token Secret.
+# The gateway certificate/CA is reused for both authenticated HTTPS listeners.
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: codex-session-operator-manager
+  labels:
+    app.kubernetes.io/name: codex-session-operator
+    app.kubernetes.io/component: observability
+spec:
+  selector:
+    matchLabels:
+      control-plane: controller-manager
+      app.kubernetes.io/name: codex-session-operator
+  endpoints:
+  - port: https
+    scheme: https
+    path: /metrics
+    interval: 30s
+    scrapeTimeout: 10s
+    honorLabels: true
+    authorization:
+      type: Bearer
+      credentials:
+        name: metrics-scrape-token
+        key: token
+    tlsConfig:
+      serverName: codex-session-operator-gateway.codex-session-operator-system.svc
+      ca:
+        secret:
+          name: gateway-tls
+          key: ca.crt
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: codex-session-operator-gateway
+  labels:
+    app.kubernetes.io/name: codex-session-operator
+    app.kubernetes.io/component: observability
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/component: gateway
+  endpoints:
+  - port: metrics
+    scheme: https
+    path: /metrics
+    interval: 30s
+    scrapeTimeout: 10s
+    honorLabels: true
+    authorization:
+      type: Bearer
+      credentials:
+        name: metrics-scrape-token
+        key: token
+    tlsConfig:
+      serverName: codex-session-operator-gateway.codex-session-operator-system.svc
+      ca:
+        secret:
+          name: gateway-tls
+          key: ca.crt

@@ -1,0 +1,7 @@
+{
+  "route_id": "demo-investigation",
+  "work_id": "demo-incident-001",
+  "event_id": "restart-001",
+  "kind": "restart",
+  "text": "Start a fresh investigation using the same work identity."
+}

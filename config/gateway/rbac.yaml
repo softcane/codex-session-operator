@@ -1,0 +1,41 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: codex-session-operator-gateway
+  namespace: codex-session-operator-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: codex-session-operator-gateway
+rules:
+- apiGroups:
+  - agents.softcane.io
+  resources:
+  - sessions
+  - agents
+  - environments
+  - vaults
+  verbs:
+  - get
+  - list
+- apiGroups:
+  - agents.softcane.io
+  resources:
+  - sessions
+  verbs:
+  - create
+  - delete
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: codex-session-operator-gateway
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: codex-session-operator-gateway
+subjects:
+- kind: ServiceAccount
+  name: codex-session-operator-gateway
+  namespace: codex-session-operator-system

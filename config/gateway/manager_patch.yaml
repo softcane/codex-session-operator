@@ -1,0 +1,36 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: codex-session-operator-controller-manager
+  namespace: codex-session-operator-system
+spec:
+  template:
+    spec:
+      securityContext:
+        fsGroup: 65532
+        fsGroupChangePolicy: OnRootMismatch
+      containers:
+      - name: manager
+        env:
+        - name: GATEWAY_INTERNAL_URL
+          value: https://codex-session-operator-gateway.codex-session-operator-system.svc:8083
+        - name: GATEWAY_INTERNAL_TOKEN_FILE
+          value: /gateway-internal/token
+        - name: GATEWAY_INTERNAL_CA_FILE
+          value: /gateway-tls/ca.crt
+        volumeMounts:
+        - name: gateway-internal
+          mountPath: /gateway-internal
+          readOnly: true
+        - name: gateway-tls
+          mountPath: /gateway-tls
+          readOnly: true
+      volumes:
+      - name: gateway-internal
+        secret:
+          secretName: gateway-internal
+          defaultMode: 0440
+      - name: gateway-tls
+        secret:
+          secretName: gateway-tls
+          defaultMode: 0440

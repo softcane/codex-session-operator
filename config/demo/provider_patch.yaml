@@ -1,0 +1,30 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: codex-session-operator-controller-manager
+  namespace: codex-session-operator-system
+spec:
+  template:
+    spec:
+      containers:
+      - name: manager
+        env:
+        - name: OPENAI_BASE_URL
+          value: http://provider-fixture:8080/v1/
+        - name: OPENAI_AGENT_OWNER_SCOPE
+          value: demo/fixture
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: codex-session-operator-gateway
+  namespace: codex-session-operator-system
+spec:
+  template:
+    spec:
+      containers:
+      - name: gateway
+        args: [--gateway-database-insecure-local]
+        env:
+        - name: OPENAI_BASE_URL
+          value: http://provider-fixture:8080/v1/

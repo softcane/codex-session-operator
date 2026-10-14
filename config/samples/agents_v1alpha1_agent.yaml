@@ -1,0 +1,12 @@
+apiVersion: agents.softcane.io/v1alpha1
+kind: Agent
+metadata:
+  labels:
+    app.kubernetes.io/name: codex-session-operator
+    app.kubernetes.io/managed-by: kustomize
+  name: agent-sample
+spec:
+  model: gpt-6-luna
+  name: Session helper
+  instructions: Answer clearly and use the available environment tools.
+  deletionPolicy: Delete

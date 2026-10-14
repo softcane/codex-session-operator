@@ -1,0 +1,22 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: codex-session-operator-gateway
+  namespace: codex-session-operator-system
+spec:
+  template:
+    spec:
+      containers:
+      - name: gateway
+        env:
+        - name: WORK_ROUTES_FILE
+          value: /work-routes/routes.json
+        volumeMounts:
+        - name: work-routes
+          mountPath: /work-routes
+          readOnly: true
+      volumes:
+      - name: work-routes
+        configMap:
+          name: gateway-work-routes
+          defaultMode: 0444

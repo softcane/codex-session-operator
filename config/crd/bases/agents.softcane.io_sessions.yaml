@@ -1,0 +1,1142 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.22.0
+  name: sessions.agents.softcane.io
+spec:
+  group: agents.softcane.io
+  names:
+    kind: Session
+    listKind: SessionList
+    plural: sessions
+    singular: session
+  scope: Namespaced
+  versions:
+  - name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: Session is the Schema for the sessions API
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: spec defines the desired state of Session
+            properties:
+              agent:
+                description: Agent overrides saved Agent settings for this Session.
+                properties:
+                  clearTools:
+                    description: ClearTools sends an explicit null at creation.
+                    type: boolean
+                  instructions:
+                    maxLength: 65536
+                    type: string
+                  model:
+                    maxLength: 128
+                    minLength: 1
+                    type: string
+                  multiAgent:
+                    description: AgentMultiAgent controls subagent concurrency. Function
+                      tools cannot be used by subagents.
+                    properties:
+                      enabled:
+                        type: boolean
+                      maxConcurrentSubagents:
+                        format: int64
+                        maximum: 32
+                        minimum: 1
+                        type: integer
+                    required:
+                    - enabled
+                    type: object
+                  reasoning:
+                    description: AgentReasoning replaces the complete remote reasoning
+                      object.
+                    properties:
+                      effort:
+                        enum:
+                        - none
+                        - minimal
+                        - low
+                        - medium
+                        - high
+                        - xhigh
+                        - max
+                        type: string
+                      summary:
+                        enum:
+                        - concise
+                        - detailed
+                        - auto
+                        type: string
+                    type: object
+                  resetReasoning:
+                    type: boolean
+                  resetServiceTier:
+                    type: boolean
+                  serviceTier:
+                    enum:
+                    - auto
+                    - default
+                    - flex
+                    - priority
+                    - fast
+                    type: string
+                  text:
+                    description: AgentText replaces the complete remote output configuration.
+                    properties:
+                      format:
+                        description: AgentTextFormat is a discriminated text/JSON
+                          schema union.
+                        properties:
+                          schema:
+                            description: Schema is an object containing a JSON Schema,
+                              not arbitrary Agent configuration.
+                            type: object
+                            x-kubernetes-preserve-unknown-fields: true
+                          type:
+                            enum:
+                            - text
+                            - json_schema
+                            type: string
+                        required:
+                        - type
+                        type: object
+                        x-kubernetes-validations:
+                        - message: json_schema requires schema; text forbids schema
+                          rule: (self.type == 'json_schema') == has(self.schema)
+                      verbosity:
+                        enum:
+                        - low
+                        - medium
+                        - high
+                        type: string
+                    type: object
+                  tools:
+                    items:
+                      description: AgentTool is a discriminated union; fields from
+                        other variants are forbidden.
+                      properties:
+                        computerUse:
+                          description: AgentComputerUse requires hosted desktops and
+                            gateway approval handling.
+                          properties:
+                            includeScreenshots:
+                              type: boolean
+                          type: object
+                        function:
+                          description: AgentFunction declares an application tool;
+                            execution belongs to the gateway.
+                          properties:
+                            deferLoading:
+                              type: boolean
+                            description:
+                              maxLength: 8192
+                              type: string
+                            name:
+                              pattern: ^[A-Za-z0-9_-]{1,64}$
+                              type: string
+                            parameters:
+                              type: object
+                              x-kubernetes-preserve-unknown-fields: true
+                          required:
+                          - description
+                          - name
+                          - parameters
+                          type: object
+                        mcp:
+                          description: AgentMCP declares a credential-free MCP server.
+                          properties:
+                            allowedTools:
+                              items:
+                                type: string
+                              maxItems: 128
+                              type: array
+                            connectionOrigin:
+                              enum:
+                              - service
+                              - environment
+                              type: string
+                            credentialID:
+                              description: CredentialID references a Vault credential;
+                                it never contains a token.
+                              pattern: ^[A-Za-z0-9_-]{1,128}$
+                              type: string
+                            requestMetadata:
+                              additionalProperties:
+                                type: string
+                              description: RequestMetadata is limited to non-secret
+                                tracing fields by platform policy.
+                              maxProperties: 2
+                              type: object
+                              x-kubernetes-validations:
+                              - message: only non-secret tracing metadata is permitted
+                                rule: self.all(k, k in ['traceparent', 'tracestate']
+                                  && size(self[k]) <= 512)
+                            required:
+                              type: boolean
+                            serverLabel:
+                              maxLength: 64
+                              minLength: 1
+                              type: string
+                            transport:
+                              description: AgentMCPTransport permits exactly one HTTP
+                                or stdio branch.
+                              properties:
+                                http:
+                                  description: AgentMCPHTTP excludes authorization
+                                    headers and credentials in the URL.
+                                  properties:
+                                    headers:
+                                      additionalProperties:
+                                        type: string
+                                      maxProperties: 2
+                                      type: object
+                                      x-kubernetes-validations:
+                                      - message: only credential-free protocol headers
+                                          are permitted
+                                        rule: self.all(k, k in ['Accept', 'Content-Type']
+                                          && self[k] in ['application/json', 'text/event-stream'])
+                                    serverURL:
+                                      maxLength: 2048
+                                      pattern: ^https://[^/@?#]+(/[^?#]*)?$
+                                      type: string
+                                  required:
+                                  - serverURL
+                                  type: object
+                                stdio:
+                                  description: AgentMCPStdio inherits named variables;
+                                    it does not persist environment values.
+                                  properties:
+                                    args:
+                                      description: Args must contain non-secret arguments
+                                        only.
+                                      items:
+                                        type: string
+                                      maxItems: 64
+                                      type: array
+                                    command:
+                                      maxLength: 256
+                                      minLength: 1
+                                      type: string
+                                    cwd:
+                                      maxLength: 4096
+                                      pattern: ^/
+                                      type: string
+                                    envVars:
+                                      items:
+                                        type: string
+                                      maxItems: 64
+                                      type: array
+                                  required:
+                                  - command
+                                  - cwd
+                                  type: object
+                                type:
+                                  enum:
+                                  - http
+                                  - stdio
+                                  type: string
+                              required:
+                              - type
+                              type: object
+                              x-kubernetes-validations:
+                              - message: http branch must match type
+                                rule: (self.type == 'http') == has(self.http)
+                              - message: stdio branch must match type
+                                rule: (self.type == 'stdio') == has(self.stdio)
+                          required:
+                          - serverLabel
+                          - transport
+                          type: object
+                          x-kubernetes-validations:
+                          - message: stdio MCP must omit connectionOrigin
+                            rule: self.transport.type != 'stdio' || !has(self.connectionOrigin)
+                          - message: Vault credentials require service-origin HTTP
+                              MCP
+                            rule: '!has(self.credentialID) || (self.transport.type
+                              == ''http'' && (!has(self.connectionOrigin) || self.connectionOrigin
+                              == ''service''))'
+                        programmaticToolCalling:
+                          description: AgentProgrammaticToolCalling preserves explicit
+                            disabled configuration.
+                          properties:
+                            enabled:
+                              type: boolean
+                          type: object
+                        type:
+                          enum:
+                          - function
+                          - tool_search
+                          - programmatic_tool_calling
+                          - mcp
+                          - web_search
+                          - computer_use
+                          type: string
+                        webSearch:
+                          description: AgentWebSearch declares web search configuration.
+                          properties:
+                            allowedDomains:
+                              items:
+                                type: string
+                              maxItems: 128
+                              type: array
+                            contextSize:
+                              enum:
+                              - low
+                              - medium
+                              - high
+                              type: string
+                            location:
+                              description: AgentWebLocation is an approximate location,
+                                not a credential.
+                              properties:
+                                city:
+                                  maxLength: 128
+                                  type: string
+                                country:
+                                  pattern: ^[A-Z]{2}$
+                                  type: string
+                                region:
+                                  maxLength: 128
+                                  type: string
+                                timezone:
+                                  maxLength: 128
+                                  type: string
+                              type: object
+                            mode:
+                              enum:
+                              - disabled
+                              - cached
+                              - live
+                              type: string
+                          type: object
+                      required:
+                      - type
+                      type: object
+                      x-kubernetes-validations:
+                      - message: function branch must match type
+                        rule: (self.type == 'function') == has(self.function)
+                      - message: programmatic branch must match type
+                        rule: (self.type == 'programmatic_tool_calling') == has(self.programmaticToolCalling)
+                      - message: mcp branch must match type
+                        rule: (self.type == 'mcp') == has(self.mcp)
+                      - message: webSearch branch must match type
+                        rule: (self.type == 'web_search') == has(self.webSearch)
+                      - message: computerUse branch must match type
+                        rule: (self.type == 'computer_use') == has(self.computerUse)
+                    maxItems: 64
+                    type: array
+                    x-kubernetes-list-type: atomic
+                type: object
+                x-kubernetes-validations:
+                - message: reasoning and resetReasoning conflict
+                  rule: '!(has(self.reasoning) && has(self.resetReasoning) && self.resetReasoning)'
+                - message: tools and clearTools conflict
+                  rule: '!(has(self.tools) && has(self.clearTools) && self.clearTools)'
+                - message: tier and resetServiceTier conflict
+                  rule: '!(has(self.serviceTier) && has(self.resetServiceTier) &&
+                    self.resetServiceTier)'
+              agentRef:
+                description: |-
+                  AgentRef selects a saved Agent in this namespace. Existing Sessions created
+                  before explicit references were required may continue without one.
+                properties:
+                  name:
+                    maxLength: 253
+                    minLength: 1
+                    pattern: ^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$
+                    type: string
+                required:
+                - name
+                type: object
+              environmentRef:
+                description: |-
+                  EnvironmentRef selects a same-namespace profile. Existing Sessions created
+                  before explicit references were required may continue without one.
+                properties:
+                  name:
+                    maxLength: 253
+                    minLength: 1
+                    pattern: ^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$
+                    type: string
+                required:
+                - name
+                type: object
+              metadata:
+                additionalProperties:
+                  type: string
+                maxProperties: 13
+                type: object
+                x-kubernetes-validations:
+                - message: metadata exceeds limits or uses ownership keys
+                  rule: self.all(k, size(k) >= 1 && size(k) <= 64 && size(self[k])
+                    <= 512 && !(k in ['kubernetes_uid', 'operator', 'owner_scope']))
+              spendControl:
+                description: |-
+                  SpendControl explicitly selects a per-Session OpenAI spend limit or
+                  unlimited spending. Only Sessions stored before the migration may omit it.
+                properties:
+                  limitCents:
+                    description: LimitCents is a positive US-cent amount when mode
+                      is limited.
+                    format: int64
+                    maximum: 4503599627370495
+                    minimum: 1
+                    type: integer
+                  mode:
+                    enum:
+                    - limited
+                    - unlimited
+                    type: string
+                required:
+                - mode
+                type: object
+                x-kubernetes-validations:
+                - message: limited spending requires limitCents; unlimited spending
+                    forbids it
+                  rule: (self.mode == 'limited') == has(self.limitCents)
+              vaultRefs:
+                description: VaultRefs attach same-namespace Vaults at creation; later
+                  attachment changes require a new Session.
+                items:
+                  description: AgentReference cannot address another namespace.
+                  properties:
+                    name:
+                      maxLength: 253
+                      minLength: 1
+                      pattern: ^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$
+                      type: string
+                  required:
+                  - name
+                  type: object
+                maxItems: 16
+                type: array
+                x-kubernetes-list-map-keys:
+                - name
+                x-kubernetes-list-type: map
+              workspaceDirectory:
+                default: /workspace
+                description: |-
+                  WorkspaceDirectory is the working directory used by Codex
+                  inside the self-hosted environment.
+                maxLength: 4096
+                pattern: ^/
+                type: string
+            type: object
+          status:
+            description: status defines the observed state of Session
+            properties:
+              agentSnapshot:
+                description: AgentSnapshot is frozen before creation, including ambiguous
+                  outcomes.
+                properties:
+                  configurationDigest:
+                    type: string
+                  generation:
+                    format: int64
+                    type: integer
+                  model:
+                    type: string
+                  name:
+                    type: string
+                  openaiAgentID:
+                    type: string
+                  uid:
+                    type: string
+                required:
+                - configurationDigest
+                - generation
+                - model
+                - name
+                - openaiAgentID
+                - uid
+                type: object
+              appliedMutableDigest:
+                type: string
+              conditions:
+                description: Conditions represent detailed Kubernetes-style status
+                  information.
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - type
+                x-kubernetes-list-type: map
+              creationAgentDigest:
+                description: CreationAgentDigest covers effective creation settings,
+                  never their payloads.
+                type: string
+              creationAttempted:
+                description: |-
+                  CreationAttempted is persisted before the only allowed remote create call.
+                  Never reset it to retry an ambiguous create; discover by Kubernetes UID.
+                type: boolean
+              creationOnlyDigest:
+                type: string
+              creationWorkspaceDirectory:
+                description: CreationWorkspaceDirectory freezes the effective workspace
+                  for recovery.
+                type: string
+              environmentID:
+                description: |-
+                  EnvironmentID identifies the OpenAI self-hosted environment
+                  associated with this session.
+                type: string
+              environmentSnapshot:
+                description: |-
+                  SessionStatus defines the observed state of Session.
+                  SessionEnvironmentSnapshot freezes only safe configuration and protected source versions.
+                properties:
+                  configurationDigest:
+                    type: string
+                  generation:
+                    format: int64
+                    type: integer
+                  name:
+                    type: string
+                  observableDigest:
+                    type: string
+                  openaiTemplateID:
+                    type: string
+                  profile:
+                    description: EnvironmentSpec is a reusable recipe, never an active
+                      runtime.
+                    properties:
+                      deletionPolicy:
+                        enum:
+                        - Delete
+                        - Retain
+                        type: string
+                      mode:
+                        enum:
+                        - selfHosted
+                        - openaiHosted
+                        - none
+                        type: string
+                      openaiHosted:
+                        description: HostedEnvironment owns the full remote template
+                          configuration.
+                        properties:
+                          capabilityDirectories:
+                            items:
+                              maxLength: 4096
+                              pattern: ^/workspace/
+                              type: string
+                            maxItems: 32
+                            type: array
+                            x-kubernetes-list-type: set
+                          containerSize:
+                            default: medium
+                            enum:
+                            - small
+                            - medium
+                            - large
+                            type: string
+                          desktop:
+                            type: boolean
+                          env:
+                            items:
+                              description: HostedVariable reads values from the platform's
+                                codex-environment Secret.
+                              properties:
+                                name:
+                                  pattern: ^[A-Za-z_][A-Za-z0-9_]{0,127}$
+                                  type: string
+                                secretKey:
+                                  pattern: ^[a-zA-Z0-9._-]{1,253}$
+                                  type: string
+                              required:
+                              - name
+                              - secretKey
+                              type: object
+                              x-kubernetes-validations:
+                              - message: Runtime-reserved environment names are restricted
+                                rule: self.name != 'PATH' && self.name != 'OPENAI_API_KEY'
+                                  && !self.name.startsWith('CODEX_')
+                            maxItems: 64
+                            type: array
+                            x-kubernetes-list-map-keys:
+                            - name
+                            x-kubernetes-list-type: map
+                          files:
+                            items:
+                              description: HostedFile never stores inline bytes in
+                                the API.
+                              properties:
+                                fileID:
+                                  maxLength: 256
+                                  minLength: 1
+                                  type: string
+                                path:
+                                  maxLength: 4096
+                                  pattern: ^/workspace/
+                                  type: string
+                                secretKey:
+                                  pattern: ^[a-zA-Z0-9._-]{1,253}$
+                                  type: string
+                                type:
+                                  enum:
+                                  - fileID
+                                  - inline
+                                  type: string
+                              required:
+                              - path
+                              - type
+                              type: object
+                              x-kubernetes-validations:
+                              - message: fileID branch must match type
+                                rule: (self.type == 'fileID') == has(self.fileID)
+                              - message: inline branch must match type
+                                rule: (self.type == 'inline') == has(self.secretKey)
+                            maxItems: 64
+                            type: array
+                            x-kubernetes-list-map-keys:
+                            - path
+                            x-kubernetes-list-type: map
+                          name:
+                            description: Optional display prefix; the controller retains
+                              an ownership suffix.
+                            maxLength: 128
+                            type: string
+                          network:
+                            description: HostedNetwork sets explicit policy independently
+                              of beta/GA defaults.
+                            properties:
+                              access:
+                                enum:
+                                - enabled
+                                - disabled
+                                - restricted
+                                type: string
+                              allowedDomains:
+                                default: []
+                                items:
+                                  maxLength: 253
+                                  pattern: ^[a-zA-Z0-9]([a-zA-Z0-9.-]*[a-zA-Z0-9])?$
+                                  type: string
+                                maxItems: 100
+                                type: array
+                                x-kubernetes-list-type: set
+                              blockedDomains:
+                                default: []
+                                items:
+                                  maxLength: 253
+                                  pattern: ^[a-zA-Z0-9]([a-zA-Z0-9.-]*[a-zA-Z0-9])?$
+                                  type: string
+                                maxItems: 100
+                                type: array
+                                x-kubernetes-list-type: set
+                            required:
+                            - access
+                            type: object
+                            x-kubernetes-validations:
+                            - message: Domains require restricted access
+                              rule: self.access == 'restricted' || (size(self.allowedDomains)
+                                == 0 && size(self.blockedDomains) == 0)
+                            - message: Allow and block lists cannot be combined
+                              rule: size(self.allowedDomains) == 0 || size(self.blockedDomains)
+                                == 0
+                            - message: Restricted access requires domains
+                              rule: self.access != 'restricted' || size(self.allowedDomains)
+                                + size(self.blockedDomains) > 0
+                          packages:
+                            description: HostedPackages contains non-secret package
+                              specifiers.
+                            properties:
+                              npm:
+                                items:
+                                  maxLength: 256
+                                  type: string
+                                maxItems: 64
+                                type: array
+                              python:
+                                items:
+                                  maxLength: 256
+                                  type: string
+                                maxItems: 64
+                                type: array
+                              system:
+                                items:
+                                  maxLength: 256
+                                  type: string
+                                maxItems: 64
+                                type: array
+                            type: object
+                          plugins:
+                            items:
+                              description: HostedInlineCapability carries safe metadata
+                                and a protected archive reference.
+                              properties:
+                                description:
+                                  maxLength: 2048
+                                  minLength: 1
+                                  type: string
+                                name:
+                                  pattern: ^[a-z][a-z0-9-]{0,63}$
+                                  type: string
+                                source:
+                                  description: HostedArchive pins a protected ZIP
+                                    to an immutable Secret object version.
+                                  properties:
+                                    secretKey:
+                                      pattern: ^[a-zA-Z0-9._-]{1,253}$
+                                      type: string
+                                    secretResourceVersion:
+                                      maxLength: 128
+                                      minLength: 1
+                                      type: string
+                                    secretUID:
+                                      maxLength: 128
+                                      minLength: 1
+                                      type: string
+                                  required:
+                                  - secretKey
+                                  - secretResourceVersion
+                                  - secretUID
+                                  type: object
+                              required:
+                              - description
+                              - name
+                              - source
+                              type: object
+                            maxItems: 16
+                            type: array
+                            x-kubernetes-list-map-keys:
+                            - name
+                            x-kubernetes-list-type: map
+                          setupCommands:
+                            items:
+                              description: HostedSetupCommand reads its command from
+                                the protected platform Secret.
+                              properties:
+                                cwd:
+                                  default: /workspace
+                                  maxLength: 4096
+                                  pattern: ^/workspace($|/)
+                                  type: string
+                                secretKey:
+                                  pattern: ^[a-zA-Z0-9._-]{1,253}$
+                                  type: string
+                              required:
+                              - secretKey
+                              type: object
+                            maxItems: 32
+                            type: array
+                            x-kubernetes-list-type: atomic
+                          skills:
+                            items:
+                              description: HostedSkill selects an exact API version
+                                or a pinned protected archive.
+                              properties:
+                                inline:
+                                  description: HostedInlineCapability carries safe
+                                    metadata and a protected archive reference.
+                                  properties:
+                                    description:
+                                      maxLength: 2048
+                                      minLength: 1
+                                      type: string
+                                    name:
+                                      pattern: ^[a-z][a-z0-9-]{0,63}$
+                                      type: string
+                                    source:
+                                      description: HostedArchive pins a protected
+                                        ZIP to an immutable Secret object version.
+                                      properties:
+                                        secretKey:
+                                          pattern: ^[a-zA-Z0-9._-]{1,253}$
+                                          type: string
+                                        secretResourceVersion:
+                                          maxLength: 128
+                                          minLength: 1
+                                          type: string
+                                        secretUID:
+                                          maxLength: 128
+                                          minLength: 1
+                                          type: string
+                                      required:
+                                      - secretKey
+                                      - secretResourceVersion
+                                      - secretUID
+                                      type: object
+                                  required:
+                                  - description
+                                  - name
+                                  - source
+                                  type: object
+                                skillID:
+                                  maxLength: 256
+                                  minLength: 1
+                                  type: string
+                                type:
+                                  enum:
+                                  - skillReference
+                                  - inline
+                                  type: string
+                                version:
+                                  maxLength: 20
+                                  pattern: ^[1-9][0-9]*$
+                                  type: string
+                              required:
+                              - type
+                              type: object
+                              x-kubernetes-validations:
+                              - message: skillReference requires ID and concrete version
+                                rule: (self.type == 'skillReference') == (has(self.skillID)
+                                  && has(self.version))
+                              - message: inline branch must match type
+                                rule: (self.type == 'inline') == has(self.inline)
+                              - message: inline skill cannot carry reference fields
+                                rule: self.type == 'skillReference' || (!has(self.skillID)
+                                  && !has(self.version))
+                            maxItems: 16
+                            type: array
+                            x-kubernetes-list-type: atomic
+                        required:
+                        - network
+                        type: object
+                      selfHosted:
+                        description: SelfHostedEnvironment describes platform-approved
+                          local compute.
+                        properties:
+                          architecture:
+                            enum:
+                            - amd64
+                            - arm64
+                            type: string
+                          capabilities:
+                            items:
+                              description: LocalCapability is a versioned /bundle
+                                image copied before the executor starts.
+                              properties:
+                                image:
+                                  maxLength: 512
+                                  pattern: ^[^\s@]+@sha256:[a-f0-9]{64}$
+                                  type: string
+                                name:
+                                  pattern: ^[a-z][a-z0-9-]{0,31}$
+                                  type: string
+                                path:
+                                  description: Path selects the actual plugin root,
+                                    or a directory containing skills.
+                                  pattern: ^/capabilities/[a-z][a-z0-9-]{0,31}$
+                                  type: string
+                                type:
+                                  enum:
+                                  - plugin
+                                  - skills
+                                  type: string
+                              required:
+                              - image
+                              - name
+                              - path
+                              - type
+                              type: object
+                            maxItems: 16
+                            type: array
+                            x-kubernetes-list-map-keys:
+                            - name
+                            x-kubernetes-list-type: map
+                          image:
+                            maxLength: 512
+                            pattern: ^[^\s@]+@sha256:[a-f0-9]{64}$
+                            type: string
+                          resources:
+                            description: ExecutorResources permits CPU and memory
+                              only; controller enforces platform bounds.
+                            properties:
+                              cpuLimit:
+                                default: "1"
+                                maxLength: 32
+                                type: string
+                              cpuRequest:
+                                default: 100m
+                                maxLength: 32
+                                type: string
+                              memoryLimit:
+                                default: 512Mi
+                                maxLength: 32
+                                type: string
+                              memoryRequest:
+                                default: 128Mi
+                                maxLength: 32
+                                type: string
+                            type: object
+                          workspaceDirectory:
+                            default: /workspace
+                            maxLength: 4096
+                            pattern: ^/
+                            type: string
+                          workspaceSize:
+                            default: 1Gi
+                            description: WorkspaceSize bounds an ephemeral volume
+                              or requests a persistent claim.
+                            maxLength: 32
+                            type: string
+                          workspaceStorage:
+                            description: |-
+                              WorkspaceStorage selects whether files survive executor Pod replacement.
+                              Omission preserves the legacy ephemeral workspace behavior.
+                            properties:
+                              claimDeletionPolicy:
+                                description: |-
+                                  ClaimDeletionPolicy deletes or retains the PVC when its Session is deleted.
+                                  A StorageClass separately controls whether its backing volume is reclaimed.
+                                enum:
+                                - Delete
+                                - Retain
+                                type: string
+                              storageClassName:
+                                description: StorageClassName must also be approved
+                                  by the operator allowlist.
+                                maxLength: 253
+                                pattern: ^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$
+                                type: string
+                              type:
+                                enum:
+                                - Ephemeral
+                                - Persistent
+                                type: string
+                            required:
+                            - type
+                            type: object
+                            x-kubernetes-validations:
+                            - message: Persistent storage requires a class and claim
+                                deletion policy; Ephemeral permits neither
+                              rule: 'self.type == ''Persistent'' ? has(self.storageClassName)
+                                && has(self.claimDeletionPolicy) : !has(self.storageClassName)
+                                && !has(self.claimDeletionPolicy)'
+                        required:
+                        - architecture
+                        - image
+                        type: object
+                    required:
+                    - mode
+                    type: object
+                    x-kubernetes-validations:
+                    - message: Environment mode is immutable
+                      rule: self.mode == oldSelf.mode
+                    - message: selfHosted branch must match mode
+                      rule: (self.mode == 'selfHosted') == has(self.selfHosted)
+                    - message: openaiHosted branch must match mode
+                      rule: (self.mode == 'openaiHosted') == has(self.openaiHosted)
+                  sourceVersion:
+                    description: EnvironmentSourceVersion identifies protected material
+                      without hashing values.
+                    properties:
+                      resourceVersion:
+                        type: string
+                      uid:
+                        type: string
+                    required:
+                    - resourceVersion
+                    - uid
+                    type: object
+                  uid:
+                    type: string
+                required:
+                - configurationDigest
+                - generation
+                - name
+                - profile
+                - uid
+                type: object
+              executorImage:
+                description: ExecutorImage freezes the operator-selected image digest
+                  for this Session.
+                type: string
+              managedMetadataKeys:
+                items:
+                  type: string
+                maxItems: 26
+                type: array
+                x-kubernetes-list-type: set
+              openaiSessionID:
+                description: OpenAISessionID is the session ID returned by OpenAI.
+                type: string
+              ownerScope:
+                type: string
+              phase:
+                description: |-
+                  Phase is the current high-level lifecycle state.
+                  Examples: Pending, Creating, Connecting, Ready, Failed.
+                type: string
+              podName:
+                description: PodName is the Kubernetes Pod running codex exec-server.
+                type: string
+              remoteURL:
+                description: RemoteURL is the connection URL used by codex exec-server.
+                type: string
+              resolvedCapabilityDirectories:
+                description: ResolvedCapabilityDirectories freezes public provider
+                  installation paths after creation.
+                items:
+                  type: string
+                maxItems: 64
+                type: array
+                x-kubernetes-list-type: set
+              spendControlAttemptedDigest:
+                description: |-
+                  SpendControlAttemptedDigest records a claimed remote spend-control create
+                  or update whose outcome must be observed before another write is attempted.
+                type: string
+              vaultSnapshots:
+                items:
+                  description: SessionVaultSnapshot freezes each attached Vault and
+                    its selected credentials.
+                  properties:
+                    credentials:
+                      items:
+                        description: SessionCredentialSnapshot freezes public credential
+                          identity and acknowledged source versions.
+                        properties:
+                          authType:
+                            type: string
+                          generation:
+                            format: int64
+                            type: integer
+                          name:
+                            type: string
+                          openaiCredentialID:
+                            type: string
+                          sourceVersions:
+                            items:
+                              description: CredentialSourceVersion exposes source
+                                identity, never secret bytes or their hash.
+                              properties:
+                                name:
+                                  type: string
+                                resourceVersion:
+                                  type: string
+                                uid:
+                                  type: string
+                              required:
+                              - name
+                              - resourceVersion
+                              - uid
+                              type: object
+                            type: array
+                          uid:
+                            type: string
+                        required:
+                        - authType
+                        - generation
+                        - name
+                        - openaiCredentialID
+                        - uid
+                        type: object
+                      maxItems: 1000
+                      type: array
+                    generation:
+                      format: int64
+                      type: integer
+                    name:
+                      type: string
+                    openaiVaultID:
+                      type: string
+                    uid:
+                      type: string
+                  required:
+                  - generation
+                  - name
+                  - openaiVaultID
+                  - uid
+                  type: object
+                maxItems: 16
+                type: array
+              workspaceClaimCreationAttempted:
+                description: |-
+                  WorkspaceClaimCreationAttempted is a durable one-time claim for an
+                  unowned Retain PVC. Unknown outcomes require administrative audit.
+                type: boolean
+              workspaceClaimUID:
+                description: |-
+                  WorkspaceClaimUID pins the Session-owned PVC identity across Pod replacement.
+                  Empty means the legacy ephemeral workspace or an unobserved claim.
+                type: string
+            type: object
+        required:
+        - spec
+        type: object
+        x-kubernetes-validations:
+        - message: new Sessions require agentRef, environmentRef and spendControl;
+            existing choices cannot be removed
+          optionalOldSelf: true
+          rule: (has(self.spec.agentRef) && has(self.spec.environmentRef) && has(self.spec.spendControl))
+            || (oldSelf.hasValue() && (has(self.spec.agentRef) || !has(oldSelf.value().spec.agentRef))
+            && (has(self.spec.environmentRef) || !has(oldSelf.value().spec.environmentRef))
+            && (has(self.spec.spendControl) || !has(oldSelf.value().spec.spendControl)))
+    served: true
+    storage: true
+    subresources:
+      status: {}

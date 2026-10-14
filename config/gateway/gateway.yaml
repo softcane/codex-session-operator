@@ -1,0 +1,121 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: codex-session-operator-gateway
+  namespace: codex-session-operator-system
+spec:
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+  selector:
+    matchLabels:
+      app.kubernetes.io/component: gateway
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/component: gateway
+    spec:
+      serviceAccountName: codex-session-operator-gateway
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        fsGroup: 65532
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+      - name: gateway
+        image: controller:latest
+        command:
+        - /gateway
+        env:
+        - name: GATEWAY_ADDRESS
+          value: :8082
+        - name: GATEWAY_INTERNAL_ADDRESS
+          value: :8083
+        - name: GATEWAY_DATABASE_FILE
+          value: /gateway-database/url
+        - name: GATEWAY_AUTH_FILE
+          value: /auth/principals.json
+        - name: GATEWAY_INTERNAL_TOKEN_FILE
+          value: /gateway-internal/token
+        - name: GATEWAY_CERT
+          value: /gateway-tls/tls.crt
+        - name: GATEWAY_KEY
+          value: /gateway-tls/tls.key
+        - name: OPENAI_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: openai-application
+              key: OPENAI_API_KEY
+        ports:
+        - name: public
+          containerPort: 8082
+        - name: internal
+          containerPort: 8083
+        securityContext:
+          readOnlyRootFilesystem: true
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
+        readinessProbe:
+          httpGet:
+            path: /readyz
+            port: public
+            scheme: HTTPS
+          periodSeconds: 5
+        resources:
+          requests:
+            cpu: 10m
+            memory: 64Mi
+          limits:
+            cpu: 500m
+            memory: 1Gi
+        volumeMounts:
+        - name: gateway-database
+          mountPath: /gateway-database
+          readOnly: true
+        - name: gateway-auth
+          mountPath: /auth
+          readOnly: true
+        - name: gateway-internal
+          mountPath: /gateway-internal
+          readOnly: true
+        - name: gateway-tls
+          mountPath: /gateway-tls
+          readOnly: true
+      volumes:
+      - name: gateway-database
+        secret:
+          secretName: gateway-database
+          defaultMode: 0440
+      - name: gateway-auth
+        secret:
+          secretName: gateway-auth
+          defaultMode: 0440
+      - name: gateway-internal
+        secret:
+          secretName: gateway-internal
+          defaultMode: 0440
+      - name: gateway-tls
+        secret:
+          secretName: gateway-tls
+          defaultMode: 0440
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: codex-session-operator-gateway
+  namespace: codex-session-operator-system
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/component: gateway
+  ports:
+  - name: public
+    port: 8082
+    targetPort: public
+  - name: internal
+    port: 8083
+    targetPort: internal

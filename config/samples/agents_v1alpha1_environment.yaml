@@ -1,0 +1,12 @@
+apiVersion: agents.softcane.io/v1alpha1
+kind: Environment
+metadata:
+  name: environment-sample
+spec:
+  mode: openaiHosted
+  deletionPolicy: Delete
+  openaiHosted:
+    name: example-hosted-profile
+    containerSize: small
+    network:
+      access: disabled

@@ -1,0 +1,33 @@
+:root { font: 16px/1.45 system-ui, sans-serif; color: #20302b; background: #f5f7f5; }
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+body { margin: 0; }
+main { width: min(100%, 1000px); margin: auto; padding: 1.5rem; }
+header { border-bottom: 1px solid #ccd8d0; margin-bottom: 1.5rem; }
+h1 { margin-bottom: .2rem; }
+h2 { margin-top: 0; }
+section { background: white; border: 1px solid #d4dfd8; border-radius: .6rem; padding: 1.2rem; margin: 1rem 0; }
+form { display: grid; gap: .75rem; }
+label { display: grid; gap: .25rem; font-weight: 600; }
+input, select, textarea { font: inherit; width: 100%; padding: .5rem; border: 1px solid #a8b9ad; border-radius: .3rem; }
+textarea { resize: vertical; }
+button { font: inherit; width: fit-content; border: 0; border-radius: .3rem; padding: .55rem .9rem; background: #125c3b; color: white; cursor: pointer; }
+button:disabled { opacity: .5; cursor: default; }
+button.secondary { background: #425c4c; }
+ul { list-style: none; padding: 0; }
+li { padding: .5rem 0; border-bottom: 1px solid #e4ebe6; }
+li button { margin-right: .5rem; }
+.hint { color: #53655a; margin: 0; font-size: .9rem; }
+.item { padding: .65rem; border: 1px solid #d4dfd8; border-radius: .3rem; margin: .5rem 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+.pending { border-color: #bd8d3d; }
+.work-error { border-color: #bd8d3d; color: #8b371f; }
+#task-status { min-height: 1.5em; }
+#conversation-status, #message-status { min-height: 1.5em; }
+.profile-details { background: #edf4ee; border-left: 3px solid #125c3b; padding: .7rem; margin: 0; overflow-wrap: anywhere; }
+.advanced { margin: 1.5rem 0; }
+.advanced > summary { cursor: pointer; font-weight: 600; color: #425c4c; }
+#restart-form { margin-top: 1rem; }
+#conversations li { padding: .75rem 0; overflow-wrap: anywhere; }
+.pagination { display: flex; flex-wrap: wrap; align-items: center; gap: .5rem; }
+#work li > div:first-child { margin-bottom: .5rem; overflow-wrap: anywhere; }
+#error { color: #a22b1a; min-height: 1.5em; }

@@ -1,0 +1,16 @@
+apiVersion: agents.softcane.io/v1alpha1
+kind: Session
+metadata:
+  labels:
+    app.kubernetes.io/name: codex-session-operator
+    app.kubernetes.io/managed-by: kustomize
+  name: session-sample
+spec:
+  workspaceDirectory: /workspace
+  agentRef:
+    name: agent-sample
+  environmentRef:
+    name: environment-sample
+  spendControl:
+    mode: limited
+    limitCents: 500

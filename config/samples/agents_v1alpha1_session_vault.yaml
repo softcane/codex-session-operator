@@ -1,0 +1,20 @@
+apiVersion: agents.softcane.io/v1alpha1
+kind: Session
+metadata:
+  name: session-vault-sample
+spec:
+  agentRef:
+    name: agent-sample
+  environmentRef:
+    name: environment-sample
+  spendControl:
+    mode: limited
+    limitCents: 500
+  vaultRefs:
+  - name: vault-sample
+  metadata:
+    workflow: example
+  agent:
+    reasoning:
+      effort: low
+    serviceTier: default

@@ -1,0 +1,87 @@
+name: Quality gates
+
+on:
+  workflow_call:
+
+permissions: {}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  tests:
+    name: Go and storage tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+      - name: Verify modules
+        run: make dependencies-check
+      - name: Test with race detection and randomized order
+        run: make test
+      - name: Test PostgreSQL durability
+        run: make test-storage-postgres
+      - name: Reject generated source drift
+        run: git diff --exit-code -- go.mod go.sum api config
+
+  checks:
+    name: Lint and vulnerabilities
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+      - name: Verify modules and lint configuration
+        run: |
+          make dependencies-check
+          make lint-config
+      - name: Lint
+        run: make lint
+      - name: Scan reachable vulnerabilities
+        run: make vulncheck
+
+  e2e:
+    name: End to end without an API key
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+      - name: Install checksum verified Kind and kubectl
+        run: |
+          curl --fail --location --retry 3 -o "$RUNNER_TEMP/kind" \
+            https://github.com/kubernetes-sigs/kind/releases/download/v0.33.0/kind-linux-amd64
+          echo 'aee6151561422756b764a4ae28e7f44cda5af5a9eead3cc9985112b1de8d8e0d  '"$RUNNER_TEMP/kind" | sha256sum --check --strict
+          # Match the node minor pinned in test/e2e/support.py.
+          curl --fail --location --retry 3 -o "$RUNNER_TEMP/kubectl" \
+            https://dl.k8s.io/release/v1.35.0/bin/linux/amd64/kubectl
+          echo 'a2e984a18a0c063279d692533031c1eff93a262afcc0afdc517375432d060989  '"$RUNNER_TEMP/kubectl" | sha256sum --check --strict
+          sudo install -m 0755 "$RUNNER_TEMP/kind" /usr/local/bin/kind
+          sudo install -m 0755 "$RUNNER_TEMP/kubectl" /usr/local/bin/kubectl
+      - name: Run the isolated Kind lifecycle
+        run: make test-e2e
+      - name: Reject generated source drift
+        run: git diff --exit-code -- go.mod go.sum api config

@@ -1,0 +1,76 @@
+# Disposable Kind only: mirrors the existing storage acceptance fixture.
+# This database has trust authentication and must stay inside the demo cluster.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: gateway-postgres
+  namespace: codex-session-operator-system
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gateway-postgres
+  namespace: codex-session-operator-system
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: gateway-postgres
+  template:
+    metadata:
+      labels:
+        app: gateway-postgres
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 70
+        fsGroup: 70
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+      - name: postgres
+        image: postgres:18.3-alpine@sha256:54451ecb8ab38c24c3ec123f2fd501303a3a1856a5c66e98cecf2460d5e1e9d7
+        args: [-c, fsync=on, -c, full_page_writes=on, -c, synchronous_commit=on]
+        env:
+        - name: POSTGRES_HOST_AUTH_METHOD
+          value: trust
+        - name: PGDATA
+          value: /var/lib/postgresql/data
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop: [ALL]
+        readinessProbe:
+          exec:
+            command: [pg_isready, -h, 127.0.0.1, -U, postgres]
+        volumeMounts:
+        - name: data
+          mountPath: /var/lib/postgresql
+        - name: socket
+          mountPath: /var/run/postgresql
+      volumes:
+      - name: data
+        persistentVolumeClaim:
+          claimName: gateway-postgres
+      - name: socket
+        emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: gateway-postgres
+  namespace: codex-session-operator-system
+spec:
+  selector:
+    app: gateway-postgres
+  ports:
+  - port: 5432
+    targetPort: 5432

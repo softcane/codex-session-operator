@@ -1,0 +1,20 @@
+apiVersion: agents.softcane.io/v1alpha1
+kind: Environment
+metadata:
+  name: environment-local
+spec:
+  mode: selfHosted
+  deletionPolicy: Delete
+  selfHosted:
+    # Replace with an image approved through EXECUTOR_IMAGE or EXECUTOR_IMAGES.
+    image: registry.example/executor@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+    architecture: arm64
+    workspaceDirectory: /workspace
+    workspaceSize: 1Gi
+    workspaceStorage:
+      type: Ephemeral
+    resources:
+      cpuRequest: 100m
+      cpuLimit: "1"
+      memoryRequest: 128Mi
+      memoryLimit: 512Mi

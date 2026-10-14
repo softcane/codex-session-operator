@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Session gateway</title>
+  <link rel="stylesheet" href="/ui/style.css">
+  <script src="/ui/app.js" defer></script>
+</head>
+<body>
+  <main>
+    <header><h1>Conversation gateway</h1><p>Choose an approved profile, send a task, and follow its conversation.</p></header>
+    <section aria-labelledby="connection-title">
+      <h2 id="connection-title">Connection</h2>
+      <form id="connect-form">
+        <label>Namespace <input id="namespace" required autocomplete="off" spellcheck="false"></label>
+        <label>Gateway token <input id="token" type="password" required autocomplete="off"></label>
+        <button>Connect</button><button id="disconnect" type="button" disabled>Disconnect</button>
+      </form>
+      <p id="connection-status" role="status">Disconnected</p>
+    </section>
+    <div id="workspace" hidden>
+      <section aria-labelledby="start-conversation-title">
+        <h2 id="start-conversation-title">Start a conversation</h2>
+        <form id="conversation-form">
+          <label>Approved profile <select id="profile" required></select></label>
+          <p id="profile-details" class="profile-details" role="status"></p>
+          <label>Title (optional) <input id="conversation-label" maxlength="256" autocomplete="off"></label>
+          <label>First message <textarea id="first-message" rows="5" required maxlength="65536"></textarea></label>
+          <button id="start-conversation">Start conversation</button>
+          <p class="hint">The profile selects the Agent, Environment and spending policy. A saved request starts work in the background; read the conversation to see completed turns.</p>
+        </form>
+        <p id="conversation-status" role="status"></p>
+        <h3>Saved conversations</h3>
+        <button id="refresh" type="button" class="secondary">Refresh</button>
+        <ul id="conversations"></ul>
+        <div class="pagination">
+          <button id="conversation-first-page" type="button" class="secondary" disabled>First page</button>
+          <button id="conversation-next-page" type="button" class="secondary" disabled>Next page</button>
+          <p id="conversation-page-status" class="hint" role="status"></p>
+        </div>
+      </section>
+      <details class="advanced"><summary>Advanced: work events and direct Sessions</summary>
+      <section id="tasks-section" aria-labelledby="tasks-title" hidden>
+        <h2 id="tasks-title">Start task</h2>
+        <form id="task-form">
+          <label>Approved route <select id="work-route" required></select></label>
+          <label>Work ID <input id="work-id" required maxlength="256" autocomplete="off" spellcheck="false" placeholder="incident-123"></label>
+          <label>Action <select id="work-event-kind" required><option value="task">Start or update task</option><option value="evidence">Add evidence</option><option value="restart">Start fresh after closing</option></select></label>
+          <label>Task or additional evidence <textarea id="task-text" rows="5" required maxlength="65536"></textarea></label>
+          <p class="hint">Use the same route and Work ID to continue an existing investigation. Starting fresh requires the earlier attempt to be closed and cleaned up. The route selects its approved Agent and Environment.</p>
+          <button id="start-task">Submit task event</button>
+        </form>
+        <p id="task-status" role="status"></p>
+        <h3>Work</h3><ul id="work"></ul>
+      </section>
+      <section aria-labelledby="create-title">
+        <h2 id="create-title">Create Session</h2>
+        <form id="create-form">
+          <label>Name <input id="session-name" required pattern="[a-z0-9]([-a-z0-9.]*[a-z0-9])?" spellcheck="false"></label>
+          <label>Agent <select id="agent" required></select></label>
+          <label>Environment <select id="environment" required></select></label>
+          <label>Spend choice <select id="spend-mode" required><option value="limited">Limited</option><option value="unlimited">Unlimited</option></select></label>
+          <label id="spend-limit-label">Limit in US cents <input id="spend-limit" type="number" min="1" max="4503599627370495" step="1" required></label>
+          <label>Other Session spec fields (JSON object, optional)
+            <textarea id="extra-spec" rows="4" spellcheck="false" placeholder='{"vaultRefs":[{"name":"team"}]}'></textarea>
+          </label>
+          <p class="hint">Agent, Environment and spend choice above always take precedence. No workflow or tool policy is selected automatically.</p>
+          <button>Create</button>
+        </form>
+      </section>
+      <section aria-labelledby="sessions-title">
+        <h2 id="sessions-title">Sessions</h2>
+        <ul id="sessions"></ul>
+      </section>
+      </details>
+      <section aria-labelledby="conversation-title">
+        <h2 id="conversation-title">Conversation <span id="selected-name"></span></h2>
+        <p id="session-state"></p>
+        <form id="message-form">
+          <label>Message <textarea id="message" rows="5" required></textarea></label>
+          <button id="send" disabled>Send message</button>
+        </form>
+        <p id="message-status" role="status"></p>
+        <button id="close-conversation" type="button" class="secondary" hidden>Close conversation</button>
+        <form id="restart-form" hidden>
+          <label>First message for a fresh attempt <textarea id="restart-text" rows="3" required maxlength="65536"></textarea></label>
+          <button id="restart-conversation" class="secondary">Start fresh attempt</button>
+          <p class="hint">A fresh attempt uses the same approved profile and creates a new Session after cleanup. Earlier history remains readable.</p>
+        </form>
+        <h3>Messages and items</h3><div id="conversation" aria-live="polite"></div>
+        <h3>Actions awaiting approval</h3><div id="actions"></div>
+      </section>
+    </div>
+    <p id="error" role="alert"></p>
+  </main>
+</body>
+</html>

@@ -1,0 +1,14 @@
+# Disposable Kind demo. The provider simulates OpenAI; no real API key is used.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+- ../work
+- provider.yaml
+- postgres.yaml
+patches:
+- path: routes.yaml
+- path: provider_patch.yaml
+images:
+- name: controller
+  newName: codex-session-manager
+  newTag: demo

@@ -1,0 +1,109 @@
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: manager-role
+rules:
+- apiGroups:
+  - ""
+  resources:
+  - persistentvolumeclaims
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - watch
+- apiGroups:
+  - ""
+  resources:
+  - pods
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - watch
+- apiGroups:
+  - ""
+  resourceNames:
+  - codex-environment
+  resources:
+  - secrets
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - ""
+  resourceNames:
+  - codex-executor
+  resources:
+  - secrets
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - ""
+  resourceNames:
+  - codex-vault
+  resources:
+  - secrets
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - agents.softcane.io
+  resources:
+  - agents
+  - environments
+  - vaultcredentials
+  - vaults
+  verbs:
+  - get
+  - list
+  - patch
+  - watch
+- apiGroups:
+  - agents.softcane.io
+  resources:
+  - agents/finalizers
+  - environments/finalizers
+  - vaultcredentials/finalizers
+  - vaults/finalizers
+  verbs:
+  - patch
+  - update
+- apiGroups:
+  - agents.softcane.io
+  resources:
+  - agents/status
+  - environments/status
+  - sessions/status
+  - vaultcredentials/status
+  - vaults/status
+  verbs:
+  - get
+  - patch
+  - update
+- apiGroups:
+  - agents.softcane.io
+  resources:
+  - sessions
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - agents.softcane.io
+  resources:
+  - sessions/finalizers
+  verbs:
+  - update

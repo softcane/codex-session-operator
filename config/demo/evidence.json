@@ -1,0 +1,7 @@
+{
+  "route_id": "demo-investigation",
+  "work_id": "demo-incident-001",
+  "event_id": "evidence-001",
+  "kind": "evidence",
+  "text": "Additional evidence: the conversion is Number.parseInt(amount, 10) * 100."
+}

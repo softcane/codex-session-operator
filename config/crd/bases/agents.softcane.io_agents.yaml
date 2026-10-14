@@ -1,0 +1,467 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.22.0
+  name: agents.agents.softcane.io
+spec:
+  group: agents.softcane.io
+  names:
+    kind: Agent
+    listKind: AgentList
+    plural: agents
+    singular: agent
+  scope: Namespaced
+  versions:
+  - name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: Agent is the Schema for the agents API
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: spec defines the desired state of Agent
+            properties:
+              clearName:
+                type: boolean
+              deletionPolicy:
+                enum:
+                - Delete
+                - Retain
+                type: string
+              instructions:
+                maxLength: 65536
+                type: string
+              metadata:
+                additionalProperties:
+                  type: string
+                description: Metadata permits 13 user entries, reserving three ownership
+                  entries.
+                maxProperties: 13
+                type: object
+                x-kubernetes-validations:
+                - message: metadata exceeds limits or uses reserved ownership keys
+                  rule: self.all(k, size(k) <= 64 && size(self[k]) <= 512 && !(k in
+                    ['kubernetes_uid', 'operator', 'owner_scope']))
+              model:
+                maxLength: 128
+                minLength: 1
+                type: string
+              multiAgent:
+                description: AgentMultiAgent controls subagent concurrency. Function
+                  tools cannot be used by subagents.
+                properties:
+                  enabled:
+                    type: boolean
+                  maxConcurrentSubagents:
+                    format: int64
+                    maximum: 32
+                    minimum: 1
+                    type: integer
+                required:
+                - enabled
+                type: object
+              name:
+                maxLength: 128
+                type: string
+              reasoning:
+                description: AgentReasoning replaces the complete remote reasoning
+                  object.
+                properties:
+                  effort:
+                    enum:
+                    - none
+                    - minimal
+                    - low
+                    - medium
+                    - high
+                    - xhigh
+                    - max
+                    type: string
+                  summary:
+                    enum:
+                    - concise
+                    - detailed
+                    - auto
+                    type: string
+                type: object
+              resetReasoning:
+                type: boolean
+              serviceTier:
+                enum:
+                - auto
+                - default
+                - flex
+                - priority
+                - fast
+                type: string
+              text:
+                description: AgentText replaces the complete remote output configuration.
+                properties:
+                  format:
+                    description: AgentTextFormat is a discriminated text/JSON schema
+                      union.
+                    properties:
+                      schema:
+                        description: Schema is an object containing a JSON Schema,
+                          not arbitrary Agent configuration.
+                        type: object
+                        x-kubernetes-preserve-unknown-fields: true
+                      type:
+                        enum:
+                        - text
+                        - json_schema
+                        type: string
+                    required:
+                    - type
+                    type: object
+                    x-kubernetes-validations:
+                    - message: json_schema requires schema; text forbids schema
+                      rule: (self.type == 'json_schema') == has(self.schema)
+                  verbosity:
+                    enum:
+                    - low
+                    - medium
+                    - high
+                    type: string
+                type: object
+              tools:
+                description: Tools replaces the entire remote list when supplied,
+                  including an empty list.
+                items:
+                  description: AgentTool is a discriminated union; fields from other
+                    variants are forbidden.
+                  properties:
+                    computerUse:
+                      description: AgentComputerUse requires hosted desktops and gateway
+                        approval handling.
+                      properties:
+                        includeScreenshots:
+                          type: boolean
+                      type: object
+                    function:
+                      description: AgentFunction declares an application tool; execution
+                        belongs to the gateway.
+                      properties:
+                        deferLoading:
+                          type: boolean
+                        description:
+                          maxLength: 8192
+                          type: string
+                        name:
+                          pattern: ^[A-Za-z0-9_-]{1,64}$
+                          type: string
+                        parameters:
+                          type: object
+                          x-kubernetes-preserve-unknown-fields: true
+                      required:
+                      - description
+                      - name
+                      - parameters
+                      type: object
+                    mcp:
+                      description: AgentMCP declares a credential-free MCP server.
+                      properties:
+                        allowedTools:
+                          items:
+                            type: string
+                          maxItems: 128
+                          type: array
+                        connectionOrigin:
+                          enum:
+                          - service
+                          - environment
+                          type: string
+                        credentialID:
+                          description: CredentialID references a Vault credential;
+                            it never contains a token.
+                          pattern: ^[A-Za-z0-9_-]{1,128}$
+                          type: string
+                        requestMetadata:
+                          additionalProperties:
+                            type: string
+                          description: RequestMetadata is limited to non-secret tracing
+                            fields by platform policy.
+                          maxProperties: 2
+                          type: object
+                          x-kubernetes-validations:
+                          - message: only non-secret tracing metadata is permitted
+                            rule: self.all(k, k in ['traceparent', 'tracestate'] &&
+                              size(self[k]) <= 512)
+                        required:
+                          type: boolean
+                        serverLabel:
+                          maxLength: 64
+                          minLength: 1
+                          type: string
+                        transport:
+                          description: AgentMCPTransport permits exactly one HTTP
+                            or stdio branch.
+                          properties:
+                            http:
+                              description: AgentMCPHTTP excludes authorization headers
+                                and credentials in the URL.
+                              properties:
+                                headers:
+                                  additionalProperties:
+                                    type: string
+                                  maxProperties: 2
+                                  type: object
+                                  x-kubernetes-validations:
+                                  - message: only credential-free protocol headers
+                                      are permitted
+                                    rule: self.all(k, k in ['Accept', 'Content-Type']
+                                      && self[k] in ['application/json', 'text/event-stream'])
+                                serverURL:
+                                  maxLength: 2048
+                                  pattern: ^https://[^/@?#]+(/[^?#]*)?$
+                                  type: string
+                              required:
+                              - serverURL
+                              type: object
+                            stdio:
+                              description: AgentMCPStdio inherits named variables;
+                                it does not persist environment values.
+                              properties:
+                                args:
+                                  description: Args must contain non-secret arguments
+                                    only.
+                                  items:
+                                    type: string
+                                  maxItems: 64
+                                  type: array
+                                command:
+                                  maxLength: 256
+                                  minLength: 1
+                                  type: string
+                                cwd:
+                                  maxLength: 4096
+                                  pattern: ^/
+                                  type: string
+                                envVars:
+                                  items:
+                                    type: string
+                                  maxItems: 64
+                                  type: array
+                              required:
+                              - command
+                              - cwd
+                              type: object
+                            type:
+                              enum:
+                              - http
+                              - stdio
+                              type: string
+                          required:
+                          - type
+                          type: object
+                          x-kubernetes-validations:
+                          - message: http branch must match type
+                            rule: (self.type == 'http') == has(self.http)
+                          - message: stdio branch must match type
+                            rule: (self.type == 'stdio') == has(self.stdio)
+                      required:
+                      - serverLabel
+                      - transport
+                      type: object
+                      x-kubernetes-validations:
+                      - message: stdio MCP must omit connectionOrigin
+                        rule: self.transport.type != 'stdio' || !has(self.connectionOrigin)
+                      - message: Vault credentials require service-origin HTTP MCP
+                        rule: '!has(self.credentialID) || (self.transport.type ==
+                          ''http'' && (!has(self.connectionOrigin) || self.connectionOrigin
+                          == ''service''))'
+                    programmaticToolCalling:
+                      description: AgentProgrammaticToolCalling preserves explicit
+                        disabled configuration.
+                      properties:
+                        enabled:
+                          type: boolean
+                      type: object
+                    type:
+                      enum:
+                      - function
+                      - tool_search
+                      - programmatic_tool_calling
+                      - mcp
+                      - web_search
+                      - computer_use
+                      type: string
+                    webSearch:
+                      description: AgentWebSearch declares web search configuration.
+                      properties:
+                        allowedDomains:
+                          items:
+                            type: string
+                          maxItems: 128
+                          type: array
+                        contextSize:
+                          enum:
+                          - low
+                          - medium
+                          - high
+                          type: string
+                        location:
+                          description: AgentWebLocation is an approximate location,
+                            not a credential.
+                          properties:
+                            city:
+                              maxLength: 128
+                              type: string
+                            country:
+                              pattern: ^[A-Z]{2}$
+                              type: string
+                            region:
+                              maxLength: 128
+                              type: string
+                            timezone:
+                              maxLength: 128
+                              type: string
+                          type: object
+                        mode:
+                          enum:
+                          - disabled
+                          - cached
+                          - live
+                          type: string
+                      type: object
+                  required:
+                  - type
+                  type: object
+                  x-kubernetes-validations:
+                  - message: function branch must match type
+                    rule: (self.type == 'function') == has(self.function)
+                  - message: programmatic branch must match type
+                    rule: (self.type == 'programmatic_tool_calling') == has(self.programmaticToolCalling)
+                  - message: mcp branch must match type
+                    rule: (self.type == 'mcp') == has(self.mcp)
+                  - message: webSearch branch must match type
+                    rule: (self.type == 'web_search') == has(self.webSearch)
+                  - message: computerUse branch must match type
+                    rule: (self.type == 'computer_use') == has(self.computerUse)
+                maxItems: 64
+                type: array
+                x-kubernetes-list-type: atomic
+            required:
+            - model
+            type: object
+            x-kubernetes-validations:
+            - message: name and clearName conflict
+              rule: '!(has(self.name) && has(self.clearName) && self.clearName)'
+            - message: reasoning and resetReasoning conflict
+              rule: '!(has(self.reasoning) && has(self.resetReasoning) && self.resetReasoning)'
+          status:
+            description: status defines the observed state of Agent
+            properties:
+              conditions:
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - type
+                x-kubernetes-list-type: map
+              creationAttempted:
+                type: boolean
+              managedMetadataKeys:
+                description: ManagedMetadataKeys tracks ownership of keys, never their
+                  values.
+                items:
+                  type: string
+                maxItems: 26
+                type: array
+                x-kubernetes-list-type: set
+              observedGeneration:
+                format: int64
+                type: integer
+              openaiAgentID:
+                type: string
+              ownerScope:
+                description: OwnerScope freezes the operator installation/project
+                  identity before creation.
+                type: string
+              reasoningConfigurationDigest:
+                description: ReasoningConfigurationDigest acknowledges whole-object
+                  replacements and resets.
+                type: string
+            type: object
+        required:
+        - spec
+        type: object
+        x-kubernetes-validations:
+        - message: new Agents require deletionPolicy; an existing policy cannot be
+            removed
+          optionalOldSelf: true
+          rule: has(self.spec.deletionPolicy) || (oldSelf.hasValue() && !has(oldSelf.value().spec.deletionPolicy))
+    served: true
+    storage: true
+    subresources:
+      status: {}

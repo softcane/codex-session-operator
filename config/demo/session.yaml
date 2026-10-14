@@ -1,0 +1,17 @@
+# Optional direct-Session example. The work gateway creates its own Session;
+# do not apply this file when testing "one event creates one Session".
+apiVersion: agents.softcane.io/v1alpha1
+kind: Session
+metadata:
+  name: demo-direct-session
+  namespace: codex-session-operator-system
+spec:
+  agentRef:
+    name: demo-investigator-v1
+  environmentRef:
+    name: demo-text-v1
+  spendControl:
+    mode: unlimited
+  workspaceDirectory: /workspace
+# In none mode this path is configuration, not a mounted workspace. First input
+# through POST /sessions/demo-direct-session/messages triggers remote creation.

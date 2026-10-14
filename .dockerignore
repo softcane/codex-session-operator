@@ -1,0 +1,42 @@
+# Allow only build inputs. Local plans, credentials and test reports never enter
+# the context, even when they live next to the source checkout.
+**
+
+!go.mod
+!go.sum
+!api/
+!api/**/
+!api/**/*.go
+!cmd/
+!cmd/**/
+!cmd/**/*.go
+!internal/
+!internal/**/
+!internal/**/*.go
+**/*_test.go
+
+# Assets embedded in the gateway binary.
+!internal/gateway/ui/
+!internal/gateway/ui/index.html
+!internal/gateway/ui/app.js
+!internal/gateway/ui/style.css
+
+# The sole local acceptance provider image.
+!test/
+!test/e2e/
+!test/e2e/provider.js
+
+# Explicit exclusions protect these if the allowlist is expanded later.
+.private/
+.git/
+.agents/
+.codex/
+.env
+.env.*
+**/.env
+**/.env.*
+bin/
+dist/
+*.kubeconfig
+**/*.key
+**/*.pem

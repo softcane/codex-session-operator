@@ -1,0 +1,7 @@
+{
+  "route_id": "demo-investigation",
+  "work_id": "demo-incident-001",
+  "event_id": "task-001",
+  "kind": "task",
+  "text": "Investigate this supplied evidence: checkout expected 1099 cents but returned 1000 cents."
+}

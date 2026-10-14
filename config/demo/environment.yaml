@@ -1,0 +1,9 @@
+# Reusable runtime recipe. "none" means text only, with no executor Pod or workspace.
+apiVersion: agents.softcane.io/v1alpha1
+kind: Environment
+metadata:
+  name: demo-text-v1
+  namespace: codex-session-operator-system
+spec:
+  mode: none
+  deletionPolicy: Delete

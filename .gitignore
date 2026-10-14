@@ -1,0 +1,62 @@
+# Binaries for programs and plugins
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+/bin/
+/tmp/
+/Dockerfile.cross
+
+# Test binary, built with `go test -c`
+*.test
+
+# Output of the Go coverage tool
+*.out
+coverage.html
+
+# Dependency and workspace files
+/vendor/
+/go.work
+/go.work.sum
+
+# editor and IDE paraphernalia
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Kubeconfig might contain secrets
+*.kubeconfig
+kubeconfig
+
+# Local credentials (never commit)
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.p12
+*.pfx
+curl.conf
+
+# Python test helpers and local report artifacts
+__pycache__/
+*.py[cod]
+
+# Local research, historical acceptance harnesses and maintainer notes
+/.private/
+/.agents/
+/.codex/
+/PLAN.md
+/Plan.md
+/KAGENT_LESSONS.md
+/HANDOFF.md
+
+# Generated release assets and private test reports
+/dist/
+/reports/
+/test-results/
+*.log
+.DS_Store

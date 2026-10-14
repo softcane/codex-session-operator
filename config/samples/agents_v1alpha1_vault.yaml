@@ -1,0 +1,9 @@
+apiVersion: agents.softcane.io/v1alpha1
+kind: Vault
+metadata:
+  name: vault-sample
+spec:
+  name: Team service MCP credentials
+  metadata:
+    team: example
+  deletionPolicy: Delete

@@ -1,0 +1,45 @@
+# The runner supplies provider-fixture/server.js from test/e2e/provider.js.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: provider-fixture
+  namespace: codex-session-operator-system
+  labels:
+    app: provider-fixture
+spec:
+  automountServiceAccountToken: false
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 1000
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+  - name: provider
+    image: codex-provider-fixture:demo
+    imagePullPolicy: IfNotPresent
+    command: [node, /fixture/server.js]
+    securityContext:
+      allowPrivilegeEscalation: false
+      readOnlyRootFilesystem: true
+      capabilities:
+        drop: [ALL]
+    volumeMounts:
+    - name: fixture
+      mountPath: /fixture
+      readOnly: true
+  volumes:
+  - name: fixture
+    configMap:
+      name: provider-fixture
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: provider-fixture
+  namespace: codex-session-operator-system
+spec:
+  selector:
+    app: provider-fixture
+  ports:
+  - port: 8080
+    targetPort: 8080
