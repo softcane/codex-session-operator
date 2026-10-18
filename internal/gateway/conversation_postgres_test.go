@@ -26,10 +26,10 @@ func reopenConversationStore(t *testing.T, dsn string) *PostgreSQLStore {
 }
 
 func TestPostgreSQLConversationConcurrentAcceptanceAndSubjectScope(t *testing.T) {
-	store, dsn := postgresForTest(t, 32)
+	store, dsn := postgresForTest(t)
 	other := reopenConversationStore(t, dsn)
-	first, firstWriter, firstProvider := workHTTPGateway(t, store)
-	second, secondWriter, secondProvider := workHTTPGateway(t, other)
+	first, firstWriter, firstProvider := profileConversationGateway(t, store)
+	second, secondWriter, secondProvider := profileConversationGateway(t, other)
 	responses := make(chan *httptest.ResponseRecorder, 16)
 	var group sync.WaitGroup
 	for i := range 16 {
@@ -90,30 +90,27 @@ func TestPostgreSQLConversationConcurrentAcceptanceAndSubjectScope(t *testing.T)
 }
 
 func TestPostgreSQLConversationReopenRetainsReceiptAndFrozenProfile(t *testing.T) {
-	store, dsn := postgresForTest(t, 32)
-	g, _, _ := workHTTPGateway(t, store)
+	store, dsn := postgresForTest(t)
+	g, _, _ := profileConversationGateway(t, store)
 	original := readConversationReceipt(t, conversationRequest(g, http.MethodPost, _conversationPath, "reopen", _postgresConversationInput))
 	if err := store.Close(); err != nil {
 		t.Fatal(err)
 	}
 	reopened := reopenConversationStore(t, dsn)
-	next, _, _ := workHTTPGateway(t, reopened)
-	route := next.workRoutes[_testWorkRouteID]
-	route.Agent, route.Environment = _testWorkAgentV2, "node-v2"
-	next.workRoutes[route.ID] = route
+	next, _, _ := profileConversationGateway(t, reopened)
 	replay := readConversationReceipt(t, conversationRequest(next, http.MethodPost, _conversationPath, "reopen", _postgresConversationInput))
 	if !reflect.DeepEqual(original, replay) {
 		t.Fatal("database reopening changed receipt")
 	}
 	_, attempt, err := reopened.LookupConversation(t.Context(), _testNamespace, original.ConversationID)
-	if err != nil || attempt.Policy.AgentRef.Name != _testWorkAgentV1 || attempt.Policy.EnvironmentRef.Name != _testWorkEnvironmentV1 {
+	if err != nil || attempt.Policy.AgentRef.Name != _profileTestAgent || attempt.Policy.EnvironmentRef.Name != _profileTestEnvironment {
 		t.Fatal("database reopening changed selected profile", err)
 	}
 }
 
 func TestPostgreSQLConversationMessageKeysAreScopedToLineage(t *testing.T) {
-	store, _ := postgresForTest(t, 32)
-	g, _, _ := workHTTPGateway(t, store)
+	store, _ := postgresForTest(t)
+	g, _, _ := profileConversationGateway(t, store)
 	first := readConversationReceipt(t, conversationRequest(g, http.MethodPost, _conversationPath, "first-lineage", _postgresConversationInput))
 	second := readConversationReceipt(t, conversationRequest(g, http.MethodPost, _conversationPath, "second-lineage", _postgresConversationInput))
 	for _, receipt := range []ConversationReceipt{first, second} {
@@ -149,8 +146,8 @@ func (s *conversationRestoreRaceStore) GetInNamespace(ctx context.Context, names
 }
 
 func TestPostgreSQLConversationAdmissionRechecksChildHoldDuringRestoreRelease(t *testing.T) {
-	store, _ := postgresForTest(t, 32)
-	g, _, _ := workHTTPGateway(t, store)
+	store, _ := postgresForTest(t)
+	g, _, _ := profileConversationGateway(t, store)
 	original := readConversationReceipt(t, conversationRequest(g, http.MethodPost, _conversationPath, "restore-race", _postgresConversationInput))
 	id := conversationRecordID(_testNamespace, _testConversationSubject, "restore-race")
 	const sessionUID = "restore-race-session"
@@ -170,7 +167,7 @@ func TestPostgreSQLConversationAdmissionRechecksChildHoldDuringRestoreRelease(t 
 	if err != nil {
 		t.Fatal(err)
 	}
-	fresh, _ := postgresForTest(t, 32)
+	fresh, _ := postgresForTest(t)
 	report, err := fresh.Restore(t.Context(), backup)
 	if err != nil {
 		t.Fatal(err)
@@ -185,7 +182,7 @@ func TestPostgreSQLConversationAdmissionRechecksChildHoldDuringRestoreRelease(t 
 			t.Fatal(err)
 		}
 	}
-	next, _, _ := workHTTPGateway(t, interleaved)
+	next, _, _ := profileConversationGateway(t, interleaved)
 	response := conversationRequest(next, http.MethodPost, original.ConversationURL+"/messages", "race-message", `{"text":"More evidence"}`)
 	if response.Code != http.StatusServiceUnavailable || interleaved.afterRead != nil {
 		t.Fatalf("held child accepted input across restore release: %d %s", response.Code, response.Body.String())
@@ -197,19 +194,19 @@ func TestPostgreSQLConversationAdmissionRechecksChildHoldDuringRestoreRelease(t 
 }
 
 func TestPostgreSQLConversationRestoreRebuildsIndexesAndHoldsNewInput(t *testing.T) {
-	store, _ := postgresForTest(t, 32)
-	g, _, _ := workHTTPGateway(t, store)
+	store, _ := postgresForTest(t)
+	g, _, _ := profileConversationGateway(t, store)
 	original := readConversationReceipt(t, conversationRequest(g, http.MethodPost, _conversationPath, "restore", _postgresConversationInput))
 	backup, err := store.Backup(t.Context())
 	if err != nil {
 		t.Fatal(err)
 	}
-	fresh, _ := postgresForTest(t, 32)
+	fresh, _ := postgresForTest(t)
 	report, err := fresh.Restore(t.Context(), backup)
 	if err != nil {
 		t.Fatal(err)
 	}
-	next, writer, provider := workHTTPGateway(t, fresh)
+	next, writer, provider := profileConversationGateway(t, fresh)
 	replay := readConversationReceipt(t, conversationRequest(next, http.MethodPost, _conversationPath, "restore", _postgresConversationInput))
 	if !reflect.DeepEqual(original, replay) {
 		t.Fatal("held restore changed the original receipt")
@@ -253,8 +250,8 @@ func assertConversationInputHeld(t *testing.T, g *Gateway, receipt ConversationR
 }
 
 func TestPostgreSQLConversationArchivePreservesReplayAndAttemptLookup(t *testing.T) {
-	store, _ := postgresForTest(t, 32)
-	g, _, _ := workHTTPGateway(t, store)
+	store, _ := postgresForTest(t)
+	g, _, _ := profileConversationGateway(t, store)
 	original := readConversationReceipt(t, conversationRequest(g, http.MethodPost, _conversationPath, "archive", _postgresConversationInput))
 	id := conversationRecordID(_testNamespace, _testConversationSubject, "archive")
 	if err := store.Update(t.Context(), id, func(r *Record) error {
@@ -284,7 +281,7 @@ func TestPostgreSQLConversationArchivePreservesReplayAndAttemptLookup(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
-	fresh, _ := postgresForTest(t, 32)
+	fresh, _ := postgresForTest(t)
 	if _, err := fresh.Restore(t.Context(), backup); err != nil {
 		t.Fatal(err)
 	}
@@ -292,15 +289,15 @@ func TestPostgreSQLConversationArchivePreservesReplayAndAttemptLookup(t *testing
 	if err != nil || !reflect.DeepEqual(attempt, restoredAttempt) {
 		t.Fatal("restore changed archived attempt mapping", err)
 	}
-	next, _, _ := workHTTPGateway(t, fresh)
+	next, _, _ := profileConversationGateway(t, fresh)
 	if restoredReceipt := readConversationReceipt(t, conversationRequest(next, http.MethodPost, _conversationPath, "archive", _postgresConversationInput)); !reflect.DeepEqual(original, restoredReceipt) {
 		t.Fatal("restored archive changed receipt")
 	}
 }
 
 func TestPostgreSQLConversationAttemptIndexesFailClosed(t *testing.T) {
-	store, _ := postgresForTest(t, 32)
-	g, _, _ := workHTTPGateway(t, store)
+	store, _ := postgresForTest(t)
+	g, _, _ := profileConversationGateway(t, store)
 	original := readConversationReceipt(t, conversationRequest(g, http.MethodPost, _conversationPath, "attempts", _postgresConversationInput))
 	id := conversationRecordID(_testNamespace, _testConversationSubject, "attempts")
 	if err := store.Update(t.Context(), id, func(r *Record) error {
@@ -352,7 +349,7 @@ func TestPostgreSQLConversationQuotasReserveFutureSession(t *testing.T) {
 	} {
 		t.Run(limits.name, func(t *testing.T) {
 			store, _ := postgresForTestLimits(t, limits.active, limits.records)
-			g, _, _ := workHTTPGateway(t, store)
+			g, _, _ := profileConversationGateway(t, store)
 			first := conversationRequest(g, http.MethodPost, _conversationPath, "first", _postgresConversationInput)
 			if limits.firstAccepted {
 				readConversationReceipt(t, first)
@@ -374,36 +371,26 @@ func TestPostgreSQLConversationQuotasReserveFutureSession(t *testing.T) {
 	}
 }
 
-func TestConversationRecordVersionsPreserveLegacyAndRejectUnknownData(t *testing.T) {
+func TestConversationRecordVersionRejectsOldAndUnknownData(t *testing.T) {
 	store := testStore(t)
-	g, _, _ := workHTTPGateway(t, store)
+	g, _, _ := profileConversationGateway(t, store)
 	readConversationReceipt(t, conversationRequest(g, http.MethodPost, _conversationPath, "version", _postgresConversationInput))
 	record := readWorkRecord(t, store, conversationRecordID(_testNamespace, _testConversationSubject, "version"))
-	if record.Version != 2 {
-		t.Fatal("new conversation did not reserve version 2")
+	if record.Version != _recordVersion {
+		t.Fatal("new conversation did not use the current record version")
 	}
 	raw := mustJSON(t, record)
-	var oldReader struct {
-		Version int `json:"version"`
-	}
-	if err := json.Unmarshal(raw, &oldReader); err != nil || oldReader.Version == 1 {
-		t.Fatal("legacy version-1 reader would accept conversation data", err)
-	}
 	for _, tt := range []struct {
 		name   string
 		mutate func(*Record)
 		valid  bool
 	}{
-		{name: "new conversation", valid: true, mutate: func(*Record) {}},
-		{name: "origin under legacy version", mutate: func(r *Record) { r.Version = 1 }},
-		{name: "unknown record version", mutate: func(r *Record) { r.Version = 3 }},
-		{name: "version 2 requires origin", mutate: func(r *Record) { r.Work = nil }},
-		{name: "legacy child Session", valid: true, mutate: func(r *Record) { r.Version = 1; r.Work = nil }},
-		{name: "legacy Work", valid: true, mutate: func(r *Record) {
-			r.Version = 1
-			r.Work.Conversation = nil
-			r.Work.Attempts[0].ConversationID = ""
-		}},
+		{name: "current conversation", valid: true, mutate: func(*Record) {}},
+		{name: "version 1", mutate: func(r *Record) { r.Version = 1 }},
+		{name: "version 2", mutate: func(r *Record) { r.Version = 2 }},
+		{name: "unknown version", mutate: func(r *Record) { r.Version = _recordVersion + 1 }},
+		{name: "current child Session", valid: true, mutate: func(r *Record) { r.Work = nil }},
+		{name: "conversation without provenance", mutate: func(r *Record) { r.Work.Attempts[0].Profile = nil }},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			var candidate Record
@@ -423,8 +410,8 @@ func TestConversationRecordVersionsPreserveLegacyAndRejectUnknownData(t *testing
 }
 
 func TestPostgreSQLConversationListPaginatesAttemptsWithinNamespace(t *testing.T) {
-	store, _ := postgresForTest(t, 32)
-	g, _, _ := workHTTPGateway(t, store)
+	store, _ := postgresForTest(t)
+	g, writer, _ := profileConversationGateway(t, store)
 	first := readConversationReceipt(t, conversationRequest(g, http.MethodPost, _conversationPath, "page-first", _postgresConversationInput))
 	second := readConversationReceipt(t, conversationRequest(g, http.MethodPost, _conversationPath, "page-second", _postgresConversationInput))
 	id := conversationRecordID(_testNamespace, _testConversationSubject, "page-first")
@@ -436,15 +423,19 @@ func TestPostgreSQLConversationListPaginatesAttemptsWithinNamespace(t *testing.T
 		t.Fatal(err)
 	}
 	restarted := readConversationReceipt(t, conversationRequest(g, http.MethodPost, first.ConversationURL+"/restart", "page-restart", `{"text":"Restart investigation"}`))
-	route := workHTTPRoute()
-	route.ID, route.Namespace = "other-profile", _testWorkOther
-	g.workRoutes[route.ID] = route
+	_, objects := readyProfileObjects(_testWorkOther)
+	for _, object := range objects {
+		object.SetResourceVersion("")
+		if err := writer.Client.Create(t.Context(), object); err != nil {
+			t.Fatal(err)
+		}
+	}
 	principals, err := copyPrincipals([]Principal{{Token: _token + "-other", Subject: _testConversationSubject, Namespace: _testWorkOther}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	g.principals = append(g.principals, principals...)
-	other := readConversationReceipt(t, request(g, http.MethodPost, "/v1/namespaces/other/conversations", _token+"-other", "other-page", `{"route_id":"other-profile","text":"Other namespace"}`))
+	other := readConversationReceipt(t, request(g, http.MethodPost, "/v1/namespaces/other/conversations", _token+"-other", "other-page", `{"route_id":"payments","text":"Other namespace"}`))
 	page, err := store.ListConversationAttempts(t.Context(), _testNamespace, "", 2)
 	if err != nil || len(page) != 3 {
 		t.Fatal("first page did not return two entries and lookahead", err)
@@ -502,12 +493,12 @@ func readPostgreSQLConversationPage(t *testing.T, g *Gateway, path string) postg
 }
 
 func TestPostgreSQLConversationReadersFailClosedForRecordVersions(t *testing.T) {
-	store, _ := postgresForTest(t, 32)
-	g, _, _ := workHTTPGateway(t, store)
+	store, _ := postgresForTest(t)
+	g, _, _ := profileConversationGateway(t, store)
 	original := readConversationReceipt(t, conversationRequest(g, http.MethodPost, _conversationPath, "version-data", _postgresConversationInput))
 	id := conversationRecordID(_testNamespace, _testConversationSubject, "version-data")
 	record := readWorkRecord(t, store, id)
-	for _, version := range []int{1, 3} {
+	for _, version := range []int{1, 2, _recordVersion + 1} {
 		record.Version = version
 		if _, err := store.pool.Exec(t.Context(), "UPDATE gateway_records SET data=$1 WHERE uid=$2", mustJSON(t, record), id); err != nil {
 			t.Fatal("inject inconsistent record version", safeSQLError(err))

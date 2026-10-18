@@ -23,7 +23,7 @@ const (
 )
 
 func TestPostgreSQLCanceledMutationLockWait(t *testing.T) {
-	store, _ := postgresForTest(t, 32)
+	store, _ := postgresForTest(t)
 	held, err := store.begin(t.Context())
 	if err != nil {
 		t.Fatal(err)
@@ -81,7 +81,7 @@ func TestPostgreSQLCanceledMutationLockWait(t *testing.T) {
 }
 
 func TestPostgreSQLReadSnapshotDoesNotBlockWriter(t *testing.T) {
-	store, _ := postgresForTest(t, 32)
+	store, _ := postgresForTest(t)
 	if err := store.Update(t.Context(), _testReadSnapshotUID, func(r *Record) error {
 		r.Namespace = _testNamespace
 		r.Name = _testSnapshotBefore
@@ -124,7 +124,7 @@ func TestPostgreSQLReadSnapshotDoesNotBlockWriter(t *testing.T) {
 }
 
 func TestPostgreSQLReadWhileWriterOwnsMetadataLock(t *testing.T) {
-	store, _ := postgresForTest(t, 32)
+	store, _ := postgresForTest(t)
 	if err := store.Update(t.Context(), _testReadableUID, func(r *Record) error { r.Namespace = _testNamespace; return nil }); err != nil {
 		t.Fatal(err)
 	}
@@ -146,7 +146,7 @@ func TestPostgreSQLReadWhileWriterOwnsMetadataLock(t *testing.T) {
 }
 
 func TestPostgreSQLStaleWorkerReadsRemainFenced(t *testing.T) {
-	store, _ := postgresForTest(t, 32)
+	store, _ := postgresForTest(t)
 	first, release, err := store.ClaimWorker(t.Context())
 	if err != nil {
 		t.Fatal(err)
@@ -184,7 +184,7 @@ func (c *canceledCommitDisconnect) Read(raw []byte) (int, error) {
 }
 
 func TestPostgreSQLCanceledUnknownCommitResolvesDurableOutcome(t *testing.T) {
-	store, _ := postgresForTest(t, 32)
+	store, _ := postgresForTest(t)
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 	armed := new(atomic.Bool)

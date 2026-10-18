@@ -32,6 +32,7 @@ type scenarioSessionProvider struct {
 	*sessionProviderStub
 
 	configuration *configuredSessionStub
+	agents        *agentProviderStub
 	getErr        error
 	findErr       error
 	returnedID    string
@@ -80,7 +81,7 @@ func (p *scenarioSessionProvider) CreateConfiguredSession(ctx context.Context, u
 	defer p.mu.Unlock()
 	p.remote.AgentConfiguration = openaiapi.EffectiveSessionAgent(p.agents.remote.Config, agent)
 	p.remote.AgentConfigurationDigest = openaiapi.AgentConfigurationDigest(p.remote.AgentConfiguration)
-	p.remote.EnvironmentType = "self_hosted"
+	p.remote.EnvironmentType = executorRuntimeSelfHostedType
 	return p.remote, err
 }
 
@@ -134,6 +135,7 @@ var _ = Describe("Session lifecycle scenarios with the shipped CRD", func() {
 		pod := readPod()
 		pod.Status.Phase = corev1.PodRunning
 		pod.Status.Conditions = []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}
+		pod.Status.ContainerStatuses = []corev1.ContainerStatus{runningExecutorStatus(pod)}
 		Expect(shippedK8sClient.Status().Update(ctx, pod)).To(Succeed())
 		connections.state.Connected = true
 		connections.state.Sequence++
@@ -187,12 +189,13 @@ var _ = Describe("Session lifecycle scenarios with the shipped CRD", func() {
 				Agent:        &agentsv1alpha1.SessionAgentOverrides{Reasoning: &agentsv1alpha1.AgentReasoning{Effort: &effort}},
 				SpendControl: &agentsv1alpha1.SessionSpendControl{Mode: spendModeUnlimited}}}
 		Expect(shippedK8sClient.Create(ctx, session)).To(Succeed())
-		lifecycle := &sessionProviderStub{agents: agents}
-		provider = &scenarioSessionProvider{sessionProviderStub: lifecycle, configuration: &configuredSessionStub{lifecycle: lifecycle}}
+		lifecycle := &sessionProviderStub{}
+		provider = &scenarioSessionProvider{sessionProviderStub: lifecycle,
+			configuration: &configuredSessionStub{lifecycle: lifecycle}, agents: agents}
 		connections = &scenarioConnections{connectionStub: connectionStub{state: openaiapi.Connection{Subscribed: true, Epoch: "scenario-stream"}}}
 		r = &SessionReconciler{Client: shippedK8sClient, APIReader: shippedK8sClient, Scheme: shippedK8sClient.Scheme(), OpenAI: provider,
 			Agents: agents, Environments: environmentProvider, Configuration: provider, AgentOwnerScope: testAgentScope,
-			Connections: connections, ExecutorImage: testExecutorImage}
+			Connections: connections, ExecutorImages: []string{testExecutorImage}}
 	})
 	AfterEach(func() {
 		var pods corev1.PodList

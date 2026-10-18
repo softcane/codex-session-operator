@@ -140,63 +140,10 @@ func (s *PostgreSQLStore) RecordSummaries(ctx context.Context, namespace, kind s
 		if r.Work != nil {
 			r.Work.Events = nil
 		}
-		if r.Issue != nil {
-			r.Issue.Deliveries = nil
-		}
 		records = append(records, r)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, safeSQLError(err)
 	}
 	return records, nil
-}
-
-func (s *PostgreSQLStore) LookupWorkEvent(ctx context.Context, namespace, route, key string) (Record, WorkEvent, bool, error) {
-	ctx, cancel := context.WithTimeout(ctx, _sqlTimeout)
-	defer cancel()
-	var uid, digest string
-	err := s.pool.QueryRow(ctx, `SELECT uid,digest FROM gateway_keys WHERE kind='work-event' AND namespace=$1 AND scope=$2 AND key=$3`, namespace, route, key).Scan(&uid, &digest)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return Record{}, WorkEvent{}, false, nil
-	}
-	if err != nil {
-		return Record{}, WorkEvent{}, false, safeSQLError(err)
-	}
-	r, err := s.GetInNamespace(ctx, namespace, uid)
-	if err != nil {
-		return Record{}, WorkEvent{}, false, err
-	}
-	if r.Work != nil {
-		for _, event := range r.Work.Events {
-			if event.ID == key && event.Digest == digest {
-				return r, event, true, nil
-			}
-		}
-	}
-	return Record{}, WorkEvent{}, false, errUnavailable
-}
-
-func (s *PostgreSQLStore) LookupIssueDelivery(ctx context.Context, namespace, route, key string) (Record, IssueDelivery, bool, error) {
-	ctx, cancel := context.WithTimeout(ctx, _sqlTimeout)
-	defer cancel()
-	var uid, digest string
-	err := s.pool.QueryRow(ctx, `SELECT uid,digest FROM gateway_keys WHERE kind='issue-event' AND namespace=$1 AND scope=$2 AND key=$3`, namespace, route, key).Scan(&uid, &digest)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return Record{}, IssueDelivery{}, false, nil
-	}
-	if err != nil {
-		return Record{}, IssueDelivery{}, false, safeSQLError(err)
-	}
-	r, err := s.GetInNamespace(ctx, namespace, uid)
-	if err != nil {
-		return Record{}, IssueDelivery{}, false, err
-	}
-	if r.Issue != nil {
-		for _, delivery := range r.Issue.Deliveries {
-			if delivery.ID == key && delivery.Digest == digest {
-				return r, delivery, true, nil
-			}
-		}
-	}
-	return Record{}, IssueDelivery{}, false, errUnavailable
 }

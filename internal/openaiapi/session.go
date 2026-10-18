@@ -55,57 +55,6 @@ type Session struct {
 	SpendControlMalformed                                                     bool
 }
 
-// CreateSelfHostedSession issues exactly one POST, without SDK retries.
-// The caller must persist a finalizer and creation claim before calling it.
-func (c *Client) CreateSelfHostedSession(ctx context.Context, uid, workspace string) (Session, error) {
-	return c.createSelfHostedSession(ctx, uid, workspace, "")
-}
-
-// CreateAgentSession copies the selected saved Agent without overriding its model.
-func (c *Client) CreateAgentSession(ctx context.Context, uid, workspace, agentID string) (Session, error) {
-	if agentID == "" {
-		return Session{}, errors.New("saved Agent ID is required")
-	}
-	return c.createSelfHostedSession(ctx, uid, workspace, agentID)
-}
-
-func (c *Client) createSelfHostedSession(ctx context.Context, uid, workspace, agentID string) (Session, error) {
-	ctx, cancel := context.WithTimeout(ctx, callTimeout)
-	defer cancel()
-	body := openai.BetaAgentSessionNewParams{
-		Environment: openai.EnvironmentParamOfParamSelfHosted(workspace),
-		Metadata:    map[string]string{ownerKey: uid, operatorKey: operatorValue},
-	}
-	if agentID == "" {
-		body.Agent = openai.BetaAgentSessionNewParamsAgent{Model: openai.String(SessionModel)}
-	} else {
-		body.AgentID = openai.String(agentID)
-	}
-	remote, err := c.SDK.Beta.Agents.Sessions.New(ctx, body, option.WithMaxRetries(0))
-	if err != nil {
-		return Session{}, safeError(createOperation, err)
-	}
-	return summarize(remote), nil
-}
-
-// CreateEnvironmentSession sends full resolved settings, including the explicit SDK gap path.
-func (c *Client) CreateEnvironmentSession(ctx context.Context, uid, agentID string, environment map[string]any) (Session, error) {
-	ctx, cancel := context.WithTimeout(ctx, callTimeout)
-	defer cancel()
-	body := openai.BetaAgentSessionNewParams{Metadata: map[string]string{ownerKey: uid, operatorKey: operatorValue}}
-	if agentID == "" {
-		body.Agent = openai.BetaAgentSessionNewParamsAgent{Model: openai.String(SessionModel)}
-	} else {
-		body.AgentID = openai.String(agentID)
-	}
-	// v3.68.0 omits ContainerSize. WithJSONSet preserves that documented field and explicit empty/false settings.
-	remote, err := c.SDK.Beta.Agents.Sessions.New(ctx, body, option.WithMaxRetries(0), option.WithJSONSet("environment", environment))
-	if err != nil {
-		return Session{}, safeError(createOperation, err)
-	}
-	return summarize(remote), nil
-}
-
 // GetSession re-observes remote state. It never provisions a replacement.
 func (c *Client) GetSession(ctx context.Context, id string) (Session, error) {
 	ctx, cancel := context.WithTimeout(ctx, callTimeout)

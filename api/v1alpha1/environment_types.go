@@ -33,8 +33,7 @@ type EnvironmentSpec struct {
 	// +optional
 	OpenAIHosted *HostedEnvironment `json:"openaiHosted,omitempty"`
 	// +kubebuilder:validation:Enum=Delete;Retain
-	// +optional
-	DeletionPolicy string `json:"deletionPolicy,omitempty"`
+	DeletionPolicy string `json:"deletionPolicy"`
 }
 
 // SelfHostedEnvironment describes platform-approved local compute.
@@ -55,9 +54,13 @@ type SelfHostedEnvironment struct {
 	// +optional
 	WorkspaceSize string `json:"workspaceSize,omitempty"`
 	// WorkspaceStorage selects whether files survive executor Pod replacement.
-	// Omission preserves the legacy ephemeral workspace behavior.
+	// Omission selects an ephemeral workspace with the configured size.
 	// +optional
 	WorkspaceStorage *WorkspaceStorage `json:"workspaceStorage,omitempty"`
+	// Repository prepares a trusted checkout before the executor starts.
+	// Changes apply only to future Sessions; replacement Pods preserve existing files.
+	// +optional
+	Repository *RepositorySpec `json:"repository,omitempty"`
 	// +optional
 	Resources *ExecutorResources `json:"resources,omitempty"`
 	// +kubebuilder:validation:MaxItems=16
@@ -65,6 +68,40 @@ type SelfHostedEnvironment struct {
 	// +listMapKey=name
 	// +optional
 	Capabilities []LocalCapability `json:"capabilities,omitempty"`
+}
+
+// RepositorySpec pins a platform-approved, credential-free HTTPS repository.
+// +kubebuilder:validation:XValidation:rule="!has(self.mountCredentialsInExecutor) || !self.mountCredentialsInExecutor || has(self.credentialSecretRef)",message="executor credential mounting requires credentialSecretRef"
+type RepositorySpec struct {
+	// URL must also be approved by the operator's exact repository URL allowlist.
+	// +kubebuilder:validation:Pattern="^https://[^/@?#]+/[^?#]+$"
+	// +kubebuilder:validation:MaxLength=2048
+	URL string `json:"url"`
+	// Commit is a complete immutable SHA-1 object identity, never a branch or tag.
+	// +kubebuilder:validation:Pattern="^[a-f0-9]{40}$"
+	Commit string `json:"commit"`
+	// CredentialSecretRef selects protected material mounted into preparation by default.
+	// +optional
+	CredentialSecretRef *RepositoryCredentialSecretReference `json:"credentialSecretRef,omitempty"`
+	// MountCredentialsInExecutor explicitly exposes the selected repository credential
+	// files to task commands. Omission keeps credentials in preparation only.
+	// Credential permissions must be restricted by the Git hosting provider.
+	// +optional
+	MountCredentialsInExecutor bool `json:"mountCredentialsInExecutor,omitempty"`
+}
+
+// RepositoryCredentialSecretReference cannot select arbitrary namespace Secrets.
+// +kubebuilder:validation:XValidation:rule="!has(self.usernameKey) || self.usernameKey != self.key",message="repository token and username keys must be distinct"
+type RepositoryCredentialSecretReference struct {
+	// +kubebuilder:validation:Enum=codex-repository
+	Name string `json:"name"`
+	// Key selects the access token; its value is never placed in public configuration.
+	// +kubebuilder:validation:Pattern="^[a-zA-Z0-9._-]{1,253}$"
+	Key string `json:"key"`
+	// UsernameKey selects an optional username; omission uses x-access-token.
+	// +kubebuilder:validation:Pattern="^[a-zA-Z0-9._-]{1,253}$"
+	// +optional
+	UsernameKey string `json:"usernameKey,omitempty"`
 }
 
 // WorkspaceStorage controls the Session-owned workspace claim lifecycle.
@@ -106,13 +143,13 @@ type ExecutorResources struct {
 
 // LocalCapability is a versioned /bundle image copied before the executor starts.
 type LocalCapability struct {
-	// +kubebuilder:validation:Pattern="^[a-z][a-z0-9-]{0,31}$"
+	// +kubebuilder:validation:Pattern="^[a-z]([a-z0-9-]{0,30}[a-z0-9])?$"
 	Name string `json:"name"`
 	// +kubebuilder:validation:Pattern="^[^\\s@]+@sha256:[a-f0-9]{64}$"
 	// +kubebuilder:validation:MaxLength=512
 	Image string `json:"image"`
 	// Path selects the actual plugin root, or a directory containing skills.
-	// +kubebuilder:validation:Pattern="^/capabilities/[a-z][a-z0-9-]{0,31}$"
+	// +kubebuilder:validation:Pattern="^/capabilities/[a-z]([a-z0-9-]{0,30}[a-z0-9])?$"
 	Path string `json:"path"`
 	// +kubebuilder:validation:Enum=plugin;skills
 	Type string `json:"type"`
@@ -311,8 +348,7 @@ type EnvironmentStatus struct {
 
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
-// +kubebuilder:validation:XValidation:rule="oldSelf.hasValue() ? (!has(oldSelf.value().spec.deletionPolicy) || has(self.spec.deletionPolicy)) : has(self.spec.deletionPolicy)",message="New Environments require an explicit deletionPolicy; once set it cannot be removed",optionalOldSelf=true
-// +kubebuilder:validation:XValidation:rule="self.spec.mode != 'selfHosted' || (oldSelf.hasValue() ? (!has(oldSelf.value().spec.selfHosted.workspaceStorage) || has(self.spec.selfHosted.workspaceStorage)) : has(self.spec.selfHosted.workspaceStorage))",message="New selfHosted Environments require workspaceStorage; once set it cannot be removed",optionalOldSelf=true
+// +kubebuilder:validation:XValidation:rule="has(self.spec.deletionPolicy)",message="Environments require deletionPolicy"
 
 // Environment is the Schema for the environments API
 type Environment struct {

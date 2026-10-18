@@ -1,0 +1,5 @@
+ARG CAPABILITY_BASE=debian:bookworm-slim@sha256:7c7b2c966bc9ee8cedfeef67e0e279108992c77681fa595db4a9d65c06ccc587
+FROM ${CAPABILITY_BASE}
+
+COPY --chown=1000:1000 .agents/skills/ /bundle/skills/
+USER 1000:1000

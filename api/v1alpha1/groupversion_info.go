@@ -30,9 +30,6 @@ var (
 	// This name is used by applyconfiguration generators (e.g. controller-gen).
 	SchemeGroupVersion = schema.GroupVersion{Group: "agents.softcane.io", Version: "v1alpha1"}
 
-	// GroupVersion is an alias for SchemeGroupVersion, for backward compatibility.
-	GroupVersion = SchemeGroupVersion
-
 	// SchemeBuilder is used to add go types to the GroupVersionKind scheme.
 	SchemeBuilder = runtime.NewSchemeBuilder(func(scheme *runtime.Scheme) error {
 		metav1.AddToGroupVersion(scheme, SchemeGroupVersion)

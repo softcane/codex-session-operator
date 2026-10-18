@@ -47,13 +47,19 @@ var _ = Describe("Persistent Session workspaces (real Kubernetes API)", func() {
 			Spec: agentsv1alpha1.SessionSpec{AgentRef: &agentsv1alpha1.AgentReference{Name: "saved-agent"}, EnvironmentRef: &agentsv1alpha1.AgentReference{Name: "saved-environment"},
 				SpendControl: &agentsv1alpha1.SessionSpendControl{Mode: spendModeUnlimited}}}
 		Expect(k8sClient.Create(ctx, session)).To(Succeed())
-		session.Status.EnvironmentSnapshot = &agentsv1alpha1.SessionEnvironmentSnapshot{Profile: agentsv1alpha1.EnvironmentSpec{Mode: testSelfHostedMode, SelfHosted: &agentsv1alpha1.SelfHostedEnvironment{
+		agentConfiguration := map[string]any{agentModelField: openaiapi.SessionModel}
+		session.Status.EnvironmentSnapshot = &agentsv1alpha1.SessionEnvironmentSnapshot{Profile: agentsv1alpha1.EnvironmentSpec{Mode: testSelfHostedMode, DeletionPolicy: deletePolicy, SelfHosted: &agentsv1alpha1.SelfHostedEnvironment{
 			Image: testExecutorImage, Architecture: workspaceTestArch, WorkspaceDirectory: defaultWorkspace, WorkspaceSize: workspaceTestSize,
 			WorkspaceStorage: &agentsv1alpha1.WorkspaceStorage{Type: sandbox.WorkspaceStoragePersistent, StorageClassName: workspaceTestClass, ClaimDeletionPolicy: policy}}}}
+		session.Status.AgentSnapshot = &agentsv1alpha1.SessionAgentSnapshot{OpenAIAgentID: testAgentID,
+			Model: openaiapi.SessionModel, ConfigurationDigest: openaiapi.AgentConfigurationDigest(agentConfiguration)}
+		session.Status.CreationOnlyDigest = openaiapi.SessionCreationOnlyDigest(nil)
+		session.Status.CreationAgentDigest = openaiapi.SessionImmutableAgentDigest(agentConfiguration)
 		session.Status.OpenAISessionID = workspaceTestSessionID
+		session.Status.OwnerScope = testAgentScope
 		Expect(k8sClient.Status().Update(ctx, session)).To(Succeed())
 		session = readSession()
-		provider = &sessionProviderStub{remote: openaiapi.Session{ID: workspaceTestSessionID, OwnerUID: string(session.UID)}}
+		provider = &sessionProviderStub{remote: openaiapi.Session{ID: workspaceTestSessionID, OwnerUID: string(session.UID), OwnerScope: testAgentScope}}
 		reconciler = &SessionReconciler{Client: k8sClient, APIReader: k8sClient, Scheme: k8sClient.Scheme(), OpenAI: provider, WorkspaceStorageClasses: []string{workspaceTestClass}}
 	}
 	BeforeEach(func() { makeSession(retainPolicy) })
@@ -103,13 +109,36 @@ var _ = Describe("Persistent Session workspaces (real Kubernetes API)", func() {
 		Expect(apierrors.IsNotFound(k8sClient.Get(ctx, client.ObjectKeyFromObject(claim), &corev1.PersistentVolumeClaim{}))).To(BeTrue())
 	})
 
+	It("persists a recovered remote identity before a Retain workspace commits status", func() {
+		session.Status.OpenAISessionID = ""
+		session.Status.ExecutorImage = testExecutorImage
+		Expect(k8sClient.Status().Update(ctx, session)).To(Succeed())
+		secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: sandbox.ExecutorSecretName, Namespace: namespace},
+			Data: map[string][]byte{sandbox.ExecutorSecretKey: []byte("test-only-placeholder")}}
+		Expect(k8sClient.Create(ctx, secret)).To(Succeed())
+		reconciler.Connections = &connectionStub{state: openaiapi.Connection{Subscribed: true, Epoch: "recovered-stream"}}
+		remote := openaiapi.Session{
+			ID: workspaceTestSessionID, OwnerUID: string(session.UID), EnvironmentID: "env_test",
+			RemoteURL: "https://api.openai.com/v1/agents/api", WorkspaceDirectory: defaultWorkspace,
+			Model: openaiapi.SessionModel, SelfHosted: true, OwnerScope: testAgentScope, AgentID: testAgentID,
+			AgentConfiguration: map[string]any{agentModelField: openaiapi.SessionModel}, EnvironmentType: executorRuntimeSelfHostedType,
+		}
+		_, err := reconciler.track(ctx, readSession(), remote)
+		Expect(err).NotTo(HaveOccurred())
+		stored := readSession()
+		Expect(stored.Status.WorkspaceClaimUID).To(Equal(string(readClaim().UID)))
+		Expect(stored.Status.OpenAISessionID).To(Equal(remote.ID))
+		Expect(stored.Status.EnvironmentID).To(Equal(remote.EnvironmentID))
+		Expect(stored.Status.RemoteURL).To(Equal(remote.RemoteURL))
+	})
+
 	It("admits only complete persistent and explicit ephemeral workspace settings", func() {
 		settings := []struct {
 			name    string
 			storage *agentsv1alpha1.WorkspaceStorage
 			valid   bool
 		}{
-			{name: "new-omission-rejected"},
+			{name: "omitted-ephemeral", valid: true},
 			{name: "explicit-ephemeral", storage: &agentsv1alpha1.WorkspaceStorage{Type: sandbox.WorkspaceStorageEphemeral}, valid: true},
 			{name: "persistent", storage: &agentsv1alpha1.WorkspaceStorage{Type: sandbox.WorkspaceStoragePersistent, StorageClassName: workspaceTestClass, ClaimDeletionPolicy: retainPolicy}, valid: true},
 			{name: "missing-policy", storage: &agentsv1alpha1.WorkspaceStorage{Type: sandbox.WorkspaceStoragePersistent, StorageClassName: workspaceTestClass}},
@@ -124,15 +153,33 @@ var _ = Describe("Persistent Session workspaces (real Kubernetes API)", func() {
 		}
 	})
 
-	It("accepts a legacy Environment profile frozen into Session status", func() {
-		legacy := &agentsv1alpha1.Session{ObjectMeta: metav1.ObjectMeta{Name: "legacy-snapshot", Namespace: namespace}, Spec: agentsv1alpha1.SessionSpec{
+	It("rejects a trailing hyphen capability name at Kubernetes admission", func() {
+		environment := &agentsv1alpha1.Environment{
+			ObjectMeta: metav1.ObjectMeta{Name: "capability-admission", Namespace: namespace},
+			Spec: agentsv1alpha1.EnvironmentSpec{Mode: testSelfHostedMode, DeletionPolicy: deletePolicy,
+				SelfHosted: &agentsv1alpha1.SelfHostedEnvironment{
+					Image: testExecutorImage, Architecture: workspaceTestArch,
+					WorkspaceStorage: &agentsv1alpha1.WorkspaceStorage{Type: sandbox.WorkspaceStorageEphemeral},
+					Capabilities:     []agentsv1alpha1.LocalCapability{{Name: "helper", Image: testExecutorImage, Path: "/capabilities/helper", Type: "skills"}},
+				},
+			},
+		}
+		Expect(k8sClient.Create(ctx, environment)).To(Succeed())
+		environment.Spec.SelfHosted.Capabilities[0].Name = "helper-"
+		environment.Spec.SelfHosted.Capabilities[0].Path = "/capabilities/helper-"
+		Expect(apierrors.IsInvalid(k8sClient.Update(ctx, environment))).To(BeTrue())
+	})
+
+	It("accepts the current omitted-ephemeral profile in a frozen Session snapshot", func() {
+		current := &agentsv1alpha1.Session{ObjectMeta: metav1.ObjectMeta{Name: "ephemeral-snapshot", Namespace: namespace}, Spec: agentsv1alpha1.SessionSpec{
 			AgentRef: &agentsv1alpha1.AgentReference{Name: "saved-agent"}, EnvironmentRef: &agentsv1alpha1.AgentReference{Name: "saved-environment"},
 			SpendControl: &agentsv1alpha1.SessionSpendControl{Mode: spendModeUnlimited}}}
-		Expect(k8sClient.Create(ctx, legacy)).To(Succeed())
-		legacy.Status.EnvironmentSnapshot = &agentsv1alpha1.SessionEnvironmentSnapshot{Profile: agentsv1alpha1.EnvironmentSpec{
-			Mode: testSelfHostedMode, SelfHosted: &agentsv1alpha1.SelfHostedEnvironment{Image: testExecutorImage, Architecture: workspaceTestArch, WorkspaceDirectory: defaultWorkspace}}}
-		Expect(k8sClient.Status().Update(ctx, legacy)).To(Succeed())
-		Expect(k8sClient.Delete(ctx, legacy)).To(Succeed())
+		Expect(k8sClient.Create(ctx, current)).To(Succeed())
+		current.Status.EnvironmentSnapshot = &agentsv1alpha1.SessionEnvironmentSnapshot{Profile: agentsv1alpha1.EnvironmentSpec{
+			Mode: testSelfHostedMode, DeletionPolicy: deletePolicy,
+			SelfHosted: &agentsv1alpha1.SelfHostedEnvironment{Image: testExecutorImage, Architecture: workspaceTestArch, WorkspaceDirectory: defaultWorkspace}}}
+		Expect(k8sClient.Status().Update(ctx, current)).To(Succeed())
+		Expect(k8sClient.Delete(ctx, current)).To(Succeed())
 	})
 
 	It("marks an unowned Retain PVC only after remote cleanup", func() {

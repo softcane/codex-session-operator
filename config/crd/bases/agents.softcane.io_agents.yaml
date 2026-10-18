@@ -360,6 +360,7 @@ spec:
                 type: array
                 x-kubernetes-list-type: atomic
             required:
+            - deletionPolicy
             - model
             type: object
             x-kubernetes-validations:
@@ -457,10 +458,8 @@ spec:
         - spec
         type: object
         x-kubernetes-validations:
-        - message: new Agents require deletionPolicy; an existing policy cannot be
-            removed
-          optionalOldSelf: true
-          rule: has(self.spec.deletionPolicy) || (oldSelf.hasValue() && !has(oldSelf.value().spec.deletionPolicy))
+        - message: Agents require deletionPolicy
+          rule: has(self.spec.deletionPolicy)
     served: true
     storage: true
     subresources:

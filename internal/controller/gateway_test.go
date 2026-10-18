@@ -34,7 +34,7 @@ func (g *gatewayStub) InitialInput(context.Context, string) (string, string, err
 	}
 	return g.text, g.key, nil
 }
-func (g *gatewayStub) ValidateInvestigation(context.Context, *agentsv1alpha1.Session, *agentsv1alpha1.SessionEnvironmentSnapshot) error {
+func (g *gatewayStub) ValidateSessionPolicy(context.Context, *agentsv1alpha1.Session, *agentsv1alpha1.SessionEnvironmentSnapshot) error {
 	return g.policyErr
 }
 func (g *gatewayStub) ValidateTools(context.Context, map[string]any) error { return nil }
@@ -67,9 +67,10 @@ func (p *initialSessionStub) CreateInitialSession(ctx context.Context, uid, scop
 	return *remote, err
 }
 
-var _ = Describe("Legacy gateway coordinated none creation (pre-migration API server)", func() {
-	useLegacySessionSchema()
+var _ = Describe("Gateway coordinated none creation", func() {
 	var environment *agentsv1alpha1.Environment
+	var agent *agentsv1alpha1.Agent
+	var agents *agentProviderStub
 	var session *agentsv1alpha1.Session
 	var r *SessionReconciler
 	var gateway *gatewayStub
@@ -85,6 +86,15 @@ var _ = Describe("Legacy gateway coordinated none creation (pre-migration API se
 		return err
 	}
 	BeforeEach(func() {
+		agent = &agentsv1alpha1.Agent{ObjectMeta: metav1.ObjectMeta{GenerateName: "gateway-agent-", Namespace: testNamespace},
+			Spec: agentsv1alpha1.AgentSpec{Model: openaiapi.SessionModel, DeletionPolicy: deletePolicy}}
+		Expect(k8sClient.Create(ctx, agent)).To(Succeed())
+		agents = &agentProviderStub{}
+		ar := &AgentReconciler{Client: k8sClient, APIReader: k8sClient, OpenAI: agents, OwnerScope: testAgentScope}
+		for range 3 {
+			_, err := ar.Reconcile(ctx, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(agent)})
+			Expect(err).NotTo(HaveOccurred())
+		}
 		environment = &agentsv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{GenerateName: "gateway-none-", Namespace: testNamespace}, Spec: agentsv1alpha1.EnvironmentSpec{Mode: _noneMode, DeletionPolicy: "Delete"}}
 		Expect(k8sClient.Create(ctx, environment)).To(Succeed())
 		er := &EnvironmentReconciler{Client: k8sClient, APIReader: k8sClient, OwnerScope: testAgentScope, GatewayEnabled: true}
@@ -92,13 +102,16 @@ var _ = Describe("Legacy gateway coordinated none creation (pre-migration API se
 			_, err := er.Reconcile(ctx, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(environment)})
 			Expect(err).NotTo(HaveOccurred())
 		}
-		session = &agentsv1alpha1.Session{ObjectMeta: metav1.ObjectMeta{GenerateName: "gateway-session-", Namespace: testNamespace}, Spec: agentsv1alpha1.SessionSpec{EnvironmentRef: &agentsv1alpha1.AgentReference{Name: environment.Name}}}
+		session = &agentsv1alpha1.Session{ObjectMeta: metav1.ObjectMeta{GenerateName: "gateway-session-", Namespace: testNamespace}, Spec: agentsv1alpha1.SessionSpec{
+			AgentRef: &agentsv1alpha1.AgentReference{Name: agent.Name}, EnvironmentRef: &agentsv1alpha1.AgentReference{Name: environment.Name},
+			SpendControl: &agentsv1alpha1.SessionSpendControl{Mode: spendModeUnlimited}}}
 		Expect(k8sClient.Create(ctx, session)).To(Succeed())
 		lifecycle = &sessionProviderStub{}
 		configured := &configuredSessionStub{lifecycle: lifecycle}
 		initial = &initialSessionStub{configured: configured}
 		gateway = &gatewayStub{}
-		r = &SessionReconciler{Client: k8sClient, APIReader: k8sClient, OpenAI: lifecycle, Configuration: configured, Environments: &environmentProviderStub{}, AgentOwnerScope: testAgentScope, Gateway: gateway, InitialSessions: initial}
+		r = &SessionReconciler{Client: k8sClient, APIReader: k8sClient, OpenAI: lifecycle, Agents: agents,
+			Configuration: configured, Environments: &environmentProviderStub{}, AgentOwnerScope: testAgentScope, Gateway: gateway, InitialSessions: initial}
 	})
 	AfterEach(func() {
 		current := read()
@@ -110,8 +123,13 @@ var _ = Describe("Legacy gateway coordinated none creation (pre-migration API se
 		currentEnvironment.Finalizers = nil
 		Expect(k8sClient.Update(ctx, &currentEnvironment)).To(Succeed())
 		Expect(k8sClient.Delete(ctx, &currentEnvironment)).To(Succeed())
+		var currentAgent agentsv1alpha1.Agent
+		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(agent), &currentAgent)).To(Succeed())
+		currentAgent.Finalizers = nil
+		Expect(k8sClient.Update(ctx, &currentAgent)).To(Succeed())
+		Expect(k8sClient.Delete(ctx, &currentAgent)).To(Succeed())
 	})
-	It("consults the source policy gate when the public issue marker is missing", func() {
+	It("blocks a Session policy failure before claiming remote creation", func() {
 		gateway.text, gateway.key = "issue evidence", _testFirstKey
 		gateway.policyErr = errors.New("source identified by gateway store")
 		Expect(step()).To(Succeed())
@@ -119,30 +137,7 @@ var _ = Describe("Legacy gateway coordinated none creation (pre-migration API se
 		Expect(read().Annotations).To(BeEmpty())
 		Expect(read().Status.CreationAttempted).To(BeFalse())
 		Expect(lifecycle.creates).To(BeZero())
-		Expect(meta.FindStatusCondition(read().Status.Conditions, readyCondition).Reason).To(Equal("InvestigationPolicyBlocked"))
-	})
-	It("blocks an issue policy failure before claiming remote creation", func() {
-		current := read()
-		current.Annotations = map[string]string{"agents.softcane.io/issue-source": "fixture-source"}
-		Expect(k8sClient.Update(ctx, current)).To(Succeed())
-		gateway.text, gateway.key = "issue evidence", _testFirstKey
-		gateway.policyErr = errors.New("policy denied")
-		Expect(step()).To(Succeed())
-		Expect(step()).NotTo(Succeed())
-		Expect(read().Status.CreationAttempted).To(BeFalse())
-		Expect(lifecycle.creates).To(BeZero())
-		Expect(meta.FindStatusCondition(read().Status.Conditions, readyCondition).Reason).To(Equal("InvestigationPolicyBlocked"))
-	})
-	It("blocks issue creation when gateway configuration is disabled", func() {
-		current := read()
-		current.Annotations = map[string]string{"agents.softcane.io/issue-source": "fixture-source"}
-		Expect(k8sClient.Update(ctx, current)).To(Succeed())
-		r.Gateway = nil
-		Expect(step()).To(Succeed())
-		Expect(step()).To(Succeed())
-		Expect(read().Status.CreationAttempted).To(BeFalse())
-		Expect(lifecycle.creates).To(BeZero())
-		Expect(meta.FindStatusCondition(read().Status.Conditions, readyCondition).Reason).To(Equal("GatewayRequired"))
+		Expect(meta.FindStatusCondition(read().Status.Conditions, readyCondition).Reason).To(Equal("SessionPolicyBlocked"))
 	})
 	It("waits for durable initial input then freezes claim before a single create", func() {
 		Expect(step()).To(Succeed())

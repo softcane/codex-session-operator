@@ -8,22 +8,13 @@ rules:
   - ""
   resources:
   - persistentvolumeclaims
-  verbs:
-  - create
-  - delete
-  - get
-  - list
-  - patch
-  - watch
-- apiGroups:
-  - ""
-  resources:
   - pods
   verbs:
   - create
   - delete
   - get
   - list
+  - patch
   - watch
 - apiGroups:
   - ""
@@ -39,6 +30,16 @@ rules:
   - ""
   resourceNames:
   - codex-executor
+  resources:
+  - secrets
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - ""
+  resourceNames:
+  - codex-repository
   resources:
   - secrets
   verbs:
@@ -82,6 +83,7 @@ rules:
   resources:
   - agents/status
   - environments/status
+  - profiles/status
   - sessions/status
   - vaultcredentials/status
   - vaults/status
@@ -89,6 +91,14 @@ rules:
   - get
   - patch
   - update
+- apiGroups:
+  - agents.softcane.io
+  resources:
+  - profiles
+  verbs:
+  - get
+  - list
+  - watch
 - apiGroups:
   - agents.softcane.io
   resources:

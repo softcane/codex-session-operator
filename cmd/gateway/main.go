@@ -40,7 +40,7 @@ func main() {
 func run() (returnErr error) {
 	var (
 		address, internalAddress, authFile, internalTokenFile, certFile, keyFile string
-		issueRoutesFile, workRoutesFile, databaseFile, metricsAddress            string
+		databaseFile, metricsAddress                                             string
 		maxActive, maxRecords                                                    int
 		insecureLocal                                                            bool
 	)
@@ -52,9 +52,6 @@ func run() (returnErr error) {
 		"Secret-mounted controller token")
 	flag.StringVar(&certFile, "gateway-cert", os.Getenv("GATEWAY_CERT"), "TLS certificate")
 	flag.StringVar(&keyFile, "gateway-key", os.Getenv("GATEWAY_KEY"), "TLS private key")
-	flag.StringVar(&issueRoutesFile, "issue-routes-file", os.Getenv("ISSUE_ROUTES_FILE"), "Optional GitHub issue routes")
-	flag.StringVar(&workRoutesFile, "work-routes-file", os.Getenv("WORK_ROUTES_FILE"),
-		"Optional trusted work event routes")
 	flag.StringVar(&databaseFile, "gateway-database-file", os.Getenv("GATEWAY_DATABASE_FILE"),
 		"Required Secret-mounted PostgreSQL DSN")
 	flag.IntVar(&maxActive, "gateway-max-active", 32, "Database active execution quota")
@@ -121,31 +118,8 @@ func run() (returnErr error) {
 	if err := g.EnableSessionManagement(k8s); err != nil {
 		return fmt.Errorf("configure gateway Session management: %w", err)
 	}
-	if workRoutesFile != "" {
-		raw, readErr := os.ReadFile(workRoutesFile)
-		if readErr != nil {
-			return fmt.Errorf("read work routing configuration: %w", readErr)
-		}
-		routes, parseErr := gateway.ParseWorkRoutes(raw)
-		if parseErr != nil {
-			return fmt.Errorf("parse work routing configuration: %w", parseErr)
-		}
-		if err := g.EnableWork(k8s, routes); err != nil {
-			return fmt.Errorf("configure work event routing: %w", err)
-		}
-	}
-	if issueRoutesFile != "" {
-		raw, readErr := os.ReadFile(issueRoutesFile)
-		if readErr != nil {
-			return fmt.Errorf("read issue routing configuration: %w", readErr)
-		}
-		routes, parseErr := gateway.ParseIssueRoutes(raw)
-		if parseErr != nil {
-			return fmt.Errorf("parse issue routing configuration: %w", parseErr)
-		}
-		if err := g.EnableIssues(k8s, routes); err != nil {
-			return fmt.Errorf("configure issue adapter: %w", err)
-		}
+	if err := g.EnableProfiles(k8s); err != nil {
+		return fmt.Errorf("configure Kubernetes Profiles: %w", err)
 	}
 	internalHandler, err := g.InternalHandler(strings.TrimSpace(string(internalToken)))
 	if err != nil {

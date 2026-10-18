@@ -12,6 +12,7 @@ import (
 
 	openai "github.com/openai/openai-go/v3"
 	"github.com/openai/openai-go/v3/option"
+	agentsv1alpha1 "github.com/softcane/codex-session-operator/api/v1alpha1"
 )
 
 const testRemoteURL = "https://api.openai.com/v1/agents/api"
@@ -33,6 +34,12 @@ func remoteJSON(uid, id string) map[string]any {
 }
 func clientForServer(server *httptest.Server, transport http.RoundTripper) *Client {
 	return &Client{SDK: openai.NewClient(option.WithAPIKey("test-placeholder"), option.WithBaseURL(server.URL+"/v1/"), option.WithMaxRetries(0), option.WithHTTPClient(&http.Client{Transport: transport}))}
+}
+
+func createTestConfiguredSession(ctx context.Context, client *Client) (Session, error) {
+	spend := &agentsv1alpha1.SessionSpendControl{Mode: sessionSpendModeUnlimited}
+	return client.CreateConfiguredSession(ctx, "uid-test", "test-scope", "",
+		map[string]any{typeField: selfHostedType, workspaceDirectoryField: testWorkspace}, nil, nil, nil, spend)
 }
 
 type roundTripFunc func(*http.Request) (*http.Response, error)
@@ -101,7 +108,7 @@ func TestCreateContractAndLostResponse(t *testing.T) {
 		return res, nil
 	})
 	c := clientForServer(server, drop)
-	_, err := c.CreateSelfHostedSession(context.Background(), "uid-test", testWorkspace)
+	_, err := createTestConfiguredSession(context.Background(), c)
 	if err == nil || strings.Contains(err.Error(), "private-detail") {
 		t.Fatal("Lost response must produce a sanitized error")
 	}
@@ -194,7 +201,7 @@ func TestProviderErrorsAndDeleteConfirmation(t *testing.T) {
 					t.Fatal("Missing NotFound classification")
 				}
 			case createFailureScenario:
-				_, err = c.CreateSelfHostedSession(context.Background(), "uid-test", testWorkspace)
+				_, err = createTestConfiguredSession(context.Background(), c)
 			default:
 				err = c.DeleteSession(context.Background(), testSessionID)
 			}
@@ -230,7 +237,7 @@ func TestContextCancellationAndCallDeadline(t *testing.T) {
 				return nil, errors.New("test transport error")
 			})
 			c := &Client{SDK: openai.NewClient(option.WithAPIKey("test-placeholder"), option.WithHTTPClient(&http.Client{Transport: transport}))}
-			_, err := c.CreateSelfHostedSession(ctx, "uid-test", testWorkspace)
+			_, err := createTestConfiguredSession(ctx, c)
 			if err == nil || (canceled && !errors.Is(err, context.Canceled)) {
 				t.Fatalf("Context error mismatch: %v", err)
 			}

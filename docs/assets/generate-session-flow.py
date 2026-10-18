@@ -20,7 +20,7 @@ import random
 from PIL import Image, ImageDraw, ImageFont
 
 
-WIDTH, HEIGHT, SCALE = 1200, 820, 2
+WIDTH, HEIGHT, SCALE = 1200, 1040, 2
 BACKGROUND = "#faf8f4"
 INK = "#363a3b"
 MUTED = "#737771"
@@ -30,18 +30,18 @@ PURPLE = "#8964a9"
 AMBER = "#b48d41"
 GRAY = "#797d76"
 OUTPUT = Path(__file__).resolve().parent
-OVERVIEW = "Choose an approved profile. Save input, create a Session, and keep its history."
+OVERVIEW = "One installation. Durable conversations. A project executor for each self-hosted Session."
 
 CAPTIONS = [
-    "1  Choose an approved profile: Agent, Environment, Vaults and spend policy.",
-    "2  Send the first message to the gateway.",
-    "3  Commit the message and receipt to PostgreSQL.",
-    "4  Return 202 Accepted with a stable conversation ID.",
-    "5  Create a Kubernetes Session in the background.",
-    "6  Freeze the approved settings and create the remote Session.",
-    "7  For self hosted execution, provision a Pod and optional workspace.",
-    "8  Send follow-ups to the same conversation; read history for completion.",
-    "9  Close and keep history. Restart after cleanup to create a new attempt.",
+    "1  Install both services together. The gateway initializes its PostgreSQL tables.",
+    "2  Declare Agent, Environment and Profile. These recipes create no task Pod.",
+    "3  Start a task from the Profile with a stable idempotency key.",
+    "4  Commit input and its receipt to PostgreSQL, then return 202 Accepted.",
+    "5  The gateway creates a Kubernetes Session from the approved Profile.",
+    "6  The controller freezes approved settings and creates the remote OpenAI Session.",
+    "7  Provision the application executor, prepare its repository, and connect its tools.",
+    "8  The gateway delivers messages and saves turns. Read history to confirm completion.",
+    "9  Follow up, close, or start fresh after cleanup. Saved conversation history remains.",
 ]
 
 
@@ -115,70 +115,109 @@ def box(draw: ImageDraw.ImageDraw, bounds: tuple[int, int, int, int],
                seed + 8, width=0.6)
 
 
-def card(draw: ImageDraw.ImageDraw, x: int, title: str, line1: str,
-         line2: str, color: str, seed: int) -> None:
-    box(draw, (x, 196, x + 240, 330), color, seed)
-    text(draw, (x + 120, 215), title, 26, color, center=True)
-    text(draw, (x + 120, 263), line1, 20, center=True)
-    text(draw, (x + 120, 293), line2, 19, MUTED, center=True)
+def card(draw: ImageDraw.ImageDraw, x: int, y: int, title: str, line1: str,
+         line2: str, color: str, seed: int, title_size: int = 25) -> None:
+    box(draw, (x, y, x + 240, y + 120), color, seed)
+    text(draw, (x + 120, y + 15), title, title_size, color, center=True)
+    text(draw, (x + 120, y + 59), line1, 19, center=True)
+    text(draw, (x + 120, y + 90), line2, 18, MUTED, center=True)
+
+
+def route(draw: ImageDraw.ImageDraw, points: list[tuple[int, int]], color: str,
+          seed: int, progress: float = 1, two_way: bool = False,
+          dashed: bool = False) -> None:
+    lengths = [math.dist(start, end) for start, end in zip(points, points[1:])]
+    remaining = sum(lengths) * progress
+    for index, (start, end, length) in enumerate(zip(points, points[1:], lengths)):
+        if remaining <= 0:
+            break
+        part = min(1, remaining / length)
+        if index == len(lengths) - 1:
+            arrow(draw, start, end, color, seed + index, part, dashed=dashed)
+        else:
+            tip = tuple(start[axis] + (end[axis] - start[axis]) * part
+                        for axis in (0, 1))
+            stroke(draw, start, tip, color, seed + index, dashed=dashed, width=2)
+        remaining -= length
+    if two_way and progress == 1:
+        # Add a reverse arrowhead on the first segment without retracing a route.
+        start, following = points[:2]
+        angle = math.atan2(start[1] - following[1], start[0] - following[0])
+        for delta in (-0.52, 0.52):
+            tail = (start[0] - 10 * math.cos(angle + delta),
+                    start[1] - 10 * math.sin(angle + delta))
+            stroke(draw, tail, start, color, seed + 20, width=2)
 
 
 def render(stage: int, progress: float = 1, caption: str | None = None) -> Image.Image:
     image = Image.new("RGB", (WIDTH * SCALE, HEIGHT * SCALE), BACKGROUND)
     draw = ImageDraw.Draw(image)
     text(draw, (48, 27), "Codex Session Operator", 36)
-    text(draw, (48, 80), "From a first message to a managed conversation", 23, MUTED)
+    text(draw, (48, 80), "my-go-project: installation, conversations, and self-hosted execution", 23, MUTED)
     draw.rounded_rectangle((48 * SCALE, 128 * SCALE, 1152 * SCALE, 167 * SCALE),
                            radius=5 * SCALE, fill="#efeee8")
     text(draw, (62, 134), caption or CAPTIONS[stage], 20)
 
-    card(draw, 48, "Approved profile", "Agent + Environment", "Vaults + spend policy", GRAY, 10)
-    if stage >= 1:
-        arrow(draw, (288, 263), (332, 263), BLUE, 20,
-              progress=progress if stage == 1 else 1)
-        card(draw, 336, "Gateway", "API + browser UI", "accept first message", BLUE, 30)
-    if stage >= 2:
-        arrow(draw, (456, 333), (456, 384), BLUE, 40,
-              progress=progress if stage == 2 else 1)
-        box(draw, (336, 390, 576, 511), BLUE, 50)
-        text(draw, (456, 407), "PostgreSQL", 25, BLUE, center=True)
-        text(draw, (456, 453), "inputs + receipts", 20, center=True)
-        text(draw, (456, 482), "history + approvals", 19, MUTED, center=True)
-    if stage >= 3:
-        box(draw, (48, 390, 288, 511), GREEN, 60)
-        text(draw, (168, 407), "202 Accepted", 25, GREEN, center=True)
-        text(draw, (168, 453), "after database commit", 19, center=True)
-        text(draw, (168, 482), "stable conversation ID", 18, MUTED, center=True)
-    if stage >= 4:
-        arrow(draw, (576, 263), (620, 263), GREEN, 70,
-              progress=progress if stage == 4 else 1)
-        card(draw, 624, "Kubernetes", "Session + operator", "freeze approved settings", GREEN, 80)
-    if stage >= 5:
-        arrow(draw, (864, 263), (908, 263), PURPLE, 90,
-              progress=progress if stage == 5 else 1)
-        card(draw, 912, "OpenAI", "Remote Session", "model + tools", PURPLE, 100)
-    if stage >= 6:
-        arrow(draw, (744, 333), (744, 384), GREEN, 110,
-              progress=progress if stage == 6 else 1, dashed=True)
-        arrow(draw, (1032, 384), (1032, 334), PURPLE, 120, dashed=True)
-        box(draw, (624, 390, 1152, 511), GREEN, 130, dashed=True)
-        text(draw, (888, 405), "Self hosted only", 20, GREEN, center=True)
-        text(draw, (888, 444), "Executor Pod", 25, center=True)
-        text(draw, (888, 482), "optional workspace PVC", 19, MUTED, center=True)
+    def connect(first_stage: int, points: list[tuple[int, int]], color: str,
+                seed: int, **options: bool) -> None:
+        if stage >= first_stage:
+            route(draw, points, color, seed,
+                  progress=progress if stage == first_stage else 1, **options)
 
+    # Installation boundaries are independent of conversation state.
+    box(draw, (318, 216, 882, 416), GRAY, 10, dashed=True)
+    text(draw, (600, 229), "One install, separate images", 18, MUTED, center=True)
+    connect(1, [(168, 460), (168, 390)], GRAY, 30)
+    connect(2, [(288, 330), (336, 330)], BLUE, 40)
+    connect(0, [(456, 390), (456, 460)], BLUE, 50, two_way=True)
+    connect(4, [(576, 360), (610, 360), (610, 520), (624, 520)], BLUE, 60)
+    connect(5, [(744, 460), (744, 390)], GREEN, 70)
+    connect(5, [(864, 330), (912, 330)], GREEN, 80)
+    connect(6, [(864, 360), (892, 360), (892, 520), (912, 520)], GREEN, 90)
+    connect(6, [(1032, 390), (1032, 460)], PURPLE, 100, two_way=True)
+    connect(6, [(1032, 580), (1032, 650)], GREEN, 110, two_way=True)
+    connect(7, [(456, 270), (456, 192), (1032, 192), (1032, 270)], PURPLE,
+            120, two_way=True)
     if stage >= 7:
-        text(draw, (48, 561), "Read history to confirm a completed turn.", 25)
-        text(draw, (48, 602), "A receipt confirms saved input; completion comes later.", 20, MUTED)
-        box(draw, (48, 661, 388, 765), BLUE, 140)
-        text(draw, (218, 674), "Follow up", 25, BLUE, center=True)
-        text(draw, (218, 722), "same conversation", 20, center=True)
+        text(draw, (744, 171), "messages + turns", 16, PURPLE, center=True)
+
+    card(draw, 336, 460, "PostgreSQL", "messages + history", "external or local", BLUE, 130)
+    card(draw, 336, 270, "Gateway Deployment", "input + history",
+         "gateway image", BLUE, 150, title_size=22)
+    card(draw, 624, 270, "Controller Deployment", "resource lifecycle",
+         "controller image", GREEN, 160, title_size=21)
+    if stage >= 1:
+        card(draw, 48, 270, "Client", "start from Profile", "stable request key", GRAY, 170)
+        card(draw, 48, 460, "my-go-project", "Agent + Environment",
+             "Profile + spend policy", GRAY, 180)
+    if stage > 3 or (stage == 3 and progress == 1):
+        card(draw, 48, 650, "202 Accepted", "input saved durably",
+             "completion comes later", BLUE, 190)
+    if stage >= 4:
+        card(draw, 624, 460, "Kubernetes Session", "one conversation attempt",
+             "created by the gateway", GREEN, 200, title_size=22)
+    if stage >= 5:
+        card(draw, 912, 270, "OpenAI", "managed agent loop", "remote Session", PURPLE, 210)
+    if stage >= 6:
+        card(draw, 912, 460, "Executor Pod", "Codex + project tools",
+             "selfHosted only", GREEN, 220)
+        card(draw, 912, 650, "Workspace PVC", "source + edits + commits",
+             "per-Session storage", GREEN, 230, title_size=24)
+        text(draw, (48, 809), "Image layers: shared Codex runtime -> my-go-project tools (Go, Make, compiler).", 22)
+        text(draw, (48, 849), "Repository source is checked out per Session; it is not baked into the shared image.",
+             19, MUTED)
+    if stage >= 7:
+        card(draw, 336, 650, "Read history", "inspect the root turn",
+             "confirm its outcome", BLUE, 240)
     if stage >= 8:
-        box(draw, (430, 661, 770, 765), GRAY, 150)
-        text(draw, (600, 674), "Close", 25, GRAY, center=True)
-        text(draw, (600, 722), "retain saved history", 20, center=True)
-        box(draw, (812, 661, 1152, 765), AMBER, 160)
-        text(draw, (982, 674), "Restart after cleanup", 25, AMBER, center=True)
-        text(draw, (982, 722), "new attempt + Session", 20, center=True)
+        for x, title, detail, color, seed in [
+            (48, "Follow up", "same conversation + workspace", BLUE, 250),
+            (430, "Close", "stop input; retain saved history", GRAY, 260),
+            (812, "Start fresh after cleanup", "new Session + workspace", AMBER, 270),
+        ]:
+            box(draw, (x, 901, x + 340, 1005), color, seed)
+            text(draw, (x + 170, 917), title, 23, color, center=True)
+            text(draw, (x + 170, 965), detail, 18, center=True)
 
     return image.resize((WIDTH, HEIGHT), Image.Resampling.LANCZOS)
 

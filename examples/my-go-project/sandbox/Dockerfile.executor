@@ -1,0 +1,17 @@
+ARG EXECUTOR_BASE=codex-executor:0.162.0-alpha.20
+ARG GO_IMAGE=golang:1.27.2@sha256:007a316059246276cb214df93950be77837545dc78007a73e0291a4963d5d3bf
+FROM ${GO_IMAGE} AS go-toolchain
+FROM ${EXECUTOR_BASE}
+
+USER 0:0
+COPY --from=go-toolchain /usr/local/go /usr/local/go
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends make gcc libc6-dev gh \
+    && rm -rf /var/lib/apt/lists/* \
+    && ln -s /usr/local/go/bin/go /usr/local/bin/go \
+    && ln -s /usr/local/go/bin/gofmt /usr/local/bin/gofmt
+COPY --chmod=0755 sandbox/gh-wrapper /usr/local/bin/gh
+ENV PATH=/usr/local/go/bin:$PATH
+ENV GOCACHE=/workspace/.cache/go-build GOMODCACHE=/workspace/.cache/go-mod GOPATH=/workspace/.cache/go
+ENV CGO_ENABLED=1 GOTOOLCHAIN=local GH_PROMPT_DISABLED=1
+USER 1000:1000

@@ -80,7 +80,8 @@ jobs:
         id: images
         run: |
           repository="${REPOSITORY,,}"
-          echo "operator=ghcr.io/$repository" >> "$GITHUB_OUTPUT"
+          echo "controller=ghcr.io/$repository" >> "$GITHUB_OUTPUT"
+          echo "gateway=ghcr.io/$repository-gateway" >> "$GITHUB_OUTPUT"
           echo "executor=ghcr.io/$repository-executor" >> "$GITHUB_OUTPUT"
       - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
         with:
@@ -92,15 +93,31 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ github.token }}
-      - name: Build and publish operator
-        id: operator
+      - name: Build and publish controller
+        id: controller
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
-          target: operator
+          target: controller
           platforms: linux/amd64,linux/arm64
           push: true
-          tags: ${{ steps.images.outputs.operator }}:${{ env.VERSION }}
+          tags: ${{ steps.images.outputs.controller }}:${{ env.VERSION }}
+          provenance: mode=max
+          sbom: true
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ env.VERSION }}
+            org.opencontainers.image.licenses=Apache-2.0
+      - name: Build and publish gateway
+        id: gateway
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          target: gateway
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.images.outputs.gateway }}:${{ env.VERSION }}
           provenance: mode=max
           sbom: true
           labels: |
@@ -131,35 +148,44 @@ jobs:
           echo "$RUNNER_TEMP/release-venv/bin" >> "$GITHUB_PATH"
       - name: Render immutable deployment assets
         env:
-          OPERATOR_IMAGE: ${{ steps.images.outputs.operator }}@${{ steps.operator.outputs.digest }}
+          CONTROLLER_IMAGE: ${{ steps.images.outputs.controller }}@${{ steps.controller.outputs.digest }}
+          GATEWAY_IMAGE: ${{ steps.images.outputs.gateway }}@${{ steps.gateway.outputs.digest }}
           EXECUTOR_IMAGE: ${{ steps.images.outputs.executor }}@${{ steps.executor.outputs.digest }}
           SOURCE_REVISION: ${{ github.sha }}
         run: |
-          make build-installer IMG="$OPERATOR_IMAGE" EXECUTOR_IMG="$EXECUTOR_IMAGE"
-          make build-gateway-installer IMG="$OPERATOR_IMAGE" EXECUTOR_IMG="$EXECUTOR_IMAGE"
+          make build-installer CONTROLLER_IMG="$CONTROLLER_IMAGE" GATEWAY_IMG="$GATEWAY_IMAGE" EXECUTOR_IMG="$EXECUTOR_IMAGE"
           python3 - <<'PY'
           import json, os, re
           from pathlib import Path
           import yaml
-          operator, executor = os.environ['OPERATOR_IMAGE'], os.environ['EXECUTOR_IMAGE']
-          for image in (operator, executor):
+          controller = os.environ['CONTROLLER_IMAGE']
+          gateway = os.environ['GATEWAY_IMAGE']
+          executor = os.environ['EXECUTOR_IMAGE']
+          for image in (controller, gateway, executor):
               if not re.fullmatch(r'ghcr\.io/[a-z0-9._/-]+@sha256:[0-9a-f]{64}', image):
                   raise SystemExit('An immutable published image digest is required.')
-          for filename in ('install.yaml', 'gateway.yaml'):
-              deployments = [resource for resource in yaml.safe_load_all(Path('dist', filename).read_text()) if resource and resource.get('kind') == 'Deployment']
-              if not deployments:
-                  raise SystemExit(f'{filename}: no Deployment found')
-              for deployment in deployments:
-                  for container in deployment['spec']['template']['spec']['containers']:
-                      if container['image'] != operator:
-                          raise SystemExit(f'{filename}: unexpected container image')
-                      if container['name'] == 'manager' and not any(item.get('name') == 'EXECUTOR_IMAGE' and item.get('value') == executor for item in container.get('env', [])):
-                          raise SystemExit(f'{filename}: executor digest was not configured')
-          Path('dist/images.json').write_text(json.dumps({'version': os.environ['VERSION'], 'revision': os.environ['SOURCE_REVISION'], 'platforms': ['linux/amd64', 'linux/arm64'], 'operator': operator, 'executor': executor}, indent=2) + '\n')
+          expected_deployments = {
+              'codex-session-operator-controller-manager': ('manager', controller),
+              'codex-session-operator-gateway': ('gateway', gateway),
+          }
+          resources = [resource for resource in yaml.safe_load_all(Path('dist/install.yaml').read_text()) if resource]
+          deployments = {resource['metadata']['name']: resource for resource in resources if resource.get('kind') == 'Deployment'}
+          jobs = {resource['metadata']['name']: resource for resource in resources if resource.get('kind') == 'Job'}
+          if set(deployments) != set(expected_deployments):
+              raise SystemExit('install.yaml: expected the controller and gateway Deployments')
+          for name, (container_name, image) in expected_deployments.items():
+              containers = deployments[name]['spec']['template']['spec']['containers']
+              if len(containers) != 1 or containers[0]['name'] != container_name or containers[0]['image'] != image:
+                  raise SystemExit(f'install.yaml: unexpected {name} container image')
+              if container_name == 'manager' and not any(item.get('name') == 'EXECUTOR_IMAGES' and item.get('value') == executor for item in containers[0].get('env', [])):
+                  raise SystemExit('install.yaml: executor digest was not configured')
+          if jobs:
+              raise SystemExit('install.yaml: unexpected Job in runtime-initialized deployment')
+          Path('dist/images.json').write_text(json.dumps({'version': os.environ['VERSION'], 'revision': os.environ['SOURCE_REVISION'], 'platforms': ['linux/amd64', 'linux/arm64'], 'controller': controller, 'gateway': gateway, 'executor': executor}, indent=2) + '\n')
           PY
           git diff --exit-code -- go.mod go.sum api config
           cd dist
-          sha256sum install.yaml gateway.yaml images.json > SHA256SUMS
+          sha256sum install.yaml images.json > SHA256SUMS
       - name: Create GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -169,4 +195,4 @@ jobs:
           if [ "$PRERELEASE" = true ]; then args+=(--prerelease); fi
           gh release create "$VERSION" --repo "$REPOSITORY" --verify-tag \
             --title "$VERSION" --generate-notes "${args[@]}" \
-            dist/install.yaml dist/gateway.yaml dist/images.json dist/SHA256SUMS
+            dist/install.yaml dist/images.json dist/SHA256SUMS

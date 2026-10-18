@@ -51,6 +51,7 @@ type ConversationReceipt struct {
 
 // ConversationSummary exposes a selected attempt and its frozen safe policy.
 type ConversationSummary struct {
+	Profile                *ProfileProvenance                  `json:"profile,omitempty"`
 	ConversationID         string                              `json:"conversation_id"`
 	ConversationURL        string                              `json:"conversation_url"`
 	RouteID                string                              `json:"route_id"`
@@ -74,16 +75,17 @@ type ConversationSummary struct {
 
 // ConversationDetail retains history after the backing Session has been deleted.
 type ConversationDetail struct {
-	Summary          ConversationSummary `json:"summary"`
-	Inputs           []WorkEvent         `json:"inputs"`
-	History          openaiapi.History   `json:"history"`
-	Submissions      []Submission        `json:"submissions"`
-	Actions          map[string]Action   `json:"actions"`
-	RecoveryRequired bool                `json:"recovery_required"`
-	LastError        string              `json:"last_error,omitempty"`
-	Archived         bool                `json:"archived"`
-	InputsArchived   bool                `json:"inputs_archived"`
-	HistoryArchived  bool                `json:"history_archived"`
+	Lifecycle        ConversationLifecycle `json:"lifecycle"`
+	Summary          ConversationSummary   `json:"summary"`
+	Inputs           []WorkEvent           `json:"inputs"`
+	History          openaiapi.History     `json:"history"`
+	Submissions      []Submission          `json:"submissions"`
+	Actions          map[string]Action     `json:"actions"`
+	RecoveryRequired bool                  `json:"recovery_required"`
+	LastError        string                `json:"last_error,omitempty"`
+	Archived         bool                  `json:"archived"`
+	InputsArchived   bool                  `json:"inputs_archived"`
+	HistoryArchived  bool                  `json:"history_archived"`
 }
 
 func (g *Gateway) serveConversations(w http.ResponseWriter, r *http.Request, parts []string, principal Principal) bool {
@@ -220,10 +222,11 @@ func (g *Gateway) createConversation(ctx context.Context, principal Principal, k
 	if !errors.Is(err, os.ErrNotExist) {
 		return Record{}, WorkEvent{}, err
 	}
-	route, ok := g.workRoutes[input.RouteID]
-	if !ok || route.Namespace != principal.Namespace {
-		return Record{}, WorkEvent{}, os.ErrNotExist
+	selection, err := g.selectProfile(ctx, principal.Namespace, input.RouteID)
+	if err != nil {
+		return Record{}, WorkEvent{}, err
 	}
+	route := selection.route
 	if err := g.deliveryEnabled(ctx); err != nil {
 		return Record{}, WorkEvent{}, err
 	}
@@ -240,11 +243,14 @@ func (g *Gateway) createConversation(ctx context.Context, principal Principal, k
 			return errConflict
 		}
 		record.Namespace = route.Namespace
-		record.Version = 2 // Version 1 gateways reject this record before writing unknown metadata.
 		record.Work = &Work{ID: id, RouteID: route.ID, Source: route.Source, ExternalID: id,
 			Conversation: &ConversationOrigin{Subject: principal.Subject, Key: key, Digest: digest, Title: input.Title}}
 		startWorkAttempt(record, route)
-		return applyWorkEvent(record, route, WorkInput{RouteID: route.ID, WorkID: id, Kind: _workTask}, &event)
+		if err := applyWorkEvent(record, route, conversationMutation{WorkID: id, Kind: _workTask}, &event); err != nil {
+			return err
+		}
+		bindProfile(record, selection.provenance)
+		return nil
 	}); err != nil {
 		return Record{}, WorkEvent{}, err
 	}
@@ -312,10 +318,7 @@ func (g *Gateway) acceptConversationMutation(ctx context.Context, principal Prin
 	if err != nil {
 		return Record{}, WorkEvent{}, err
 	}
-	// Every mutation can take a work gate followed by a Session gate. Serialize
-	// that ordering with issue/work closures because both use the same hash shards.
-	g.issueCloseMu.Lock()
-	defer g.issueCloseMu.Unlock()
+	// Every mutation can take a conversation gate followed by a Session gate.
 	g.workMu.Lock()
 	defer g.workMu.Unlock()
 	gate := g.gate(initial.UID)
@@ -354,13 +357,17 @@ func (g *Gateway) acceptConversationMutation(ctx context.Context, principal Prin
 	if attempt.Number != len(current.Work.Attempts) {
 		return Record{}, WorkEvent{}, errClosed
 	}
-	route := WorkRoute{ID: current.Work.RouteID, Namespace: current.Namespace, Source: current.Work.Source}
+	route := profileRoute{ID: current.Work.RouteID, Namespace: current.Namespace, Source: current.Work.Source}
+	var provenance *ProfileProvenance
 	if kind == _workRestart {
-		configured, ok := g.workRoutes[route.ID]
-		if !ok || configured.Namespace != current.Namespace {
-			return Record{}, WorkEvent{}, os.ErrNotExist
+		selection, err := g.selectProfile(ctx, current.Namespace, route.ID)
+		if err != nil {
+			return Record{}, WorkEvent{}, err
 		}
-		route = configured
+		route = selection.route
+		// The accepted source identity remains immutable across Profile updates.
+		route.Source = current.Work.Source
+		provenance = selection.provenance
 	}
 	if err := g.store.Update(ctx, current.UID, func(record *Record) error {
 		if previous, found, err := conversationReplay(*record, event); found || err != nil {
@@ -374,7 +381,13 @@ func (g *Gateway) acceptConversationMutation(ctx context.Context, principal Prin
 		if !ok || selected.Number != len(record.Work.Attempts) {
 			return errClosed
 		}
-		return applyWorkEvent(record, route, WorkInput{RouteID: route.ID, WorkID: record.Work.ExternalID, Kind: kind}, &event)
+		if err := applyWorkEvent(record, route, conversationMutation{WorkID: record.Work.ExternalID, Kind: kind}, &event); err != nil {
+			return err
+		}
+		if kind == _workRestart {
+			bindProfile(record, provenance)
+		}
+		return nil
 	}); err != nil {
 		return Record{}, WorkEvent{}, err
 	}
@@ -432,6 +445,7 @@ func (g *Gateway) handleConversationDetail(w http.ResponseWriter, r *http.Reques
 	detail := ConversationDetail{Summary: g.summarizeConversation(ctx, record, attempt)}
 	detail.InputsArchived = detail.Summary.Archived
 	detail.Archived = detail.InputsArchived
+	var child Record
 	for _, event := range record.Work.Events {
 		if event.Attempt == attempt.Number &&
 			(event.Kind == _workTask || event.Kind == _workRestart || event.Kind == _workEvidence) {
@@ -445,6 +459,7 @@ func (g *Gateway) handleConversationDetail(w http.ResponseWriter, r *http.Reques
 			return
 		}
 		detail.History = conversation.History
+		child = conversation
 		detail.Submissions = conversation.Submissions
 		detail.Actions = conversation.Actions
 		detail.RecoveryRequired = conversation.RecoveryRequired
@@ -453,12 +468,14 @@ func (g *Gateway) handleConversationDetail(w http.ResponseWriter, r *http.Reques
 		detail.Archived = detail.InputsArchived || detail.HistoryArchived
 		detail.Summary.Archived = detail.Archived
 	}
+	detail.Lifecycle = g.conversationLifecycle(ctx, record, attempt, detail, child)
 	writeJSON(w, http.StatusOK, detail)
 }
 
 func (g *Gateway) summarizeConversation(ctx context.Context, record Record, attempt WorkAttempt) ConversationSummary {
 	work := record.Work
 	summary := ConversationSummary{ConversationID: attempt.ConversationID,
+		Profile:         copyProfileProvenance(attempt.Profile),
 		ConversationURL: conversationURL(record.Namespace, attempt.ConversationID), RouteID: work.RouteID,
 		Title: work.Conversation.Title, Attempt: attempt.Number, Active: attempt.Number == len(work.Attempts),
 		State: _workClosed, Cleaned: attempt.Cleaned, Archived: attempt.InputsArchived,
@@ -476,7 +493,7 @@ func (g *Gateway) summarizeConversation(ctx context.Context, record Record, atte
 	if !summary.Active {
 		return summary
 	}
-	observed, _ := g.summarizeWork(ctx, record)
+	observed := g.observeConversation(ctx, record)
 	summary.State = work.State
 	summary.Phase = observed.Phase
 	summary.SessionURL = observed.SessionURL
@@ -610,6 +627,10 @@ func decodeConversation(w http.ResponseWriter, r *http.Request, target any) erro
 }
 
 func writeConversationError(w http.ResponseWriter, err error) {
+	if unavailable, ok := errors.AsType[*profileUnavailableError](err); ok {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{_errorField: "profile_unavailable", "reason": unavailable.reason})
+		return
+	}
 	if errors.Is(err, os.ErrNotExist) {
 		http.Error(w, "Conversation or profile not found", http.StatusNotFound)
 		return

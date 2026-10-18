@@ -4,36 +4,17 @@ Choose an approved profile and send a first message. The gateway commits the req
 
 ## Profiles
 
-A profile is a trusted `WorkRoute`. Its configuration selects a namespace, Agent, Environment, optional Vaults and spending policy. Incoming requests supply `route_id`, message text and an optional title.
+A namespaced `Profile` CRD selects an Agent, Environment, optional Vaults and explicit spending policy. Incoming requests retain the `route_id` field, whose value is the Profile name. Fresh acceptance requires a current Ready Profile and Ready dependencies with matching identities; a same-name replacement cannot substitute a different resource after acceptance.
 
-`GET /v1/namespaces/{namespace}/catalog` lists profiles with their resource names, spend policy and readiness. It also returns `caller_subject`, the authenticated identity that scopes creation keys. It exposes no credential values or Agent instructions.
+`GET /v1/namespaces/{namespace}/profiles?limit=100&after=CURSOR` lists safe selections with `more` and `next_cursor`. `GET /v1/namespaces/{namespace}/profiles/{name}` reads one. These responses include `caller_subject`, readiness, safe resource names, UID/generation/version metadata and spending policy. Catalog includes a bounded first Profile page; use `/profiles` for subsequent pages. `GET /v1/namespaces/{namespace}/identity` returns the authenticated caller subject and namespace without Kubernetes reads, allowing CLI replay during resource-observation outages.
 
-The gateway freezes the selected route when it accepts the first message. The controller later freezes resolved dependency identities and creation settings. A changed route applies to new conversations and restarted attempts. Route files reload when the gateway restarts.
+The gateway makes bounded authoritative Kubernetes reads, so additions, edits, deletions and readiness changes need no restart.
 
-## Local demo
+At acceptance the gateway freezes the Profile identity, policy and selected dependency UIDs. Its worker and the controller compare resolved dependencies before remote creation. Changes apply to new conversations and explicit fresh attempts. Reads and exact replay remain available after a Profile is changed, retired or deleted.
 
-Run `make demo`, source the `env.sh` printed by the runner and start its printed gateway port-forward. The demo uses a simulated provider and makes no real OpenAI inference calls.
+## Real conversation walkthrough
 
-```sh
-python3 -B test/e2e/client.py conversation demo-investigation \
-  --key checkout-start-001 --title 'Checkout investigation' \
-  --text 'Explain the supplied checkout evidence.' \
-  --output "$DEMO_DIR/conversation-receipt.json"
-```
-
-Copy `conversation_url` from the receipt into these commands:
-
-```sh
-python3 -B test/e2e/client.py get '<conversation_url>' --wait-for completed --turns 1
-python3 -B test/e2e/client.py message '<conversation_url>' \
-  --key checkout-evidence-002 --text 'Here is additional evidence.'
-python3 -B test/e2e/client.py close '<conversation_url>' --key checkout-close-003
-python3 -B test/e2e/client.py get '<conversation_url>' --wait-for closed
-python3 -B test/e2e/client.py restart '<conversation_url>' \
-  --key checkout-restart-004 --text 'Start a fresh investigation.'
-```
-
-Restart returns a new ID and URL. The previous attempt remains readable and rejects fresh messages. The helper waits for cleanup before reporting closed.
+Use the [my-go-project walkthrough](my-go-project.md) for a self-hosted repository task with Profile CRDs, registered skills and the Go CLI. Use `conversation_url` from the original receipt and retain each operation's key and body. Restart returns a new URL; the old attempt remains readable and rejects fresh messages.
 
 ## HTTP API
 
@@ -68,11 +49,11 @@ Message text must be nonempty and at most 256 KiB. Titles allow at most 256 UTF-
 
 Retain each operation's key, target URL and body until its outcome is known. A transport error does not prove rejection. Retry the same request or inspect the saved conversation; a new key denotes a new operation.
 
-Creation keys are scoped to namespace and authenticated subject. Reusing a key with a different profile, text or title returns `409`. Exact replay returns the original receipt after closure, route retirement or gateway replacement.
+Creation keys are scoped to namespace and authenticated subject. Reusing a key with a different Profile, text or title returns `409`. Exact replay returns the original receipt after closure, Profile deletion or gateway replacement.
 
 Later keys are scoped to the caller and conversation lineage. Separate conversations may reuse a key. Changing the operation, target attempt or body within the same lineage conflicts. Replaying an old URL after restart returns the original receipt rather than applying input to the new attempt.
 
-Fresh input to a closed or superseded attempt returns `410`. Restart requires the latest attempt to be closed and all previous attempts to have completed cleanup. It uses the current route; retiring that route prevents restart but leaves reads and exact replay available. A lineage supports at most 16 attempts.
+Fresh input to a closed or superseded attempt returns `410`. Restart requires the latest attempt to be closed and all previous attempts to have completed cleanup. It uses the current selected Profile; retiring it prevents restart but leaves reads and exact replay available. A lineage supports at most 16 attempts.
 
 | Status | Meaning |
 | --- | --- |
@@ -86,10 +67,24 @@ Fresh input to a closed or superseded attempt returns `410`. Restart requires th
 
 `summary.state` means `open`, `closing` or `closed`. `summary.active` identifies the latest attempt, not whether inference is running. `summary.phase` describes its Kubernetes Session. Read root turns in `history.turns` to establish execution outcomes; a completed subagent turn does not complete its parent task.
 
-## Storage and upgrades
+The receipt's `event_id` identifies gateway acceptance, not an OpenAI turn. GET reads the saved history snapshot, which can lag the provider. After a completed first turn, check the new root turn when sending a follow-up; an earlier completed turn alone does not establish the outcome of that follow-up.
 
-PostgreSQL retains IDs, replay receipts, inputs and attempt mappings. Restore holds block fresh mutations until an administrator audits recovery; reads and exact replay remain available. Archive clears saved content and titles while retaining receipt identities and archive indicators. See [deployment](deployment.md#storage-and-recovery).
+Approval, cancellation and SSE routes use the live Session URL returned in `summary.session_url`. The conversation API has no `/actions`, `/cancel` or `/events` subroutes. Saved conversation reads remain available after Session cleanup.
 
-Conversation source records use version 2. Legacy Work and direct Session records retain version 1. Complete a coordinated gateway rollout before using this API: older gateways reject version 2, and an older elected worker can delay delivery. Older binaries cannot restore backups containing version 2 records.
+## Storage and recovery
 
-The browser keeps uncertain keys and bodies in memory across retry and reconnect, bound to the original `caller_subject`. Reloading the page discards that state. It stores no tokens or task text in browser persistence; clients needing recovery across reloads must retain their own keys and input.
+PostgreSQL retains IDs, replay receipts, inputs and attempt mappings. Restore holds block fresh mutations until an administrator audits recovery; reads and exact replay remain available. Archive removes payloads from the selected closed record, including saved history, input text and action arguments or results. Receipts, replay fingerprints and lifecycle identities remain. Conversation and Session records have separate archive operations; archive each record whose content should be removed. See [deployment](deployment.md#storage-and-recovery).
+
+Gateway replicas initialize a fresh database from the embedded schema while holding a PostgreSQL advisory lock. Subsequent replicas and restarts use the existing tables. See [deployment](deployment.md#postgresql-connection-and-schema) for the required gateway database role.
+
+Clients must retain uncertain operation keys, target URLs and input across retries and process restarts. Creation keys are bound to the original `caller_subject`; retry with that caller's credentials.
+
+## CLI and execution readiness
+
+Build `bin/gateway-client` with `make build`. Supply explicit `--origin`, `--namespace`, `--token-file`, `--ca-file` when needed, and a private `--state-dir`; globals precede the command. Commands are `profiles list`, `profiles show NAME`, `list`, `start --profile NAME --text-file FILE`, `read ID`, `watch ID`, `continue ID --text-file FILE`, `close ID`, `start-fresh ID --text-file FILE`, `resume OPERATION_ID` and `operations`. Use `--operation ID` to give a mutation a stable local identity. Text `-` reads stdin.
+
+The CLI fsyncs a private immutable operation before POST and its receipt before successful return. `resume` reuses the exact subject, namespace, target, body and idempotency key after lost responses or crashes. Journals contain input and receipts; protect and retain them. Token and journal paths must be canonical paths without symlink components, including workstation temporary-directory aliases. Credentials are loaded from restricted files and do not enter the journal.
+
+A mutation's exit 0 means durable acceptance. Watching an operation cannot establish per-message completion because the provider does not return a reliable input-to-root correlation. The CLI distinguishes new observed roots, pending timeouts and ambiguous outcomes; a prior completed or failed root, subagent or concurrent steering cannot prove that input finished. `watch ID --root-id ROOT_ID` reports the selected provider root's terminal outcome. Run `--help` for the exit codes.
+
+Conversation detail includes `lifecycle.delivery_held`, `execution_ready`, `delivery_observation`, `reason`, `recovery` and `actions`. `execution_ready` reports current owned compute and provider connection state. `delivery_observation` distinguishes a runtime observation from an inspected local worker stream; a follower replica does not claim it inspected another process’s stream. The elected worker applies its own live stream veto and current runtime checks before and after claiming each delivery. A preparing, failed-init, missing/replaced or disconnected executor holds delivery while accepted input remains durable. Pod preparation proof is tied to the current Pod, workspace claim and frozen configuration. Cancel and close remain available while delivery is held. Start fresh requires completed cleanup and produces independent remote identity and workspace.

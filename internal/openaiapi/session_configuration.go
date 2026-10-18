@@ -23,11 +23,10 @@ const (
 	workspaceDirectoryField         = "workspace_directory"
 )
 
-// SessionSpendControlField preserves the difference between a legacy omission,
-// an explicit unlimited choice, and a positive limit in USD cents.
+// SessionSpendControlField validates an explicit unlimited choice or positive limit in USD cents.
 func SessionSpendControlField(spec *agentsv1alpha1.SessionSpendControl) (value any, present bool, err error) {
 	if spec == nil {
-		return nil, false, nil
+		return nil, false, errors.New("Session spend control is required")
 	}
 	switch spec.Mode {
 	case sessionSpendModeLimited:
@@ -215,7 +214,9 @@ func (c *Client) createConfiguredSession(ctx context.Context, uid, scope, agentI
 	if err != nil {
 		return Session{}, err
 	}
-	if spendPresent {
+	// New unlimited Sessions use the provider default without configuring its
+	// optional budget feature. Existing-Session updates still send null to clear a limit.
+	if spendPresent && spendValue != nil {
 		fields[spendControlField] = spendValue
 	}
 	if agentID != "" {

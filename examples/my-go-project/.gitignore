@@ -1,0 +1,7 @@
+/.private/
+/.artifacts/
+/.cache/
+/.tmp/
+/bin/
+/service
+/.env

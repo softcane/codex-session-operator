@@ -29,19 +29,19 @@ type configuredSessionStub struct {
 
 var _ SessionConfigurationProvider = (*configuredSessionStub)(nil)
 
-func (p *configuredSessionStub) CreateConfiguredSession(ctx context.Context, uid, scope, agentID string, environment, agent map[string]any, vaultIDs []string, metadata *map[string]string, spend *agentsv1alpha1.SessionSpendControl) (openaiapi.Session, error) {
+func (p *configuredSessionStub) CreateConfiguredSession(_ context.Context, uid, scope, agentID string, environment, agent map[string]any, vaultIDs []string, metadata *map[string]string, spend *agentsv1alpha1.SessionSpendControl) (openaiapi.Session, error) {
 	if p.rejectSpend && spend != nil && spend.Mode == spendModeLimited {
 		return openaiapi.Session{}, openaiapi.ErrSpendControlUnavailable
 	}
 	workspace, _ := environment["workspace_directory"].(string)
-	_, err := p.lifecycle.CreateSelfHostedSession(ctx, uid, workspace)
+	_, err := p.lifecycle.createSession(uid, workspace)
 	p.lifecycle.mu.Lock()
 	defer p.lifecycle.mu.Unlock()
 	remote := &p.lifecycle.remote
 	remote.AgentID = agentID
 	remote.OwnerScope = scope
 	remote.VaultIDs = append([]string(nil), vaultIDs...)
-	remote.AgentConfiguration = openaiapi.EffectiveSessionAgent(map[string]any{"model": openaiapi.SessionModel}, agent)
+	remote.AgentConfiguration = openaiapi.EffectiveSessionAgent(map[string]any{agentModelField: openaiapi.SessionModel}, agent)
 	remote.Metadata, _ = openaiapi.VaultMetadata(metadata, nil, nil, uid, scope)
 	remote.Model, _ = remote.AgentConfiguration["model"].(string)
 	remote.AgentConfigurationDigest = openaiapi.AgentConfigurationDigest(remote.AgentConfiguration)
@@ -98,8 +98,7 @@ func (p *configuredSessionStub) UpdateSession(_ context.Context, _ string, field
 	return p.lifecycle.remote, nil
 }
 
-var _ = Describe("Legacy Session overrides and later-turn updates", func() {
-	useLegacySessionSchema()
+var _ = Describe("Session overrides and later-turn updates", func() {
 	var s *agentsv1alpha1.Session
 	var lifecycle *sessionProviderStub
 	var configured *configuredSessionStub
@@ -114,12 +113,17 @@ var _ = Describe("Legacy Session overrides and later-turn updates", func() {
 		return err
 	}
 	BeforeEach(func() {
+		fixture := newDependencyScenarioFixture()
+		fixture.ready()
 		instructions, effort := "creation-only instructions", "low"
-		s = &agentsv1alpha1.Session{ObjectMeta: metav1.ObjectMeta{GenerateName: "configured-session-", Namespace: testNamespace}, Spec: agentsv1alpha1.SessionSpec{Agent: &agentsv1alpha1.SessionAgentOverrides{Instructions: &instructions, Reasoning: &agentsv1alpha1.AgentReasoning{Effort: &effort}}}}
+		spec := currentSessionSpec(&currentSessionDependencies{agent: fixture.agent, environment: fixture.environment})
+		spec.Agent = &agentsv1alpha1.SessionAgentOverrides{Instructions: &instructions,
+			Reasoning: &agentsv1alpha1.AgentReasoning{Effort: &effort}}
+		s = &agentsv1alpha1.Session{ObjectMeta: metav1.ObjectMeta{GenerateName: "configured-session-", Namespace: fixture.namespace}, Spec: spec}
 		Expect(k8sClient.Create(ctx, s)).To(Succeed())
-		lifecycle = &sessionProviderStub{}
-		configured = &configuredSessionStub{lifecycle: lifecycle}
-		r = &SessionReconciler{Client: k8sClient, APIReader: k8sClient, OpenAI: lifecycle, Configuration: configured, AgentOwnerScope: testAgentScope}
+		lifecycle = fixture.sessions
+		configured = &fixture.configuration.configuredSessionStub
+		r = fixture.sessionController
 	})
 	AfterEach(func() {
 		current := read()
@@ -299,27 +303,6 @@ var _ = Describe("Legacy Session overrides and later-turn updates", func() {
 		Expect(configured.updates).To(BeZero())
 		Expect(lifecycle.creates).To(Equal(1))
 	})
-	It("allows legacy Sessions to gain supported mutable settings without replacing them", func() {
-		current := read()
-		current.Spec.Agent = nil
-		Expect(k8sClient.Update(ctx, current)).To(Succeed())
-		Expect(step()).To(Succeed())
-		Expect(step()).To(Succeed())
-		sid := read().Status.OpenAISessionID
-		lifecycle.remote.AgentConfiguration = map[string]any{"model": openaiapi.SessionModel}
-		model := updatedTestModel
-		current = read()
-		current.Spec.Agent = &agentsv1alpha1.SessionAgentOverrides{Model: &model}
-		Expect(k8sClient.Update(ctx, current)).To(Succeed())
-		Expect(step()).To(Succeed())
-		Expect(step()).To(Succeed())
-		Expect(step()).To(Succeed())
-		Expect(read().Status.OpenAISessionID).To(Equal(sid))
-		Expect(lifecycle.creates).To(Equal(1))
-		Expect(configured.updates).To(Equal(1))
-		Expect(meta.FindStatusCondition(read().Status.Conditions, "ConfigurationCurrent").Status).To(Equal(metav1.ConditionTrue))
-	})
-
 	It("does not claim creation when a Vault reference is absent", func() {
 		current := read()
 		current.Spec.VaultRefs = []agentsv1alpha1.AgentReference{{Name: "absent-vault"}}
@@ -332,7 +315,7 @@ var _ = Describe("Legacy Session overrides and later-turn updates", func() {
 		Expect(meta.FindStatusCondition(read().Status.Conditions, readyCondition).Reason).To(Equal("VaultNotReady"))
 	})
 	It("freezes resolved Ready Vault identities and source versions before POST", func() {
-		v := &agentsv1alpha1.Vault{ObjectMeta: metav1.ObjectMeta{GenerateName: "session-vault-", Namespace: testNamespace}, Spec: agentsv1alpha1.VaultSpec{DeletionPolicy: "Delete"}}
+		v := &agentsv1alpha1.Vault{ObjectMeta: metav1.ObjectMeta{GenerateName: "session-vault-", Namespace: s.Namespace}, Spec: agentsv1alpha1.VaultSpec{DeletionPolicy: "Delete"}}
 		Expect(k8sClient.Create(ctx, v)).To(Succeed())
 		p := &vaultProviderStub{}
 		vr := &VaultReconciler{Client: k8sClient, APIReader: k8sClient, OpenAI: p, OwnerScope: testAgentScope}

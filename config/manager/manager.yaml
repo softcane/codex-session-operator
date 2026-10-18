@@ -66,8 +66,8 @@ spec:
         image: controller:latest
         name: manager
         env:
-        # Set this to the separately built executor repository@sha256:digest.
-        - name: EXECUTOR_IMAGE
+        # Approve exact executor digests used by Environment resources.
+        - name: EXECUTOR_IMAGES
           value: ""
         - name: OPENAI_API_KEY
           valueFrom:

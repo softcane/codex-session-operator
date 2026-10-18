@@ -16,6 +16,7 @@ rules:
   - agents
   - environments
   - vaults
+  - profiles
   verbs:
   - get
   - list
@@ -35,6 +36,34 @@ roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
   name: codex-session-operator-gateway
+subjects:
+- kind: ServiceAccount
+  name: codex-session-operator-gateway
+  namespace: codex-session-operator-system
+---
+# Executor observations are restricted to this managed namespace.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: codex-session-operator-executor-observation
+  namespace: codex-session-operator-system
+rules:
+- apiGroups:
+  - ""
+  resources:
+  - pods
+  verbs:
+  - get
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: codex-session-operator-executor-observation
+  namespace: codex-session-operator-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: codex-session-operator-executor-observation
 subjects:
 - kind: ServiceAccount
   name: codex-session-operator-gateway

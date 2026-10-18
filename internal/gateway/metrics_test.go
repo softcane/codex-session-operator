@@ -421,7 +421,7 @@ func TestGatewayMetricsOutgoingStreamsAndWorkerCancellation(t *testing.T) {
 }
 
 func TestPostgreSQLGatewayMetricsDoNotMutateClaimsOrReadTranscript(t *testing.T) {
-	store, _ := postgresForTest(t, 32)
+	store, _ := postgresForTest(t)
 	if err := store.Update(t.Context(), "private-metrics-record", func(r *Record) error {
 		r.Namespace = _testNamespace
 		r.Notes["private"] = "transcript-must-not-be-scraped"
@@ -459,7 +459,7 @@ func TestPostgreSQLGatewayMetricsDoNotMutateClaimsOrReadTranscript(t *testing.T)
 }
 
 func TestPostgreSQLGatewayMetricsShareOwnedWorkerEpoch(t *testing.T) {
-	store, _ := postgresForTest(t, 32)
+	store, _ := postgresForTest(t)
 	g, _ := testGateway(t, store, simulatorForTest())
 	registry := gatewayMetricsRegistry(t, g)
 	ctx, cancel := context.WithCancel(t.Context())

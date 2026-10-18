@@ -45,7 +45,7 @@ curl.conf
 __pycache__/
 *.py[cod]
 
-# Local research, historical acceptance harnesses and maintainer notes
+# Private local state, credentials and maintainer artifacts (never commit)
 /.private/
 /.agents/
 /.codex/

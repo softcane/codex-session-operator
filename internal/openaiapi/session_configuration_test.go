@@ -61,7 +61,8 @@ func TestConfiguredSessionWireAndPartialUpdates(t *testing.T) {
 	}))
 	defer server.Close()
 	c := clientForServer(server, nil)
-	if _, err := c.CreateConfiguredSession(context.Background(), "uid-settings", agentTestScope, agentTestID, map[string]any{typeField: selfHostedType, workspaceDirectoryField: testWorkspace}, fields, []string{testVaultID}, nil, nil); err != nil {
+	spend := &agentsv1alpha1.SessionSpendControl{Mode: sessionSpendModeUnlimited}
+	if _, err := c.CreateConfiguredSession(context.Background(), "uid-settings", agentTestScope, agentTestID, map[string]any{typeField: selfHostedType, workspaceDirectoryField: testWorkspace}, fields, []string{testVaultID}, nil, spend); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := c.UpdateSession(context.Background(), testSessionID, map[string]any{agentField: map[string]any{reasoningField: map[string]any{effortField: nil}, serviceTierField: nil}, metadataField: map[string]string{ownerKey: "uid-settings", operatorKey: operatorValue, agentScopeKey: agentTestScope}}); err != nil {
@@ -119,7 +120,7 @@ func TestSessionSpendControlField(t *testing.T) {
 		want    any
 		wantErr bool
 	}{
-		{name: "legacy omission"},
+		{name: "missing required choice", wantErr: true},
 		{name: "minimum limit", spec: &agentsv1alpha1.SessionSpendControl{Mode: sessionSpendModeLimited, LimitCents: &one}, present: true, want: map[string]any{spendLimitField: one}},
 		{name: "explicit unlimited", spec: &agentsv1alpha1.SessionSpendControl{Mode: sessionSpendModeUnlimited}, present: true},
 		{name: "missing limit", spec: &agentsv1alpha1.SessionSpendControl{Mode: sessionSpendModeLimited}, wantErr: true},
@@ -151,12 +152,11 @@ func TestSessionSpendControlWireAndReadback(t *testing.T) {
 		remoteNull       bool
 		updateFields     map[string]any
 	}{
-		{name: "legacy omission"},
 		{name: "limited", spec: &agentsv1alpha1.SessionSpendControl{Mode: sessionSpendModeLimited, LimitCents: &limit}, wantPresent: true, wantValue: map[string]any{spendLimitField: float64(limit)}, wantUpdatedValue: map[string]any{spendLimitField: float64(updatedLimit)}, remoteLimit: &limit,
 			updateFields: map[string]any{spendControlField: map[string]any{spendLimitField: updatedLimit}}},
-		{name: "explicit unlimited", spec: &agentsv1alpha1.SessionSpendControl{Mode: sessionSpendModeUnlimited}, wantPresent: true,
+		{name: "explicit unlimited", spec: &agentsv1alpha1.SessionSpendControl{Mode: sessionSpendModeUnlimited},
 			updateFields: map[string]any{spendControlField: nil}},
-		{name: "explicit null readback", spec: &agentsv1alpha1.SessionSpendControl{Mode: sessionSpendModeUnlimited}, wantPresent: true, remoteNull: true},
+		{name: "explicit null readback", spec: &agentsv1alpha1.SessionSpendControl{Mode: sessionSpendModeUnlimited}, remoteNull: true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -221,6 +221,52 @@ func TestSessionSpendControlWireAndReadback(t *testing.T) {
 			}
 			if requests != wantRequests {
 				t.Fatalf("requests = %d, want %d", requests, wantRequests)
+			}
+		})
+	}
+}
+
+func TestUnlimitedCreationDoesNotConfigureProviderBudget(t *testing.T) {
+	for _, mode := range []string{selfHostedType, _noneValue} {
+		t.Run(mode, func(t *testing.T) {
+			requests := 0
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				requests++
+				w.Header().Set("Content-Type", "application/json")
+				var body map[string]json.RawMessage
+				if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+					t.Error(err)
+				}
+				if r.Method != http.MethodPost || r.URL.Path != testSessionsPath {
+					t.Error("unlimited creation used an unexpected endpoint")
+				}
+				// Projects without the optional budget capability can reject even
+				// explicit null. Omitting the field must avoid that capability gate.
+				if _, present := body[spendControlField]; present {
+					w.WriteHeader(http.StatusBadRequest)
+					_ = json.NewEncoder(w).Encode(map[string]any{"error": map[string]any{
+						"param": spendControlField, "message": "Session budget configuration is not enabled"}})
+					return
+				}
+				response := remoteJSON("uid-unlimited", testSessionID)
+				response[testEnvironmentField] = map[string]any{typeField: mode}
+				_ = json.NewEncoder(w).Encode(response)
+			}))
+			defer server.Close()
+			client := clientForServer(server, nil)
+			spend := &agentsv1alpha1.SessionSpendControl{Mode: sessionSpendModeUnlimited}
+			environment := map[string]any{typeField: mode}
+			var remote Session
+			var err error
+			if mode == _noneValue {
+				remote, err = client.CreateInitialSession(t.Context(), "uid-unlimited", agentTestScope, agentTestID,
+					environment, nil, nil, nil, spend, "durable initial task", "durable-first-key")
+			} else {
+				remote, err = client.CreateConfiguredSession(t.Context(), "uid-unlimited", agentTestScope, agentTestID,
+					environment, nil, nil, nil, spend)
+			}
+			if err != nil || remote.ID != testSessionID || remote.SpendControlObserved || remote.SpendLimitCents != nil || requests != 1 {
+				t.Fatalf("unlimited creation configured a budget or did not create once: calls=%d error=%v", requests, err)
 			}
 		})
 	}

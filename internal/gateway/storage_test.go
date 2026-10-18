@@ -9,14 +9,14 @@ import (
 	"testing"
 )
 
-func TestStorageCanceledRequestDoesNotAcceptWork(t *testing.T) {
+func TestStorageCanceledRequestDoesNotAcceptConversation(t *testing.T) {
 	store := testStore(t)
-	g, _, _ := workHTTPGateway(t, store)
+	g, _, _ := profileConversationGateway(t, store)
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
-	input := string(mustJSON(t, workInput("canceled-http", _workTask, "do not accept")))
-	request := httptest.NewRequest(http.MethodPost, _workEventPath, strings.NewReader(input)).WithContext(ctx)
+	request := httptest.NewRequest(http.MethodPost, _conversationPath, strings.NewReader(_profileTestBody)).WithContext(ctx)
 	request.Header.Set("Authorization", "Bearer "+_token)
+	request.Header.Set("Idempotency-Key", "canceled-http")
 	response := httptest.NewRecorder()
 	g.ServeHTTP(response, request)
 	if response.Code != http.StatusServiceUnavailable {
@@ -24,7 +24,7 @@ func TestStorageCanceledRequestDoesNotAcceptWork(t *testing.T) {
 	}
 	records, err := store.Records(t.Context())
 	if err != nil || len(records) != 0 {
-		t.Fatalf("canceled request persisted work: %d %v", len(records), err)
+		t.Fatalf("canceled request persisted a conversation: %d %v", len(records), err)
 	}
 }
 

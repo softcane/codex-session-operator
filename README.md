@@ -1,81 +1,142 @@
 # Codex Session Operator
 
-Run durable OpenAI agent conversations through Kubernetes. Define an Agent and Environment, choose an approved profile, then send a first message. The operator manages the Session lifecycle; the gateway stores messages, receipts, history and approvals in PostgreSQL.
+Codex Session Operator runs coding tasks against repositories through Kubernetes. You declare reusable Agents, execution Environments, and Profiles as custom resources. The gateway accepts a task from a Profile, stores it durably, and creates one Session for that conversation.
 
-![Choose a profile, save input in the gateway, create a Kubernetes Session and run it through OpenAI](docs/assets/session-flow.gif)
+## Architecture
 
-## Try it without an API key
+The controller and gateway are separate services with separate container images. They are installed together because a conversation needs both: the gateway owns durable input and history, while the controller owns Kubernetes and OpenAI resource lifecycles.
 
-You need Docker, Go matching `go.mod`, Make, Python 3, Node.js, Kind, `kubectl` and OpenSSL.
+![Session flow: install separate controller and gateway Deployments together, then start a Profile-backed Session with durable history and an application executor](docs/assets/session-flow.gif)
 
-```sh
-make demo
-```
+The system separates these responsibilities:
 
-This builds an isolated Kind cluster with the operator, two gateway replicas, PostgreSQL and a simulated provider. It checks the lifecycle, then leaves the cluster running. The provider returns fixed replies; the demo makes no real OpenAI inference calls.
+| Component | Responsibility |
+| --- | --- |
+| Controller Deployment | Reconciles CRDs, verifies ownership, creates remote resources, and manages executor Pods and workspaces. |
+| Gateway Deployment | Authenticates callers, accepts tasks, creates Sessions from Profiles, delivers messages, and saves history and approvals. |
+| PostgreSQL | Stores gateway data. Provision it separately as a managed service such as Amazon RDS, or as a local development database. |
+| Codex executor image | Provides `codex exec-server`, Git, repository preparation, and basic runtime tools. |
+| Application executor image | Extends the Codex executor with project tools. The Go example adds Go, Make, a C compiler, and GitHub CLI. |
 
-Follow the printed `source /…/env.sh` instruction, then start the printed gateway port-forward:
+On first startup, gateway replicas serialize initialization from the embedded `schema.sql` with a PostgreSQL advisory lock. The database role must own the target schema and have table creation and data access privileges. Later starts keep the existing data.
 
-```sh
-kubectl -n "$DEMO_NAMESPACE" port-forward --address 127.0.0.1 \
-  service/codex-session-operator-gateway "$DEMO_PORT:8082"
-```
+## Custom resources
 
-Open the printed UI URL. The demo uses a self-signed localhost certificate; the runner prints its certificate path. Connect with `$DEMO_NAMESPACE` and the bearer token from the private `$DEMO_DIR/curl.conf`, then choose `demo-investigation`. Send a message, inspect its history, add evidence or close it. The runner prints the exact command to remove its cluster.
-
-You can also start a conversation from the command line:
-
-```sh
-python3 -B test/e2e/client.py conversation demo-investigation \
-  --key first-task-001 --text 'Explain the supplied evidence.' \
-  --output "$DEMO_DIR/receipt.json"
-```
-
-## Resource model
+All resources use `agents.softcane.io/v1alpha1` and belong to one Kubernetes namespace.
 
 | Resource | Purpose |
 | --- | --- |
-| `Agent` | Reusable model, instructions and tools. |
-| `Environment` | Text only, OpenAI hosted or self-hosted execution. |
-| `Vault` / `VaultCredential` | Provider credential containers and protected Secret references. |
-| `Session` | One conversation bound to ready resources and an explicit spending policy. |
+| `Agent` | Model, instructions, reasoning settings, and optional tools. |
+| `Environment` | Execution recipe: no runtime, OpenAI-hosted runtime, or a self-hosted executor. |
+| `Profile` | Reusable binding of an Agent, Environment, optional Vaults, and an explicit spending policy. |
+| `Session` | One conversation attempt. The gateway creates it when a caller starts a task from a Profile. |
+| `Vault` and `VaultCredential` | References to credentials for connected provider tools. |
 
-A trusted profile maps the Agent, Environment, optional Vaults and spend policy. Callers supply the task. The gateway creates the Session in the background and returns a stable conversation URL.
+Applying an Agent, Environment, and Profile does not create a task Pod. A self-hosted executor Pod and its workspace are created only after the gateway accepts a task and creates a Session.
 
-The API request looks like this:
+## `my-go-project` example
 
-```http
-POST /v1/namespaces/team/conversations
-Authorization: Bearer <namespace-token>
-Idempotency-Key: first-task-001
-Content-Type: application/json
+The included [my-go-project](examples/my-go-project/) is a small Go service with an idempotency bug. Its application executor contains the Go toolchain and test dependencies; its skills remain in a separate immutable capability image.
 
-{"route_id":"approved-profile","text":"Investigate the supplied evidence."}
+The following declarations show the real API shape. Replace the image digests, repository commit, architecture, and StorageClass with values approved by your installation.
+
+```yaml
+apiVersion: agents.softcane.io/v1alpha1
+kind: Agent
+metadata:
+  name: my-go-maintainer
+  namespace: codex-session-operator-system
+spec:
+  model: gpt-6-luna
+  instructions: |
+    Maintain my-go-project using the requested task mode.
+    Read /workspace/AGENTS.md and docs/architecture.md first.
+    Registered project skills live under /capabilities/my-go-project/skills.
+    Run make bootstrap, reproduce failures, make the requested repair,
+    and run make verify. Report the commands and results.
+  reasoning:
+    effort: high
+  multiAgent:
+    enabled: false
+  deletionPolicy: Delete
+---
+apiVersion: agents.softcane.io/v1alpha1
+kind: Environment
+metadata:
+  name: my-go-development
+  namespace: codex-session-operator-system
+spec:
+  mode: selfHosted
+  deletionPolicy: Delete
+  selfHosted:
+    image: registry.example.com/codex/my-go-executor@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+    architecture: amd64
+    workspaceDirectory: /workspace
+    workspaceSize: 4Gi
+    workspaceStorage:
+      type: Persistent
+      storageClassName: approved-storage-class
+      claimDeletionPolicy: Retain
+    repository:
+      url: https://github.com/example/my-go-project.git
+      commit: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+      credentialSecretRef:
+        name: codex-repository
+        key: token
+    resources:
+      cpuRequest: 500m
+      cpuLimit: "2"
+      memoryRequest: 512Mi
+      memoryLimit: 2Gi
+    capabilities:
+      - name: my-go-project
+        image: registry.example.com/codex/my-go-skills@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
+        path: /capabilities/my-go-project
+        type: skills
+---
+apiVersion: agents.softcane.io/v1alpha1
+kind: Profile
+metadata:
+  name: my-go-project
+  namespace: codex-session-operator-system
+spec:
+  agentRef:
+    name: my-go-maintainer
+  environmentRef:
+    name: my-go-development
+  spendControl:
+    mode: unlimited
+  vaultRefs: []
 ```
 
-HTTP `202` means the request committed. Read the returned conversation URL to observe turn completion. Retry with the same key and body after a lost response. Close stops new input and cleans up the Session; restart after cleanup creates a new attempt while keeping earlier history readable.
+The Profile becomes Ready when its referenced policy resources are Ready. Readiness does not prove that repository checkout, the executor, or a model task has run; those exist only for a Session.
 
-The controller freezes dependency identities before remote creation and uses claims and finalizers to recover uncertain outcomes. Conversation content stays in PostgreSQL. Self-hosted Sessions can use an approved executor image and persistent workspace PVC.
+Follow [Run `my-go-project`](docs/my-go-project.md) for the complete image, credential, installation, task, recovery, and cleanup walkthrough. The source templates are in [examples/my-go-project/automation/k8s](examples/my-go-project/automation/k8s/).
 
-## Documentation
+## Task and state lifecycle
 
-- [Architecture](docs/architecture.md): components, resources and recovery boundaries.
-- [Conversations](docs/conversations.md): profiles, API, retries, close and restart.
-- [Deployment](docs/deployment.md): images, Secrets, PostgreSQL and current limits.
-- [Development](docs/development.md): build, checks and release workflow.
+1. A client sends a Profile name, message, and idempotency key to the gateway.
+2. The gateway commits the request and receipt to PostgreSQL, then returns HTTP `202` with a conversation URL.
+3. A gateway worker creates a Session from the frozen Profile selection.
+4. The controller resolves the selected resources and creates the remote Session. For a self-hosted Environment it also creates the executor Pod and workspace.
+5. The gateway saves provider turns and history. The client reads the conversation to observe completion, send more input, or close it.
 
-## Development
+HTTP `202` means the input was accepted durably. It does not mean the executor ran or the turn completed. Inspect a saved root turn and its output to establish the result.
 
-```sh
-make build
-make lint
-make test
-make test-e2e
-```
+| Store | State it owns |
+| --- | --- |
+| Kubernetes | Desired configuration, remote IDs, conditions, safe dependency snapshots, creation claims, and finalizers. |
+| Gateway PostgreSQL | Messages, receipts, replay identities, pending delivery, saved turns, and approvals. |
+| Workspace PVC | Repository files, edits, local commits, and task artifacts for one self-hosted Session. |
+| OpenAI | Managed Agent and Session identities, reasoning, and remote turns. |
 
-`make test-e2e` runs the isolated simulated-provider suite and removes its cluster. One [Dockerfile](Dockerfile) builds the operator/gateway, executor and test-provider targets.
+Conversation content and credential values do not belong in CR status. A retained workspace does not replace PostgreSQL history, and a new Session does not automatically adopt a retained PVC.
 
-This project has an alpha API. Real deployments need Agents API access, TLS, protected credentials and a tested database recovery plan. See the [deployment guide](docs/deployment.md) before using real OpenAI resources.
+## Install and operate
+
+Use the [deployment guide](docs/deployment.md) to build the separate images, provision PostgreSQL and credentials, and apply the combined controller and gateway installation. PostgreSQL lifecycle, backups, high availability, and restore testing remain installation responsibilities.
+
+See [resources](docs/resources.md) for all six CRDs, execution modes and Vault credentials; [architecture](docs/architecture.md) for component boundaries and recovery; [conversations](docs/conversations.md) for the HTTP and retry contract; and [development](docs/development.md) for repository checks. The generated [CRD schemas](config/crd/bases/) define the accepted fields for this checkout.
 
 ## License
 

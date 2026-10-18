@@ -9,6 +9,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -37,36 +38,13 @@ type PostgreSQLConfig struct {
 }
 
 type PostgreSQLStore struct {
-	pool  *pgxpool.Pool
-	owner string
-	epoch int64
+	pool       *pgxpool.Pool
+	owner      string
+	epoch      int64
+	pruneAfter atomic.Int64
 }
 
 var _ DeliveryStorage = (*PostgreSQLStore)(nil)
-
-const _schema = `
-CREATE TABLE IF NOT EXISTS gateway_meta (
- id integer PRIMARY KEY CHECK (id=1), version integer NOT NULL CHECK(version=1),
- max_active integer NOT NULL, max_records integer NOT NULL,
- delivery_disabled boolean NOT NULL DEFAULT false,
- owner text NOT NULL DEFAULT '', epoch bigint NOT NULL DEFAULT 0,
- expires timestamptz NOT NULL DEFAULT '-infinity');
-CREATE TABLE IF NOT EXISTS gateway_records (
- uid text PRIMARY KEY, namespace text NOT NULL, data bytea NOT NULL,
- mutation text NOT NULL, archived boolean NOT NULL DEFAULT false);
-CREATE INDEX IF NOT EXISTS gateway_namespace ON gateway_records(namespace);
-CREATE TABLE IF NOT EXISTS gateway_history (
- uid text PRIMARY KEY REFERENCES gateway_records(uid) ON DELETE CASCADE, data bytea NOT NULL);
-CREATE TABLE IF NOT EXISTS gateway_keys (
- kind text NOT NULL, namespace text NOT NULL, scope text NOT NULL, key text NOT NULL,
- uid text NOT NULL REFERENCES gateway_records(uid) ON DELETE CASCADE, digest text NOT NULL,
- PRIMARY KEY(kind, namespace, scope, key));
-CREATE TABLE IF NOT EXISTS gateway_reservations (
- uid text NOT NULL REFERENCES gateway_records(uid) ON DELETE CASCADE, slot text NOT NULL,
- PRIMARY KEY(uid, slot));
-CREATE TABLE IF NOT EXISTS gateway_commits (
- mutation text PRIMARY KEY, committed_at timestamptz NOT NULL DEFAULT clock_timestamp());
-`
 
 func OpenPostgreSQL(ctx context.Context, options PostgreSQLConfig) (*PostgreSQLStore, error) {
 	config, err := pgxpool.ParseConfig(options.DSN)
@@ -76,7 +54,9 @@ func OpenPostgreSQL(ctx context.Context, options PostgreSQLConfig) (*PostgreSQLS
 	if !options.AllowInsecureLocal {
 		// Checking the parsed TLS config alone is insufficient: pgx supports
 		// plaintext and unverified fallbacks for prefer/require modes.
-		if !strings.Contains(options.DSN, "sslmode=verify-full") || config.ConnConfig.TLSConfig == nil || config.ConnConfig.TLSConfig.InsecureSkipVerify || len(config.ConnConfig.Fallbacks) != 0 {
+		secureMode := strings.Contains(options.DSN, "sslmode=verify-full")
+		secureTLS := config.ConnConfig.TLSConfig != nil && !config.ConnConfig.TLSConfig.InsecureSkipVerify
+		if !secureMode || !secureTLS || len(config.ConnConfig.Fallbacks) != 0 {
 			return nil, errors.New("gateway database requires sslmode=verify-full")
 		}
 	}
@@ -99,43 +79,6 @@ func OpenPostgreSQL(ctx context.Context, options PostgreSQLConfig) (*PostgreSQLS
 		return nil, err
 	}
 	return store, nil
-}
-
-func (s *PostgreSQLStore) initialize(ctx context.Context, options PostgreSQLConfig) error {
-	ctx, cancel := context.WithTimeout(ctx, _sqlTimeout)
-	defer cancel()
-	tx, err := s.pool.Begin(ctx)
-	if err != nil {
-		return safeSQLError(err)
-	}
-	defer func() { _ = tx.Rollback(ctx) }()
-	// Serialize initial DDL even when two replicas open a fresh database.
-	if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock(731904221)"); err != nil {
-		return safeSQLError(err)
-	}
-	if err := checkDurability(ctx, tx); err != nil {
-		return err
-	}
-	if _, err := tx.Exec(ctx, _schema); err != nil {
-		return safeSQLError(err)
-	}
-	if _, err := tx.Exec(ctx, `INSERT INTO gateway_meta(id,version,max_active,max_records) VALUES(1,1,$1,$2) ON CONFLICT(id) DO NOTHING`, options.MaxActive, options.MaxRecords); err != nil {
-		return safeSQLError(err)
-	}
-	var active, retained, version int
-	if err := tx.QueryRow(ctx, "SELECT version,max_active,max_records FROM gateway_meta WHERE id=1").Scan(&version, &active, &retained); err != nil {
-		return safeSQLError(err)
-	}
-	if version != 1 {
-		return errors.New("unsupported gateway database schema")
-	}
-	if active != options.MaxActive || retained != options.MaxRecords {
-		return errors.New("gateway database quotas differ from configured quotas")
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return safeSQLError(err)
-	}
-	return nil
 }
 
 func checkDurability(ctx context.Context, tx pgx.Tx) error {
@@ -344,17 +287,31 @@ func (s *PostgreSQLStore) RecordsInNamespace(ctx context.Context, namespace stri
 }
 
 func validateRecord(record Record) error {
-	if record.UID == "" || record.Actions == nil || record.Notes == nil || record.Work != nil && record.Issue != nil {
+	if record.UID == "" || record.Actions == nil || record.Notes == nil {
 		return errConflict
 	}
 	if record.Work != nil && (record.Work.ID != record.UID || record.Work.RouteID == "" || record.Work.Source == "" || record.Work.ExternalID == "") {
 		return errConflict
 	}
-	if record.Issue != nil && (record.Issue.ID != record.UID || record.Issue.RouteID == "" || len(record.Issue.Deliveries) == 0 || record.Issue.Policy.AgentRef == nil || record.Issue.Policy.EnvironmentRef == nil) {
-		return errConflict
-	}
 	if err := validateRecordVersion(record); err != nil {
 		return err
+	}
+	for _, submission := range record.Submissions {
+		if submission.RemoteKey != wireKey(record.UID, submission.Key) {
+			return errConflict
+		}
+		if submission.ReplayDigest == "" {
+			continue
+		}
+		digest, err := hex.DecodeString(submission.ReplayDigest)
+		if err != nil || len(digest) != sha256.Size {
+			return errConflict
+		}
+		if !record.Archived || submission.Text != "" || len(submission.Event) != 0 {
+			if submission.ReplayDigest != submissionDigest(submission) {
+				return errConflict
+			}
+		}
 	}
 	raw, err := json.Marshal(record)
 	if err != nil || len(raw) > _maxRecordBytes {
@@ -364,20 +321,18 @@ func validateRecord(record Record) error {
 }
 
 func validateRecordVersion(record Record) error {
-	if record.Work != nil && record.Issue != nil {
+	if record.Version != _recordVersion {
 		return errConflict
 	}
-	switch record.Version {
-	case 1:
-		if record.Work != nil && record.Work.Conversation != nil {
+	if record.Work != nil {
+		if record.Work.Conversation == nil {
 			return errConflict
 		}
-	case 2:
-		if record.Work == nil || record.Work.Conversation == nil {
-			return errConflict
+		for _, attempt := range record.Work.Attempts {
+			if attempt.Profile == nil || validateProfileProvenance(record, attempt) != nil {
+				return errConflict
+			}
 		}
-	default:
-		return errConflict
 	}
 	return validateConversationRecord(record)
 }
@@ -424,12 +379,13 @@ func (s *PostgreSQLStore) Update(ctx context.Context, uid string, change func(*R
 	defer func() { _ = tx.Rollback(ctx) }()
 	record, err := readSQLRecord(ctx, tx, uid)
 	if errors.Is(err, os.ErrNotExist) {
-		record = Record{Version: 1, UID: uid, Actions: make(map[string]Action), Notes: make(map[string]string)}
+		record = Record{Version: _recordVersion, UID: uid, Actions: make(map[string]Action), Notes: make(map[string]string)}
 	} else if err != nil {
 		return err
 	}
 	namespace := record.Namespace
 	previous := record
+	previousProfiles := profileAttemptDigests(record)
 	var previousEvents, previousAttempts int
 	var previousSessionUID string
 	if record.Work != nil {
@@ -446,6 +402,12 @@ func (s *PostgreSQLStore) Update(ctx context.Context, uid string, change func(*R
 	}
 	if previous.RemoteID != "" && previous.RemoteID != record.RemoteID {
 		return errConflict
+	}
+	currentProfiles := profileAttemptDigests(record)
+	for i, digest := range previousProfiles {
+		if digest != "" && (i >= len(currentProfiles) || currentProfiles[i] != digest) {
+			return errConflict
+		}
 	}
 	if err := validateRecord(record); err != nil {
 		return err
@@ -585,11 +547,10 @@ func writeKeys(ctx context.Context, tx pgx.Tx, r Record) error {
 	for _, submission := range r.Submissions {
 		// Initial changes to a regular submission during hosted-mode discovery;
 		// the immutable caller key and text, rather than delivery state, identify it.
-		event := ""
-		if submission.Text == "" {
-			event = string(submission.Event)
+		digest := submissionDigest(submission)
+		if r.Archived && submission.ReplayDigest != "" {
+			digest = submission.ReplayDigest
 		}
-		digest := digestValue([]string{submission.Text, submission.TargetTurn, event})
 		if err := put("submission", r.UID, submission.Key, digest); err != nil {
 			return err
 		}
@@ -605,24 +566,6 @@ func writeKeys(ctx context.Context, tx pgx.Tx, r Record) error {
 				if err := put("conversation", "", attempt.ConversationID, strconv.Itoa(attempt.Number)); err != nil {
 					return err
 				}
-			}
-		}
-		if err := put("work", digestValue([]string{w.RouteID, w.Source}), w.ExternalID, r.UID); err != nil {
-			return err
-		}
-		for _, e := range w.Events {
-			if err := put("work-event", w.RouteID, e.ID, e.Digest); err != nil {
-				return err
-			}
-		}
-	}
-	if r.Issue != nil {
-		if err := put("issue", "github", r.Issue.StableID, r.UID); err != nil {
-			return err
-		}
-		for _, e := range r.Issue.Deliveries {
-			if err := put("issue-event", r.Issue.RouteID, e.ID, e.Digest); err != nil {
-				return err
 			}
 		}
 	}
@@ -645,13 +588,6 @@ func activeSlots(r Record) []string {
 			}
 		}
 		return slots
-	}
-	if r.Issue != nil {
-		slot := r.Issue.SessionUID
-		if slot == "" {
-			slot = r.UID + ":session"
-		}
-		return []string{slot}
 	}
 	return []string{r.UID}
 }
@@ -680,7 +616,7 @@ func (s *PostgreSQLStore) Purge(ctx context.Context, uid string) error {
 	if err != nil {
 		return err
 	}
-	if !closedForPurge(r) || r.Work != nil || r.Issue != nil {
+	if !closedForPurge(r) || r.Work != nil {
 		return errors.New("gateway active or source replay record cannot be purged")
 	}
 	if _, err := tx.Exec(ctx, "DELETE FROM gateway_records WHERE uid=$1", uid); err != nil {
@@ -700,6 +636,21 @@ func (s *PostgreSQLStore) Archive(ctx context.Context, uid string) error {
 		r.History = openaiapi.History{}
 		r.Events = nil
 		r.Notes = make(map[string]string)
+		for i := range r.Submissions {
+			submission := &r.Submissions[i]
+			if submission.ReplayDigest == "" {
+				submission.ReplayDigest = submissionDigest(*submission)
+			}
+			submission.Text = ""
+			submission.Event = nil
+		}
+		for id, action := range r.Actions {
+			action.Pending.Arguments = nil
+			action.Pending.Request = nil
+			action.Result = nil
+			action.Active = false
+			r.Actions[id] = action
+		}
 		if r.Work != nil {
 			if r.Work.Conversation != nil {
 				r.Work.Conversation.Title = ""

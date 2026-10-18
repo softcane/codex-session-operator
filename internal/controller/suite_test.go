@@ -43,13 +43,9 @@ var (
 	ctx              context.Context
 	cancel           context.CancelFunc
 	testEnv          *envtest.Environment
-	legacyTestEnv    *envtest.Environment
 	cfg              *rest.Config
-	shippedCfg       *rest.Config
-	legacyCfg        *rest.Config
 	k8sClient        client.Client
 	shippedK8sClient client.Client
-	legacyK8sClient  client.Client
 )
 
 func TestControllers(t *testing.T) {
@@ -84,57 +80,18 @@ var _ = BeforeSuite(func() {
 	cfg, err = testEnv.Start()
 	Expect(err).NotTo(HaveOccurred())
 	Expect(cfg).NotTo(BeNil())
-	shippedCfg = cfg
-
 	k8sClient, err = client.New(cfg, client.Options{Scheme: scheme.Scheme})
 	Expect(err).NotTo(HaveOccurred())
 	Expect(k8sClient).NotTo(BeNil())
 	shippedK8sClient = k8sClient
-
-	// Historical controller tests exercise Sessions that were stored before
-	// agentRef/environmentRef became mandatory. Keep those tests on an
-	// explicitly pre-migration schema; all other specs use the shipped CRD.
-	legacyCRDs := envtest.CRDInstallOptions{
-		Paths:              []string{filepath.Join("..", "..", "config", "crd", "bases")},
-		ErrorIfPathMissing: true,
-	}
-	Expect(envtest.ReadCRDFiles(&legacyCRDs)).To(Succeed())
-	foundSession := false
-	for _, crd := range legacyCRDs.CRDs {
-		if crd.Spec.Names.Kind != "Session" {
-			continue
-		}
-		foundSession = true
-		Expect(crd.Spec.Versions[0].Schema.OpenAPIV3Schema.XValidations).NotTo(BeEmpty())
-		crd.Spec.Versions[0].Schema.OpenAPIV3Schema.XValidations = nil
-	}
-	Expect(foundSession).To(BeTrue())
-	legacyTestEnv = &envtest.Environment{CRDs: legacyCRDs.CRDs,
-		BinaryAssetsDirectory: getFirstFoundEnvTestBinaryDir()}
-	legacyCfg, err = legacyTestEnv.Start()
-	Expect(err).NotTo(HaveOccurred())
-	legacyK8sClient, err = client.New(legacyCfg, client.Options{Scheme: scheme.Scheme})
-	Expect(err).NotTo(HaveOccurred())
 })
 
 var _ = AfterSuite(func() {
 	By("tearing down the test environment")
 	cancel()
-	Expect(legacyTestEnv.Stop()).To(Succeed())
 	err := testEnv.Stop()
 	Expect(err).NotTo(HaveOccurred())
 })
-
-func useLegacySessionSchema() {
-	BeforeEach(func() {
-		k8sClient = legacyK8sClient
-		cfg = legacyCfg
-		DeferCleanup(func() {
-			k8sClient = shippedK8sClient
-			cfg = shippedCfg
-		})
-	})
-}
 
 // getFirstFoundEnvTestBinaryDir locates the first binary in the specified path.
 // ENVTEST-based tests depend on specific binaries, usually located in paths set by

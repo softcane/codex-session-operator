@@ -40,6 +40,11 @@ func TestFrozenProfilePodContract(t *testing.T) {
 	if pod.Spec.AutomountServiceAccountToken == nil || *pod.Spec.AutomountServiceAccountToken || pod.Spec.HostNetwork || pod.Spec.InitContainers[0].SecurityContext.AllowPrivilegeEscalation == nil || *pod.Spec.InitContainers[0].SecurityContext.AllowPrivilegeEscalation {
 		t.Fatal("platform security contract lost")
 	}
+	for _, variable := range pod.Spec.Containers[0].Env[1:] {
+		if !strings.HasPrefix(variable.Value, "/work/.cache/") || variable.ValueFrom != nil {
+			t.Fatal("Go cache must use the configured writable workspace")
+		}
+	}
 }
 
 func TestProfileRestrictions(t *testing.T) {
@@ -66,6 +71,48 @@ func TestProfileRestrictions(t *testing.T) {
 			tt.change(profile)
 			if ValidateProfile(profile, []string{image}, nil, nil) == nil {
 				t.Fatal("restricted profile accepted")
+			}
+		})
+	}
+}
+
+func TestCapabilityNameRestrictions(t *testing.T) {
+	const (
+		mode          = "selfHosted"
+		architecture  = "amd64"
+		workspaceSize = "1Gi"
+	)
+	image := "registry.example/executor@sha256:" + strings.Repeat("a", 64)
+	for _, tt := range []struct {
+		name  string
+		valid bool
+	}{
+		{name: "h", valid: true},
+		{name: "helper-1", valid: true},
+		{name: strings.Repeat("h", 32), valid: true},
+		{name: "helper-"},
+		{name: "1helper"},
+		{name: "Helper"},
+		{name: "helper_name"},
+		{name: strings.Repeat("h", 33)},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			profile := &agentsv1alpha1.SelfHostedEnvironment{
+				Image: image, Architecture: architecture, WorkspaceDirectory: defaultWorkspaceDirectory, WorkspaceSize: workspaceSize,
+				Capabilities: []agentsv1alpha1.LocalCapability{{Name: tt.name, Path: "/capabilities/" + tt.name, Image: image, Type: "skills"}},
+			}
+			err := ValidateProfile(profile, []string{image}, []string{image}, nil)
+			if (err == nil) != tt.valid {
+				t.Fatalf("capability admission validity: %v", err)
+			}
+			session := &agentsv1alpha1.Session{ObjectMeta: metav1.ObjectMeta{UID: "capability-session"}, Status: agentsv1alpha1.SessionStatus{
+				ExecutorImage: image, EnvironmentSnapshot: &agentsv1alpha1.SessionEnvironmentSnapshot{
+					Profile: agentsv1alpha1.EnvironmentSpec{Mode: mode, SelfHosted: profile},
+				},
+			}}
+			_, err = Pod(session, defaultWorkspaceDirectory, "")
+			if (err == nil) != tt.valid {
+				t.Fatalf("frozen capability Pod validity: %v", err)
 			}
 		})
 	}

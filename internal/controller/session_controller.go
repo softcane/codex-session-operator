@@ -20,20 +20,23 @@ import (
 	"context"
 	"errors"
 	"reflect"
-	"strings"
 	"time"
 
 	agentsv1alpha1 "github.com/softcane/codex-session-operator/api/v1alpha1"
 	"github.com/softcane/codex-session-operator/internal/openaiapi"
+	"github.com/softcane/codex-session-operator/internal/sandbox"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+	"sigs.k8s.io/controller-runtime/pkg/source"
 )
 
 const agentNotReadyReason = "AgentNotReady"
@@ -47,8 +50,6 @@ const observationInterval = 30 * time.Second
 
 // SessionProvider is the controller's external lifecycle boundary.
 type SessionProvider interface {
-	CreateSelfHostedSession(context.Context, string, string) (openaiapi.Session, error)
-	CreateAgentSession(context.Context, string, string, string) (openaiapi.Session, error)
 	GetSession(context.Context, string) (openaiapi.Session, error)
 	FindSession(context.Context, string) (openaiapi.Session, error)
 	DeleteSession(context.Context, string) error
@@ -88,9 +89,9 @@ type SessionReconciler struct {
 	Vaults                           CredentialProvider
 	ExecutorImages, CapabilityImages []string
 	WorkspaceStorageClasses          []string
+	RepositoryURLs                   []string
 	AgentOwnerScope                  string
 	Connections                      EnvironmentObserver
-	ExecutorImage                    string
 	// ApplicationKeyHash prevents accidental reuse of the manager credential.
 	ApplicationKeyHash [32]byte
 }
@@ -100,9 +101,10 @@ type SessionReconciler struct {
 // +kubebuilder:rbac:groups=agents.softcane.io,resources=sessions/finalizers,verbs=update
 // +kubebuilder:rbac:groups=agents.softcane.io,resources=agents,verbs=get;list;watch
 // +kubebuilder:rbac:groups=agents.softcane.io,resources=environments,verbs=get;list;watch
-// +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;create;delete
+// +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;create;patch;delete
 // +kubebuilder:rbac:groups="",resources=persistentvolumeclaims,verbs=get;list;watch;create;patch;delete
 // +kubebuilder:rbac:groups="",resources=secrets,resourceNames=codex-executor,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=secrets,resourceNames=codex-repository,verbs=get;list;watch
 
 // Reconcile maintains one remote Session without replaying an ambiguous create.
 func (r *SessionReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -136,6 +138,10 @@ func (r *SessionReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			if secret == nil || err != nil {
 				return ctrl.Result{RequeueAfter: observationInterval}, errors.Join(err, r.patchStatus(ctx, &session, base))
 			}
+			_, available, err := r.executorRepositoryCredential(ctx, &session)
+			if !available || err != nil {
+				return ctrl.Result{RequeueAfter: observationInterval}, errors.Join(err, r.patchStatus(ctx, &session, base))
+			}
 		}
 		remote, err := r.OpenAI.GetSession(ctx, session.Status.OpenAISessionID)
 		if err != nil {
@@ -162,12 +168,11 @@ func (r *SessionReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 }
 
 func (r *SessionReconciler) createSession(ctx context.Context, session *agentsv1alpha1.Session) (ctrl.Result, error) {
-	workspace := effectiveWorkspace(session)
-	if !strings.HasPrefix(workspace, "/") || len(workspace) > 4096 {
-		return r.problem(ctx, session, invalidConfigurationReason, "Workspace must be an absolute path of at most 4096 characters", nil)
-	}
 	if session.UID == "" {
 		return ctrl.Result{}, errors.New("kubernetes Session UID is missing")
+	}
+	if session.Spec.AgentRef == nil || session.Spec.EnvironmentRef == nil || session.Spec.SpendControl == nil {
+		return r.problem(ctx, session, invalidConfigurationReason, "Session agentRef, environmentRef and spendControl are required", nil)
 	}
 	if _, _, err := openaiapi.SessionSpendControlField(session.Spec.SpendControl); err != nil {
 		return r.problem(ctx, session, invalidConfigurationReason, "Session spend control is invalid", nil)
@@ -177,21 +182,17 @@ func (r *SessionReconciler) createSession(ctx context.Context, session *agentsv1
 	if reason != "" {
 		return r.problem(ctx, session, reason, message, err)
 	}
-	if policy, ok := r.Gateway.(investigationPolicy); ok {
-		if err := policy.ValidateInvestigation(ctx, session, environmentSnapshot); err != nil {
-			return r.problem(ctx, session, "InvestigationPolicyBlocked", "Gateway work policy no longer permits creation", err)
+	if policy, ok := r.Gateway.(sessionPolicy); ok {
+		if err := policy.ValidateSessionPolicy(ctx, session, environmentSnapshot); err != nil {
+			return r.problem(ctx, session, "SessionPolicyBlocked", "Session policy does not permit creation", err)
 		}
-	} else if session.Annotations["agents.softcane.io/issue-source"] != "" ||
-		session.Annotations["agents.softcane.io/work-source"] != "" {
-		return r.problem(ctx, session, "InvestigationPolicyRequired", "Gateway-managed work requires the gateway policy gate", nil)
+	} else if session.Annotations["agents.softcane.io/work-source"] != "" {
+		return r.problem(ctx, session, "SessionPolicyRequired", "Gateway-managed Session requires policy validation", nil)
 	}
-	if environmentSnapshot != nil {
-		workspace = defaultWorkspace
-		if environmentSnapshot.Profile.SelfHosted != nil {
-			workspace = environmentSnapshot.Profile.SelfHosted.WorkspaceDirectory
-		}
+	if environmentSnapshot == nil {
+		return r.problem(ctx, session, invalidConfigurationReason, "Referenced Environment did not produce a frozen snapshot", nil)
 	}
-	snapshot, reason, message, err := r.resolveAgent(ctx, session, environmentSnapshot)
+	snapshot, reason, message, err := r.resolveAgent(ctx, session)
 	if reason != "" {
 		return r.problem(ctx, session, reason, message, err)
 	}
@@ -207,6 +208,17 @@ func (r *SessionReconciler) createSession(ctx context.Context, session *agentsv1
 	if message != "" {
 		return r.problem(ctx, session, "VaultNotReady", message, err)
 	}
+	if policy, ok := r.Gateway.(sessionPolicy); ok && session.Annotations["agents.softcane.io/work-source"] != "" {
+		// Validate resolved identities so a replacement during resolution cannot
+		// consume an accepted attempt's claim against another dependency UID.
+		resolved := session.DeepCopy()
+		resolved.Status.AgentSnapshot = snapshot
+		resolved.Status.EnvironmentSnapshot = environmentSnapshot
+		resolved.Status.VaultSnapshots = vaultSnapshots
+		if err := policy.ValidateSessionPolicy(ctx, resolved.DeepCopy(), environmentSnapshot); err != nil {
+			return r.problem(ctx, session, "SessionPolicyBlocked", "Resolved dependencies do not match the accepted Session policy", err)
+		}
+	}
 	none := environmentSnapshot != nil && environmentSnapshot.Profile.Mode == _noneMode
 	initialText, initialKey, inputErr := r.initialGatewayInput(ctx, session, environmentSnapshot)
 	if inputErr != nil {
@@ -215,20 +227,19 @@ func (r *SessionReconciler) createSession(ctx context.Context, session *agentsv1
 	if none && initialText == "" {
 		return r.problem(ctx, session, "GatewayInputRequired", "Waiting for durable first message in gateway store", nil)
 	}
-	if (sessionConfigured(session) || none) && (r.Configuration == nil || r.AgentOwnerScope == "") {
+	if r.Configuration == nil || r.AgentOwnerScope == "" {
 		return r.problem(ctx, session, "SessionProviderRequired", "Configure Session creation and installation/project scope", nil)
 	}
 	if _, err := openaiapi.VaultMetadata(session.Spec.Metadata, nil, nil, string(session.UID), r.AgentOwnerScope); err != nil {
 		return r.problem(ctx, session, invalidConfigurationReason, err.Error(), nil)
 	}
 
-	return r.claimSession(ctx, session, sessionCreation{workspace: workspace, environmentSnapshot: environmentSnapshot,
+	return r.claimSession(ctx, session, sessionCreation{environmentSnapshot: environmentSnapshot,
 		environmentFields: environmentFields, agentSnapshot: snapshot, vaultSnapshots: vaultSnapshots, vaultIDs: vaultIDs,
 		effectiveAgent: effectiveAgent, overrides: overrides, none: none, initialText: initialText, initialKey: initialKey})
 }
 
 type sessionCreation struct {
-	workspace                 string
 	environmentSnapshot       *agentsv1alpha1.SessionEnvironmentSnapshot
 	environmentFields         map[string]any
 	agentSnapshot             *agentsv1alpha1.SessionAgentSnapshot
@@ -246,20 +257,15 @@ func (r *SessionReconciler) claimSession(ctx context.Context, session *agentsv1a
 	// writer sends POST. Never put this POST inside a Kubernetes conflict retry.
 	base := session.DeepCopy()
 	session.Status.CreationAttempted = true
-	if session.Spec.SpendControl != nil {
-		session.Status.SpendControlAttemptedDigest = spendControlDigest(session.Spec.SpendControl)
-	}
-	session.Status.CreationWorkspaceDirectory = creation.workspace
+	session.Status.SpendControlAttemptedDigest = spendControlDigest(session.Spec.SpendControl)
 	session.Status.AgentSnapshot = creation.agentSnapshot
 	session.Status.EnvironmentSnapshot = creation.environmentSnapshot
 	session.Status.VaultSnapshots = creation.vaultSnapshots
-	if sessionConfigured(session) || creation.none {
-		session.Status.OwnerScope = r.AgentOwnerScope
-		session.Status.CreationAgentDigest = openaiapi.SessionImmutableAgentDigest(creation.effectiveAgent)
-		session.Status.CreationOnlyDigest = openaiapi.SessionCreationOnlyDigest(session.Spec.Agent)
-		session.Status.ManagedMetadataKeys = metadataKeys(session.Spec.Metadata)
-		session.Status.AppliedMutableDigest = openaiapi.SessionMutableDigest(session.Spec.Agent)
-	}
+	session.Status.OwnerScope = r.AgentOwnerScope
+	session.Status.CreationAgentDigest = openaiapi.SessionImmutableAgentDigest(creation.effectiveAgent)
+	session.Status.CreationOnlyDigest = openaiapi.SessionCreationOnlyDigest(session.Spec.Agent)
+	session.Status.ManagedMetadataKeys = metadataKeys(session.Spec.Metadata)
+	session.Status.AppliedMutableDigest = openaiapi.SessionMutableDigest(session.Spec.Agent)
 	if creation.environmentSnapshot != nil && creation.environmentSnapshot.Profile.SelfHosted != nil {
 		session.Status.ExecutorImage = creation.environmentSnapshot.Profile.SelfHosted.Image
 	}
@@ -268,29 +274,14 @@ func (r *SessionReconciler) claimSession(ctx context.Context, session *agentsv1a
 		return ctrl.Result{}, err
 	}
 	var remote openaiapi.Session
-	if sessionConfigured(session) || creation.none {
-		agentID := ""
-		if creation.agentSnapshot != nil {
-			agentID = creation.agentSnapshot.OpenAIAgentID
-		}
-		if creation.environmentSnapshot == nil {
-			creation.environmentFields = map[string]any{_wireType: "self_hosted", "workspace_directory": creation.workspace}
-		}
-		if creation.none {
-			remote, err = r.InitialSessions.CreateInitialSession(ctx, string(session.UID), session.Status.OwnerScope, agentID, creation.environmentFields, creation.overrides, creation.vaultIDs, session.Spec.Metadata, session.Spec.SpendControl, creation.initialText, creation.initialKey)
-		} else {
-			remote, err = r.Configuration.CreateConfiguredSession(ctx, string(session.UID), session.Status.OwnerScope, agentID, creation.environmentFields, creation.overrides, creation.vaultIDs, session.Spec.Metadata, session.Spec.SpendControl)
-		}
-	} else if creation.environmentSnapshot != nil {
-		agentID := ""
-		if creation.agentSnapshot != nil {
-			agentID = creation.agentSnapshot.OpenAIAgentID
-		}
-		remote, err = r.Environments.CreateEnvironmentSession(ctx, string(session.UID), agentID, creation.environmentFields)
-	} else if creation.agentSnapshot == nil {
-		remote, err = r.OpenAI.CreateSelfHostedSession(ctx, string(session.UID), creation.workspace)
+	if creation.agentSnapshot == nil {
+		return r.problem(ctx, session, invalidConfigurationReason, "Referenced Agent did not produce a frozen snapshot", nil)
+	}
+	agentID := creation.agentSnapshot.OpenAIAgentID
+	if creation.none {
+		remote, err = r.InitialSessions.CreateInitialSession(ctx, string(session.UID), session.Status.OwnerScope, agentID, creation.environmentFields, creation.overrides, creation.vaultIDs, session.Spec.Metadata, session.Spec.SpendControl, creation.initialText, creation.initialKey)
 	} else {
-		remote, err = r.OpenAI.CreateAgentSession(ctx, string(session.UID), creation.workspace, creation.agentSnapshot.OpenAIAgentID)
+		remote, err = r.Configuration.CreateConfiguredSession(ctx, string(session.UID), session.Status.OwnerScope, agentID, creation.environmentFields, creation.overrides, creation.vaultIDs, session.Spec.Metadata, session.Spec.SpendControl)
 	}
 	if err != nil {
 		if errors.Is(err, openaiapi.ErrSpendControlUnavailable) {
@@ -319,7 +310,7 @@ func (r *SessionReconciler) recoverCreation(ctx context.Context, session *agents
 		return r.problem(ctx, session, creationOutcomeUnknownReason, "No unique remote Session was discovered; create is blocked and the finalizer is retained for audit", err)
 	}
 	if !session.DeletionTimestamp.IsZero() {
-		if remote.OwnerUID != string(session.UID) || (session.Status.OwnerScope != "" && remote.OwnerScope != session.Status.OwnerScope) {
+		if remote.OwnerUID != string(session.UID) || remote.OwnerScope != session.Status.OwnerScope {
 			return r.problem(ctx, session, ownershipMismatchReason, "Discovered Session belongs to another Kubernetes UID", nil)
 		}
 		base := session.DeepCopy()
@@ -346,7 +337,7 @@ func (r *SessionReconciler) track(ctx context.Context, session *agentsv1alpha1.S
 	if reason, message := r.sessionInvariantProblem(ctx, session, remote); reason != "" {
 		return r.rejectRemoteSession(ctx, session, base, reason, message)
 	}
-	if spend := session.Spec.SpendControl; spend != nil && !spendControlMatches(spend, remote) {
+	if !spendControlMatches(session.Spec.SpendControl, remote) {
 		return r.rejectRemoteSession(ctx, session, base, "SpendControlUnverified", "OpenAI did not confirm the requested Session spend limit")
 	}
 	session.Status.SpendControlAttemptedDigest = ""
@@ -362,6 +353,15 @@ func (r *SessionReconciler) track(ctx context.Context, session *agentsv1alpha1.S
 	session.Status.EnvironmentID = remote.EnvironmentID
 	session.Status.RemoteURL = remote.RemoteURL
 	setState(session, "Connecting", metav1.ConditionTrue, "RemoteSessionCreated", "Remote Session exists; executor connection is pending")
+	// Workspace creation may commit status with its own optimistic-lock base.
+	// Freeze the learned remote identity before that base can omit these changes.
+	if base.Status.OpenAISessionID != session.Status.OpenAISessionID ||
+		base.Status.EnvironmentID != session.Status.EnvironmentID || base.Status.RemoteURL != session.Status.RemoteURL {
+		if err := r.patchStatus(ctx, session, base); err != nil {
+			return ctrl.Result{}, err
+		}
+		base = session.DeepCopy()
+	}
 	result, committed, err := r.reconcileExecutor(ctx, session)
 	if committed {
 		return result, err
@@ -371,7 +371,7 @@ func (r *SessionReconciler) track(ctx context.Context, session *agentsv1alpha1.S
 
 func ownedSession(session *agentsv1alpha1.Session, remote openaiapi.Session) bool {
 	return remote.ID != "" && remote.OwnerUID == string(session.UID) &&
-		(session.Status.OwnerScope == "" || remote.OwnerScope == session.Status.OwnerScope) &&
+		remote.OwnerScope == session.Status.OwnerScope &&
 		(session.Status.OpenAISessionID == "" || remote.ID == session.Status.OpenAISessionID)
 }
 
@@ -464,7 +464,7 @@ func (r *SessionReconciler) finalize(ctx context.Context, session *agentsv1alpha
 			return r.problem(ctx, session, "CleanupFailed", "Could not observe remote Session for cleanup", err)
 		}
 		if err == nil {
-			if remote.OwnerUID != string(session.UID) || remote.ID != session.Status.OpenAISessionID || (session.Status.OwnerScope != "" && remote.OwnerScope != session.Status.OwnerScope) {
+			if remote.OwnerUID != string(session.UID) || remote.ID != session.Status.OpenAISessionID || remote.OwnerScope != session.Status.OwnerScope {
 				return r.problem(ctx, session, ownershipMismatchReason, "Remote Session ownership could not be verified; cleanup is blocked", nil)
 			}
 			if err := r.OpenAI.DeleteSession(ctx, remote.ID); err != nil && !errors.Is(err, openaiapi.ErrNotFound) {
@@ -530,17 +530,23 @@ func optimisticPatch(base *agentsv1alpha1.Session) client.Patch {
 }
 
 func effectiveWorkspace(session *agentsv1alpha1.Session) string {
-	if session.Status.CreationWorkspaceDirectory != "" {
-		return session.Status.CreationWorkspaceDirectory
+	if snapshot := session.Status.EnvironmentSnapshot; snapshot != nil && snapshot.Profile.SelfHosted != nil {
+		return snapshot.Profile.SelfHosted.WorkspaceDirectory
 	}
-	if session.Spec.WorkspaceDirectory == "" {
-		return defaultWorkspace
-	}
-	return session.Spec.WorkspaceDirectory
+	return defaultWorkspace
 }
 
 func setState(session *agentsv1alpha1.Session, phase string, status metav1.ConditionStatus, reason, message string) {
 	session.Status.Phase = phase
+	// Ordinary executor reconciliation compares the prior instance before clearing
+	// and re-observing its proof. Failed and terminating states revoke it here.
+	if phase != "Connecting" || status != metav1.ConditionTrue {
+		session.Status.WorkspacePreparation = nil
+		meta.SetStatusCondition(&session.Status.Conditions, metav1.Condition{
+			Type: workspacePreparedCondition, Status: metav1.ConditionFalse, Reason: reason,
+			Message: "Current workspace preparation has not been confirmed", ObservedGeneration: session.Generation,
+		})
+	}
 	meta.SetStatusCondition(&session.Status.Conditions, metav1.Condition{
 		Type: "RemoteSessionCreated", Status: status, Reason: reason,
 		Message: message, ObservedGeneration: session.Generation,
@@ -575,6 +581,16 @@ func (r *SessionReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	}); err != nil {
 		return err
 	}
+	repositoryCache, err := cache.New(mgr.GetConfig(), cache.Options{Scheme: mgr.GetScheme(), ReaderFailOnMissingInformer: true,
+		ByObject: map[client.Object]cache.ByObject{&corev1.Secret{}: {
+			Field: fields.OneTermEqualSelector("metadata.name", sandbox.RepositorySecretName),
+		}}})
+	if err != nil {
+		return err
+	}
+	if err := mgr.Add(repositoryCache); err != nil {
+		return err
+	}
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&agentsv1alpha1.Session{}).
 		Owns(&corev1.Pod{}).
@@ -584,13 +600,14 @@ func (r *SessionReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Watches(&agentsv1alpha1.Vault{}, handler.EnqueueRequestsFromMapFunc(r.vaultSessionRequests)).
 		Watches(&agentsv1alpha1.VaultCredential{}, handler.EnqueueRequestsFromMapFunc(r.vaultSessionRequests)).
 		Watches(&corev1.Secret{}, r.executorSecretHandler()).
+		WatchesRawSource(source.Kind(repositoryCache, &corev1.Secret{}, handler.TypedEnqueueRequestsFromMapFunc(r.repositorySecretRequests))).
 		Named("session").
 		Complete(r)
 }
 
-func (r *SessionReconciler) resolveAgent(ctx context.Context, session *agentsv1alpha1.Session, environment *agentsv1alpha1.SessionEnvironmentSnapshot) (*agentsv1alpha1.SessionAgentSnapshot, string, string, error) {
+func (r *SessionReconciler) resolveAgent(ctx context.Context, session *agentsv1alpha1.Session) (*agentsv1alpha1.SessionAgentSnapshot, string, string, error) {
 	if session.Spec.AgentRef == nil {
-		return nil, "", "", nil
+		return nil, invalidConfigurationReason, "Session agentRef is required", nil
 	}
 	if r.Agents == nil || r.AgentOwnerScope == "" {
 		return nil, "AgentProviderRequired", "Saved Agent provider and installation/project scope must be configured", nil
@@ -629,18 +646,8 @@ func (r *SessionReconciler) resolveAgent(ctx context.Context, session *agentsv1a
 	if len(changes) > 0 {
 		return nil, agentNotReadyReason, "Referenced Agent configuration has drifted", nil
 	}
-	if reason, message := r.gatewayAgentBlock(ctx, remote.Config, environment); !sessionConfigured(session) && reason != "" {
-		return nil, reason, message, nil
-	}
 	return &agentsv1alpha1.SessionAgentSnapshot{Name: agent.Name, UID: string(agent.UID), Generation: agent.Generation,
 		OpenAIAgentID: remote.ID, Model: remote.Model, ConfigurationDigest: openaiapi.AgentConfigurationDigest(remote.Config)}, "", "", nil
-}
-
-func sessionModel(session *agentsv1alpha1.Session) string {
-	if session.Status.AgentSnapshot != nil {
-		return session.Status.AgentSnapshot.Model
-	}
-	return openaiapi.SessionModel
 }
 
 func setSessionConfigurationCondition(session *agentsv1alpha1.Session) {
@@ -652,10 +659,6 @@ func setSessionConfigurationCondition(session *agentsv1alpha1.Session) {
 	if session.Status.AgentSnapshot != nil {
 		selected = session.Status.AgentSnapshot.Name
 	}
-	workspace := session.Spec.WorkspaceDirectory
-	if workspace == "" {
-		workspace = defaultWorkspace
-	}
 	environmentName, selectedEnvironment := "", ""
 	if session.Spec.EnvironmentRef != nil {
 		environmentName = session.Spec.EnvironmentRef.Name
@@ -663,10 +666,10 @@ func setSessionConfigurationCondition(session *agentsv1alpha1.Session) {
 	if session.Status.EnvironmentSnapshot != nil {
 		selectedEnvironment = session.Status.EnvironmentSnapshot.Name
 	}
-	changed := phase4CreationChanged(session) || name != selected || environmentName != selectedEnvironment || (session.Status.EnvironmentSnapshot != nil && workspace != defaultWorkspace) || (session.Status.EnvironmentSnapshot == nil && session.Status.CreationWorkspaceDirectory != "" && workspace != session.Status.CreationWorkspaceDirectory)
+	changed := phase4CreationChanged(session) || name != selected || environmentName != selectedEnvironment
 	status, reason, message := metav1.ConditionTrue, "CreationConfigurationCurrent", "Session uses its frozen creation configuration"
 	if changed {
-		status, reason, message = metav1.ConditionFalse, "RequiresNewSession", "Session reference or legacy workspace changed; create a new Session to apply it"
+		status, reason, message = metav1.ConditionFalse, "RequiresNewSession", "Session reference or creation-only configuration changed; create a new Session to apply it"
 	}
 	meta.SetStatusCondition(&session.Status.Conditions, metav1.Condition{Type: "ConfigurationCurrent", Status: status,
 		Reason: reason, Message: message, ObservedGeneration: session.Generation})

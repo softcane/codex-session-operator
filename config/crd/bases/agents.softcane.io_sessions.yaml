@@ -355,9 +355,7 @@ spec:
                   rule: '!(has(self.serviceTier) && has(self.resetServiceTier) &&
                     self.resetServiceTier)'
               agentRef:
-                description: |-
-                  AgentRef selects a saved Agent in this namespace. Existing Sessions created
-                  before explicit references were required may continue without one.
+                description: AgentRef selects a saved Agent in this namespace.
                 properties:
                   name:
                     maxLength: 253
@@ -368,9 +366,7 @@ spec:
                 - name
                 type: object
               environmentRef:
-                description: |-
-                  EnvironmentRef selects a same-namespace profile. Existing Sessions created
-                  before explicit references were required may continue without one.
+                description: EnvironmentRef selects a same-namespace Environment.
                 properties:
                   name:
                     maxLength: 253
@@ -390,9 +386,8 @@ spec:
                   rule: self.all(k, size(k) >= 1 && size(k) <= 64 && size(self[k])
                     <= 512 && !(k in ['kubernetes_uid', 'operator', 'owner_scope']))
               spendControl:
-                description: |-
-                  SpendControl explicitly selects a per-Session OpenAI spend limit or
-                  unlimited spending. Only Sessions stored before the migration may omit it.
+                description: SpendControl explicitly selects a per-Session OpenAI
+                  spend limit or unlimited spending.
                 properties:
                   limitCents:
                     description: LimitCents is a positive US-cent amount when mode
@@ -432,14 +427,10 @@ spec:
                 x-kubernetes-list-map-keys:
                 - name
                 x-kubernetes-list-type: map
-              workspaceDirectory:
-                default: /workspace
-                description: |-
-                  WorkspaceDirectory is the working directory used by Codex
-                  inside the self-hosted environment.
-                maxLength: 4096
-                pattern: ^/
-                type: string
+            required:
+            - agentRef
+            - environmentRef
+            - spendControl
             type: object
           status:
             description: status defines the observed state of Session
@@ -542,10 +533,6 @@ spec:
                   Never reset it to retry an ambiguous create; discover by Kubernetes UID.
                 type: boolean
               creationOnlyDigest:
-                type: string
-              creationWorkspaceDirectory:
-                description: CreationWorkspaceDirectory freezes the effective workspace
-                  for recovery.
                 type: string
               environmentID:
                 description: |-
@@ -884,12 +871,12 @@ spec:
                                   pattern: ^[^\s@]+@sha256:[a-f0-9]{64}$
                                   type: string
                                 name:
-                                  pattern: ^[a-z][a-z0-9-]{0,31}$
+                                  pattern: ^[a-z]([a-z0-9-]{0,30}[a-z0-9])?$
                                   type: string
                                 path:
                                   description: Path selects the actual plugin root,
                                     or a directory containing skills.
-                                  pattern: ^/capabilities/[a-z][a-z0-9-]{0,31}$
+                                  pattern: ^/capabilities/[a-z]([a-z0-9-]{0,30}[a-z0-9])?$
                                   type: string
                                 type:
                                   enum:
@@ -911,6 +898,63 @@ spec:
                             maxLength: 512
                             pattern: ^[^\s@]+@sha256:[a-f0-9]{64}$
                             type: string
+                          repository:
+                            description: |-
+                              Repository prepares a trusted checkout before the executor starts.
+                              Changes apply only to future Sessions; replacement Pods preserve existing files.
+                            properties:
+                              commit:
+                                description: Commit is a complete immutable SHA-1
+                                  object identity, never a branch or tag.
+                                pattern: ^[a-f0-9]{40}$
+                                type: string
+                              credentialSecretRef:
+                                description: CredentialSecretRef selects protected
+                                  material mounted into preparation by default.
+                                properties:
+                                  key:
+                                    description: Key selects the access token; its
+                                      value is never placed in public configuration.
+                                    pattern: ^[a-zA-Z0-9._-]{1,253}$
+                                    type: string
+                                  name:
+                                    enum:
+                                    - codex-repository
+                                    type: string
+                                  usernameKey:
+                                    description: UsernameKey selects an optional username;
+                                      omission uses x-access-token.
+                                    pattern: ^[a-zA-Z0-9._-]{1,253}$
+                                    type: string
+                                required:
+                                - key
+                                - name
+                                type: object
+                                x-kubernetes-validations:
+                                - message: repository token and username keys must
+                                    be distinct
+                                  rule: '!has(self.usernameKey) || self.usernameKey
+                                    != self.key'
+                              mountCredentialsInExecutor:
+                                description: |-
+                                  MountCredentialsInExecutor explicitly exposes the selected repository credential
+                                  files to task commands. Omission keeps credentials in preparation only.
+                                  Credential permissions must be restricted by the Git hosting provider.
+                                type: boolean
+                              url:
+                                description: URL must also be approved by the operator's
+                                  exact repository URL allowlist.
+                                maxLength: 2048
+                                pattern: ^https://[^/@?#]+/[^?#]+$
+                                type: string
+                            required:
+                            - commit
+                            - url
+                            type: object
+                            x-kubernetes-validations:
+                            - message: executor credential mounting requires credentialSecretRef
+                              rule: '!has(self.mountCredentialsInExecutor) || !self.mountCredentialsInExecutor
+                                || has(self.credentialSecretRef)'
                           resources:
                             description: ExecutorResources permits CPU and memory
                               only; controller enforces platform bounds.
@@ -946,7 +990,7 @@ spec:
                           workspaceStorage:
                             description: |-
                               WorkspaceStorage selects whether files survive executor Pod replacement.
-                              Omission preserves the legacy ephemeral workspace behavior.
+                              Omission selects an ephemeral workspace with the configured size.
                             properties:
                               claimDeletionPolicy:
                                 description: |-
@@ -981,6 +1025,7 @@ spec:
                         - image
                         type: object
                     required:
+                    - deletionPolicy
                     - mode
                     type: object
                     x-kubernetes-validations:
@@ -1122,20 +1167,47 @@ spec:
               workspaceClaimUID:
                 description: |-
                   WorkspaceClaimUID pins the Session-owned PVC identity across Pod replacement.
-                  Empty means the legacy ephemeral workspace or an unobserved claim.
+                  Empty means an ephemeral workspace or an unobserved claim.
                 type: string
+              workspacePreparation:
+                description: |-
+                  WorkspacePreparation records preparation evidence for one observed Pod.
+                  Missing or replaced Pods invalidate this evidence before execution resumes.
+                properties:
+                  claimUID:
+                    type: string
+                  configDigest:
+                    type: string
+                  containerID:
+                    description: ContainerID and StartedAt identify the executor process
+                      generation inside the Pod.
+                    type: string
+                  initialCommit:
+                    type: string
+                  podUID:
+                    type: string
+                  repositoryDigest:
+                    type: string
+                  restartCount:
+                    format: int32
+                    type: integer
+                  startedAt:
+                    format: date-time
+                    type: string
+                required:
+                - configDigest
+                - containerID
+                - podUID
+                - restartCount
+                - startedAt
+                type: object
             type: object
         required:
         - spec
         type: object
         x-kubernetes-validations:
-        - message: new Sessions require agentRef, environmentRef and spendControl;
-            existing choices cannot be removed
-          optionalOldSelf: true
-          rule: (has(self.spec.agentRef) && has(self.spec.environmentRef) && has(self.spec.spendControl))
-            || (oldSelf.hasValue() && (has(self.spec.agentRef) || !has(oldSelf.value().spec.agentRef))
-            && (has(self.spec.environmentRef) || !has(oldSelf.value().spec.environmentRef))
-            && (has(self.spec.spendControl) || !has(oldSelf.value().spec.spendControl)))
+        - message: Sessions require agentRef, environmentRef and spendControl
+          rule: has(self.spec.agentRef) && has(self.spec.environmentRef) && has(self.spec.spendControl)
     served: true
     storage: true
     subresources:

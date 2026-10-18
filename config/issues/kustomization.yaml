@@ -1,4 +1,0 @@
-resources:
-- ../gateway
-patches:
-- path: manager_patch.yaml

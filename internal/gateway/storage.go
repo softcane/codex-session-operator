@@ -29,8 +29,6 @@ type DeliveryStorage interface {
 type IndexedStorage interface {
 	ActiveRecords(context.Context) ([]Record, error)
 	RecordSummaries(context.Context, string, string) ([]Record, error)
-	LookupWorkEvent(context.Context, string, string, string) (Record, WorkEvent, bool, error)
-	LookupIssueDelivery(context.Context, string, string, string) (Record, IssueDelivery, bool, error)
 }
 
 // ConversationEntry holds compact metadata for one public conversation attempt.

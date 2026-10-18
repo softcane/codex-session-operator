@@ -37,9 +37,8 @@ type VaultCredentialSpec struct {
 	// +kubebuilder:validation:XValidation:rule="self.all(k, size(k) >= 1 && size(k) <= 64 && size(self[k]) <= 512 && !(k in ['kubernetes_uid', 'operator', 'owner_scope']))",message="metadata exceeds limits or uses ownership keys"
 	Metadata *map[string]string  `json:"metadata,omitempty"`
 	Auth     VaultCredentialAuth `json:"auth"`
-	// +optional
 	// +kubebuilder:validation:Enum=Delete;Retain
-	DeletionPolicy string `json:"deletionPolicy,omitempty"`
+	DeletionPolicy string `json:"deletionPolicy"`
 }
 
 // CredentialSecretReference selects a key in the namespace's protected Vault source.
@@ -178,7 +177,7 @@ type VaultCredentialStatus struct {
 
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
-// +kubebuilder:validation:XValidation:rule="has(self.spec.deletionPolicy) || (oldSelf.hasValue() && !has(oldSelf.value().spec.deletionPolicy))",message="new VaultCredentials require deletionPolicy; an existing policy cannot be removed",optionalOldSelf=true
+// +kubebuilder:validation:XValidation:rule="has(self.spec.deletionPolicy)",message="VaultCredentials require deletionPolicy"
 
 // VaultCredential is the Schema for the vaultcredentials API
 type VaultCredential struct {

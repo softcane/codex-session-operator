@@ -10,7 +10,7 @@ import (
 func BenchmarkPostgreSQLRecords(b *testing.B) {
 	for _, size := range []int{1, 64} {
 		b.Run(fmt.Sprintf("retained=%d", size), func(b *testing.B) {
-			store, _ := postgresForTest(b, 32)
+			store, _ := postgresForTest(b)
 			for i := range size {
 				if err := store.Update(b.Context(), fmt.Sprintf("record-%04d", i), func(r *Record) error {
 					r.Namespace = _testNamespace

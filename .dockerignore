@@ -13,18 +13,15 @@
 !internal/
 !internal/**/
 !internal/**/*.go
+!internal/gateway/schema.sql
 **/*_test.go
 
-# Assets embedded in the gateway binary.
-!internal/gateway/ui/
-!internal/gateway/ui/index.html
-!internal/gateway/ui/app.js
-!internal/gateway/ui/style.css
-
-# The sole local acceptance provider image.
+# Isolated acceptance fixtures; credentials remain outside the build context.
 !test/
 !test/e2e/
 !test/e2e/provider.js
+!test/e2e/executor.js
+!test/e2e/repository.js
 
 # Explicit exclusions protect these if the allowlist is expanded later.
 .private/

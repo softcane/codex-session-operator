@@ -111,7 +111,8 @@ func TestHostedCompleteWireAndSDKSizeGap(t *testing.T) {
 	fields[typeField] = openaiHostedType
 	fields["container_size"] = testSmallContainerSize
 	fields["environment_template_id"] = testHostedTemplateID
-	session, err := c.CreateEnvironmentSession(context.Background(), "uid-test", "agent_test", fields)
+	spend := &agentsv1alpha1.SessionSpendControl{Mode: sessionSpendModeUnlimited}
+	session, err := c.CreateConfiguredSession(context.Background(), "uid-test", "test-scope", "agent_test", fields, nil, nil, nil, spend)
 	if err != nil {
 		t.Fatal(err)
 	}

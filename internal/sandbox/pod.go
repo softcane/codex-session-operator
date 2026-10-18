@@ -71,6 +71,11 @@ func Pod(session *agentsv1alpha1.Session, workspace, config string) (*corev1.Pod
 		if err := ApplyProfile(pod, session.Status.EnvironmentSnapshot.Profile.SelfHosted, string(session.UID)); err != nil {
 			return nil, err
 		}
+		if profile := session.Status.EnvironmentSnapshot.Profile.SelfHosted; profile != nil {
+			if err := applyRepository(pod, profile.Repository, string(session.UID)); err != nil {
+				return nil, err
+			}
+		}
 	}
 	return pod, nil
 }

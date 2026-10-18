@@ -26,10 +26,8 @@ import (
 
 // SessionSpec defines the desired state of Session.
 type SessionSpec struct {
-	// SpendControl explicitly selects a per-Session OpenAI spend limit or
-	// unlimited spending. Only Sessions stored before the migration may omit it.
-	// +optional
-	SpendControl *SessionSpendControl `json:"spendControl,omitempty"`
+	// SpendControl explicitly selects a per-Session OpenAI spend limit or unlimited spending.
+	SpendControl *SessionSpendControl `json:"spendControl"`
 	// VaultRefs attach same-namespace Vaults at creation; later attachment changes require a new Session.
 	// +optional
 	// +kubebuilder:validation:MaxItems=16
@@ -44,21 +42,10 @@ type SessionSpec struct {
 	// +kubebuilder:validation:XValidation:rule="self.all(k, size(k) >= 1 && size(k) <= 64 && size(self[k]) <= 512 && !(k in ['kubernetes_uid', 'operator', 'owner_scope']))",message="metadata exceeds limits or uses ownership keys"
 	Metadata *map[string]string `json:"metadata,omitempty"`
 
-	// EnvironmentRef selects a same-namespace profile. Existing Sessions created
-	// before explicit references were required may continue without one.
-	// +optional
-	EnvironmentRef *AgentReference `json:"environmentRef,omitempty"`
-	// AgentRef selects a saved Agent in this namespace. Existing Sessions created
-	// before explicit references were required may continue without one.
-	// +optional
-	AgentRef *AgentReference `json:"agentRef,omitempty"`
-	// WorkspaceDirectory is the working directory used by Codex
-	// inside the self-hosted environment.
-	//
-	// +kubebuilder:default="/workspace"
-	// +kubebuilder:validation:Pattern="^/"
-	// +kubebuilder:validation:MaxLength=4096
-	WorkspaceDirectory string `json:"workspaceDirectory,omitempty"`
+	// EnvironmentRef selects a same-namespace Environment.
+	EnvironmentRef *AgentReference `json:"environmentRef"`
+	// AgentRef selects a saved Agent in this namespace.
+	AgentRef *AgentReference `json:"agentRef"`
 }
 
 // SessionSpendControl models the OpenAI Session spend control. A limited
@@ -164,11 +151,15 @@ type SessionEnvironmentSnapshot struct {
 
 // SessionStatus defines observed state, never protected content.
 type SessionStatus struct {
+	// WorkspacePreparation records preparation evidence for one observed Pod.
+	// Missing or replaced Pods invalidate this evidence before execution resumes.
+	// +optional
+	WorkspacePreparation *SessionWorkspacePreparationStatus `json:"workspacePreparation,omitempty"`
 	// WorkspaceClaimCreationAttempted is a durable one-time claim for an
 	// unowned Retain PVC. Unknown outcomes require administrative audit.
 	WorkspaceClaimCreationAttempted bool `json:"workspaceClaimCreationAttempted,omitempty"`
 	// WorkspaceClaimUID pins the Session-owned PVC identity across Pod replacement.
-	// Empty means the legacy ephemeral workspace or an unobserved claim.
+	// Empty means an ephemeral workspace or an unobserved claim.
 	WorkspaceClaimUID string `json:"workspaceClaimUID,omitempty"`
 	// +optional
 	// +kubebuilder:validation:MaxItems=16
@@ -200,9 +191,6 @@ type SessionStatus struct {
 	// Never reset it to retry an ambiguous create; discover by Kubernetes UID.
 	CreationAttempted bool `json:"creationAttempted,omitempty"`
 
-	// CreationWorkspaceDirectory freezes the effective workspace for recovery.
-	CreationWorkspaceDirectory string `json:"creationWorkspaceDirectory,omitempty"`
-
 	// Phase is the current high-level lifecycle state.
 	// Examples: Pending, Creating, Connecting, Ready, Failed.
 	Phase string `json:"phase,omitempty"`
@@ -230,9 +218,25 @@ type SessionStatus struct {
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
 }
 
+// SessionWorkspacePreparationStatus binds safe preparation evidence to compute and storage.
+type SessionWorkspacePreparationStatus struct {
+	PodUID string `json:"podUID"`
+	// ContainerID and StartedAt identify the executor process generation inside the Pod.
+	ContainerID  string      `json:"containerID"`
+	RestartCount int32       `json:"restartCount"`
+	StartedAt    metav1.Time `json:"startedAt"`
+	// +optional
+	ClaimUID     string `json:"claimUID,omitempty"`
+	ConfigDigest string `json:"configDigest"`
+	// +optional
+	RepositoryDigest string `json:"repositoryDigest,omitempty"`
+	// +optional
+	InitialCommit string `json:"initialCommit,omitempty"`
+}
+
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
-// +kubebuilder:validation:XValidation:rule="(has(self.spec.agentRef) && has(self.spec.environmentRef) && has(self.spec.spendControl)) || (oldSelf.hasValue() && (has(self.spec.agentRef) || !has(oldSelf.value().spec.agentRef)) && (has(self.spec.environmentRef) || !has(oldSelf.value().spec.environmentRef)) && (has(self.spec.spendControl) || !has(oldSelf.value().spec.spendControl)))",message="new Sessions require agentRef, environmentRef and spendControl; existing choices cannot be removed",optionalOldSelf=true
+// +kubebuilder:validation:XValidation:rule="has(self.spec.agentRef) && has(self.spec.environmentRef) && has(self.spec.spendControl)",message="Sessions require agentRef, environmentRef and spendControl"
 
 // Session is the Schema for the sessions API
 type Session struct {

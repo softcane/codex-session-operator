@@ -22,9 +22,11 @@ const (
 	_approve           = "approve"
 	_deny              = "deny"
 	_typeField         = "type"
+	_closedStatus      = "closed"
 )
 
 const (
+	_recordVersion  = 3
 	_maxSubmissions = 1000
 	_maxEvents      = 256
 	_maxRecordBytes = 16 << 20
@@ -40,17 +42,18 @@ var (
 // Submission persists the exact wire event before its first network request.
 // Accepted describes HTTP acceptance; turn outcomes live in History.Turns.
 type Submission struct {
-	Key         string          `json:"key"`
-	RemoteKey   string          `json:"remote_key"`
-	Event       json.RawMessage `json:"event,omitempty"`
-	Text        string          `json:"text,omitempty"`
-	Initial     bool            `json:"initial,omitempty"`
-	TargetTurn  string          `json:"target_turn,omitempty"`
-	Accepted    bool            `json:"accepted"`
-	Attempts    int             `json:"attempts"`
-	CreatedAt   time.Time       `json:"created_at"`
-	AttemptedAt *time.Time      `json:"attempted_at,omitempty"`
-	Blocked     string          `json:"blocked,omitempty"`
+	Key          string          `json:"key"`
+	RemoteKey    string          `json:"remote_key"`
+	ReplayDigest string          `json:"replay_digest,omitempty"`
+	Event        json.RawMessage `json:"event,omitempty"`
+	Text         string          `json:"text,omitempty"`
+	Initial      bool            `json:"initial,omitempty"`
+	TargetTurn   string          `json:"target_turn,omitempty"`
+	Accepted     bool            `json:"accepted"`
+	Attempts     int             `json:"attempts"`
+	CreatedAt    time.Time       `json:"created_at"`
+	AttemptedAt  *time.Time      `json:"attempted_at,omitempty"`
+	Blocked      string          `json:"blocked,omitempty"`
 }
 
 // Action binds an approval and result to immutable provider call/request identity.
@@ -74,16 +77,17 @@ type TimelineEvent struct {
 
 // Record is gateway application data. No field is copied to a CRD.
 type Record struct {
-	Archived         bool              `json:"archived,omitempty"`
-	DeliveryHeld     bool              `json:"delivery_held,omitempty"`
-	Issue            *IssueSource      `json:"issue,omitempty"`
-	Work             *Work             `json:"work,omitempty"`
-	Version          int               `json:"version"`
-	Namespace        string            `json:"namespace"`
-	Name             string            `json:"name"`
-	UID              string            `json:"uid"`
-	RemoteID         string            `json:"remote_id,omitempty"`
-	Closed           bool              `json:"closed"`
+	Archived     bool   `json:"archived,omitempty"`
+	DeliveryHeld bool   `json:"delivery_held,omitempty"`
+	Work         *Work  `json:"work,omitempty"`
+	Version      int    `json:"version"`
+	Namespace    string `json:"namespace"`
+	Name         string `json:"name"`
+	UID          string `json:"uid"`
+	RemoteID     string `json:"remote_id,omitempty"`
+	Closed       bool   `json:"closed"`
+	// TerminalReason is a safe observation hint; Closed remains the input fence.
+	TerminalReason   string            `json:"terminal_reason,omitempty"`
 	InitialKey       string            `json:"initial_key,omitempty"`
 	Submissions      []Submission      `json:"submissions"`
 	Actions          map[string]Action `json:"actions"`
@@ -150,4 +154,14 @@ func resultKey(uid, id string) string {
 func wireKey(uid, key string) string {
 	sum := sha256.Sum256([]byte(uid + "/submission/" + key))
 	return "msg-" + hex.EncodeToString(sum[:])
+}
+
+// submissionDigest excludes mutable delivery state and the initial-to-hosted
+// event transition. Archive retains this fingerprint after erasing payloads.
+func submissionDigest(submission Submission) string {
+	event := ""
+	if submission.Text == "" {
+		event = string(submission.Event)
+	}
+	return digestValue([]string{submission.Text, submission.TargetTurn, event})
 }

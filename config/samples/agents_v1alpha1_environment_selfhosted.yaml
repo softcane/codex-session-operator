@@ -6,7 +6,7 @@ spec:
   mode: selfHosted
   deletionPolicy: Delete
   selfHosted:
-    # Replace with an image approved through EXECUTOR_IMAGE or EXECUTOR_IMAGES.
+    # Replace with an image approved through EXECUTOR_IMAGES.
     image: registry.example/executor@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
     architecture: arm64
     workspaceDirectory: /workspace

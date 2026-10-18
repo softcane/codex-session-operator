@@ -1,0 +1,30 @@
+apiVersion: agents.softcane.io/v1alpha1
+kind: Environment
+metadata:
+  name: my-go-development
+  namespace: ${NAMESPACE}
+spec:
+  mode: selfHosted
+  deletionPolicy: Delete
+  selfHosted:
+    image: ${EXECUTOR_IMAGE}
+    architecture: ${ARCH}
+    workspaceDirectory: /workspace
+    workspaceSize: 4Gi
+    workspaceStorage:
+      type: Persistent
+      storageClassName: ${STORAGE_CLASS}
+      claimDeletionPolicy: Retain
+    repository:
+      url: ${REPOSITORY_URL}
+      commit: ${REPOSITORY_COMMIT}
+    resources:
+      cpuRequest: 500m
+      cpuLimit: '2'
+      memoryRequest: 512Mi
+      memoryLimit: 2Gi
+    capabilities:
+    - name: my-go-project
+      image: ${SKILLS_IMAGE}
+      path: /capabilities/my-go-project
+      type: skills

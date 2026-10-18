@@ -1,0 +1,70 @@
+name: Manually opted-in real sandbox acceptance
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm_paid_run:
+        description: Run real OpenAI with an aggregate maximum of 500 US cents
+        required: true
+        type: boolean
+        default: false
+      model:
+        description: Model available to the configured restricted OpenAI project
+        required: true
+        type: string
+        default: gpt-6-luna
+
+permissions: {}
+
+concurrency:
+  group: live-sandbox-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  live:
+    if: inputs.confirm_paid_run
+    # A failed/ambiguous cleanup leaves its owned Kind/controllers running for audit.
+    # Ephemeral hosted runners would destroy that recovery boundary after this job.
+    runs-on: [self-hosted, linux, x64, codex-sandbox-live]
+    timeout-minutes: 75
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+      - name: Install checksum verified isolated cluster tools
+        shell: bash
+        run: |
+          curl --fail --location --retry 3 -o "$RUNNER_TEMP/kind" \
+            https://github.com/kubernetes-sigs/kind/releases/download/v0.33.0/kind-linux-amd64
+          echo 'aee6151561422756b764a4ae28e7f44cda5af5a9eead3cc9985112b1de8d8e0d  '"$RUNNER_TEMP/kind" | sha256sum --check --strict
+          curl --fail --location --retry 3 -o "$RUNNER_TEMP/kubectl" \
+            https://dl.k8s.io/release/v1.35.0/bin/linux/amd64/kubectl
+          echo 'a2e984a18a0c063279d692533031c1eff93a262afcc0afdc517375432d060989  '"$RUNNER_TEMP/kubectl" | sha256sum --check --strict
+          chmod 0755 "$RUNNER_TEMP/kind" "$RUNNER_TEMP/kubectl"
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+          make kustomize
+      - name: Run production executor qualification
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_EXECUTOR_API_KEY: ${{ secrets.OPENAI_EXECUTOR_API_KEY }}
+          # Required private durable directory outside the checkout and RUNNER_TEMP.
+          CODEX_TEST_REPORT_DIR: ${{ vars.CODEX_LIVE_REPORT_DIR }}
+          ACCEPTANCE_MODEL: ${{ inputs.model }}
+        shell: bash
+        run: |
+          test -n "$CODEX_TEST_REPORT_DIR" || { echo 'Configure CODEX_LIVE_REPORT_DIR on this persistent runner.' >&2; exit 1; }
+          python3 -B test/e2e/live.py --model "$ACCEPTANCE_MODEL" --spend-limit-cents 500
+      - name: Retain public evidence allowlist
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: real-sandbox-evidence
+          path: ${{ vars.CODEX_LIVE_REPORT_DIR }}/codex-sandbox-live-*/public/report.json
+          if-no-files-found: warn
+          retention-days: 14

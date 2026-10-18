@@ -64,7 +64,7 @@ func (c *Resources) Describe(ch chan<- *prometheus.Desc) {
 func (c *Resources) Collect(ch chan<- prometheus.Metric) {
 	ctx, cancel := context.WithTimeout(context.Background(), _collectionTimeout)
 	defer cancel()
-	for _, kind := range []string{"Agent", "Environment", "Vault", "VaultCredential", "Session"} {
+	for _, kind := range []string{"Agent", "Environment", "Vault", "VaultCredential", "Session", "Profile"} {
 		values, err := c.list(ctx, kind)
 		if err != nil {
 			ch <- prometheus.MustNewConstMetric(c.success, prometheus.GaugeValue, 0, kind)
@@ -175,6 +175,15 @@ func (c *Resources) list(ctx context.Context, kind string) ([]sample, error) {
 		for i := range objects.Items {
 			o := &objects.Items[i]
 			values = append(values, lifecycleSample(o, o.Status.Conditions, o.Status.CreationAttempted, o.Status.OpenAISessionID))
+		}
+	case "Profile":
+		var objects agentsv1alpha1.ProfileList
+		if err := c.reader.List(ctx, &objects); err != nil {
+			return nil, err
+		}
+		for i := range objects.Items {
+			o := &objects.Items[i]
+			values = append(values, lifecycleSample(o, o.Status.Conditions, false, ""))
 		}
 	}
 	return values, nil

@@ -200,7 +200,8 @@ func TestInitialCreationDoesNotReplayOnReusedConnectionLoss(t *testing.T) {
 			reused.Store(true)
 		}
 	}})
-	_, err := c.CreateInitialSession(ctx, "uid", "scope", "", map[string]any{typeField: _noneValue}, nil, nil, nil, nil, "commit once", "logical-first-key")
+	spend := &agentsv1alpha1.SessionSpendControl{Mode: sessionSpendModeUnlimited}
+	_, err := c.CreateInitialSession(ctx, "uid", "scope", "", map[string]any{typeField: _noneValue}, nil, nil, nil, spend, "commit once", "logical-first-key")
 	if err == nil || !reused.Load() {
 		t.Fatal("fixture did not exercise response loss on a reused connection")
 	}

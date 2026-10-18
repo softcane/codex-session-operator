@@ -38,9 +38,8 @@ type VaultSpec struct {
 	// +kubebuilder:validation:MaxProperties=13
 	// +kubebuilder:validation:XValidation:rule="self.all(k, size(k) >= 1 && size(k) <= 64 && size(self[k]) <= 512 && !(k in ['kubernetes_uid', 'operator', 'owner_scope']))",message="metadata exceeds limits or uses ownership keys"
 	Metadata *map[string]string `json:"metadata,omitempty"`
-	// +optional
 	// +kubebuilder:validation:Enum=Delete;Retain
-	DeletionPolicy string `json:"deletionPolicy,omitempty"`
+	DeletionPolicy string `json:"deletionPolicy"`
 }
 
 // VaultStatus records only remote identity and public observations.
@@ -63,7 +62,7 @@ type VaultStatus struct {
 
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
-// +kubebuilder:validation:XValidation:rule="has(self.spec.deletionPolicy) || (oldSelf.hasValue() && !has(oldSelf.value().spec.deletionPolicy))",message="new Vaults require deletionPolicy; an existing policy cannot be removed",optionalOldSelf=true
+// +kubebuilder:validation:XValidation:rule="has(self.spec.deletionPolicy)",message="Vaults require deletionPolicy"
 
 // Vault is the Schema for the vaults API
 type Vault struct {

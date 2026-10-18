@@ -1,0 +1,13 @@
+# Apply after the Agent and Environment fixtures; inference is simulated.
+apiVersion: agents.softcane.io/v1alpha1
+kind: Profile
+metadata:
+  name: demo-investigation
+  namespace: codex-session-operator-system
+spec:
+  agentRef:
+    name: demo-investigator-v1
+  environmentRef:
+    name: demo-text-v1
+  spendControl:
+    mode: unlimited

@@ -44,19 +44,23 @@ type Operation struct {
 }
 
 type watch struct {
-	cancel context.CancelFunc
-	done   chan struct{}
-	stream openaiapi.MessageStream
-	once   sync.Once
+	ctx                 context.Context
+	environmentID       string
+	environmentRevision uint64
+	environmentBlocked  bool
+	verifiedRevision    uint64
+	environmentVerified bool
+	cancel              context.CancelFunc
+	done                chan struct{}
+	stream              openaiapi.MessageStream
+	once                sync.Once
 }
 
 // Gateway owns bounded streams and the durable outbox. Start must be joined by
 // its manager; HTTP handlers enqueue work and do not own background execution.
 type Gateway struct {
-	issueWriter   client.Client
 	sessionWriter client.Client
-	issueRoutes   map[string]IssueRoute
-	workRoutes    map[string]WorkRoute
+	profiles      *ProfileResolver
 	workMu        sync.Mutex
 	store         Storage
 	reader        client.Reader
@@ -64,7 +68,6 @@ type Gateway struct {
 	functions     map[string]Function
 	principals    []Principal
 	mu            sync.Mutex
-	issueCloseMu  sync.Mutex
 	ctx           context.Context
 	worker        *Gateway
 	gates         *[64]sync.Mutex
@@ -95,7 +98,8 @@ func New(store Storage, reader client.Reader, provider Provider, principals []Pr
 	// Ordinary requests retain capacity even when every stream slot is occupied.
 	// Both admission paths reject excess requests instead of queueing goroutines.
 	return &Gateway{store: store, reader: reader, provider: provider, principals: auth, functions: copied,
-		gates: &[64]sync.Mutex{}, watches: make(map[string]*watch),
+		profiles: &ProfileResolver{reader: reader},
+		gates:    &[64]sync.Mutex{}, watches: make(map[string]*watch),
 		requestSlots: make(chan struct{}, 64), streamSlots: make(chan struct{}, 32),
 		streamCounts: make(map[streamPrincipal]int)}, nil
 }
@@ -146,6 +150,7 @@ func (g *Gateway) runWorker(ctx context.Context) error {
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
 	for {
+		g.maintainStore(ctx)
 		records, err := g.activeRecords(ctx)
 		if err != nil {
 			return err
@@ -161,17 +166,6 @@ func (g *Gateway) runWorker(ctx context.Context) error {
 				if err := g.syncWork(ctx, record.UID); err != nil {
 					if writeErr := g.store.Update(ctx, record.UID, func(r *Record) error {
 						r.Work.LastError = "Work provisioning or delivery pending; inspect the Session and creation claim"
-						return nil
-					}); writeErr != nil {
-						return writeErr
-					}
-				}
-				continue
-			}
-			if record.Issue != nil {
-				if err := g.syncIssue(ctx, record.UID); err != nil {
-					if writeErr := g.store.Update(ctx, record.UID, func(r *Record) error {
-						r.Issue.LastError = "Session provisioning or cleanup pending; inspect lifecycle conditions and audit creation claim"
 						return nil
 					}); writeErr != nil {
 						return writeErr
@@ -342,7 +336,7 @@ func (g *Gateway) ensureWatch(uid, id string) error {
 		cancel()
 		return err
 	}
-	w := &watch{cancel: cancel, done: make(chan struct{}), stream: stream}
+	w := &watch{ctx: streamCtx, cancel: cancel, done: make(chan struct{}), stream: stream}
 	g.mu.Lock()
 	if g.ctx == nil || g.ctx.Err() != nil {
 		g.mu.Unlock()
@@ -365,6 +359,7 @@ func (g *Gateway) ensureWatch(uid, id string) error {
 			if json.Unmarshal(event, &identity) != nil || identity.SessionID != id {
 				continue
 			}
+			g.observeExecutionEvent(w, event)
 			if err := g.store.Update(streamCtx, uid, func(r *Record) error {
 				if r.Closed {
 					return errClosed
@@ -375,6 +370,8 @@ func (g *Gateway) ensureWatch(uid, id string) error {
 				break
 			}
 		}
+		// Revoke the live execution proof before a detached storage write can wait.
+		w.stop()
 		// Persist the recovery marker even when stream cancellation ended the watch.
 		// Storage adds its own short deadline; this never starts remote delivery.
 		_ = g.store.Update(context.WithoutCancel(streamCtx), uid, func(r *Record) error { r.RecoveryRequired = true; return nil })
@@ -400,7 +397,11 @@ func (g *Gateway) sync(ctx context.Context, uid string) error {
 	err = g.reader.Get(ctx, client.ObjectKey{Namespace: record.Namespace, Name: record.Name}, &session)
 	if apierrors.IsNotFound(err) || (err == nil && (string(session.UID) != uid || !session.DeletionTimestamp.IsZero())) {
 		g.stopWatch(uid)
-		return g.store.Update(ctx, uid, func(r *Record) error { r.Closed = true; return nil })
+		return g.store.Update(ctx, uid, func(r *Record) error {
+			r.Closed = true
+			r.TerminalReason = "SessionMissing"
+			return nil
+		})
 	}
 	if err != nil {
 		return err
@@ -434,9 +435,6 @@ func (g *Gateway) sync(ctx context.Context, uid string) error {
 	if err := g.store.Update(ctx, uid, func(r *Record) error {
 		r.RemoteID = id
 		for i := range r.Submissions {
-			if r.Submissions[i].RemoteKey == "" {
-				r.Submissions[i].RemoteKey = r.Submissions[i].Key
-			}
 			if r.Submissions[i].Initial {
 				if session.Status.EnvironmentSnapshot != nil && session.Status.EnvironmentSnapshot.Profile.Mode == _noneMode {
 					r.Submissions[i].Accepted = true
@@ -453,6 +451,7 @@ func (g *Gateway) sync(ctx context.Context, uid string) error {
 	// Subscribe before sending. Failed subscription still permits saved-state
 	// recovery and keyed delivery, with an explicit recovery indicator.
 	streamErr := g.ensureWatch(uid, id)
+	g.bindExecutionWatch(uid, session.Status.EnvironmentID)
 
 	if err := g.recover(ctx, uid, history, streamErr != nil); err != nil {
 		return err
@@ -464,7 +463,7 @@ func (g *Gateway) sync(ctx context.Context, uid string) error {
 	if string(beforeActions.UID) != uid || !beforeActions.DeletionTimestamp.IsZero() {
 		return errClosed
 	}
-	if beforeActions.Status.OpenAISessionID != id {
+	if !sameRemoteSession(&session, &beforeActions) {
 		return errors.New("remote identity changed before action execution")
 	}
 	if err := g.sessionInputOpen(ctx, &beforeActions); err != nil {
@@ -482,6 +481,7 @@ func (g *Gateway) sealMissingRemote(ctx context.Context, uid string) error {
 		// Provider 404 and a current controller 404 observation seal the same
 		// identity. Only explicit new work may create another Session.
 		r.Closed = true
+		r.TerminalReason = _remoteSessionMissingReason
 		r.RecoveryRequired = true
 		r.LastError = "Remote Session is missing; saved history retained and delivery stopped"
 		for id, action := range r.Actions {
@@ -513,11 +513,16 @@ func (g *Gateway) deliveryAllowed(ctx context.Context, session *agentsv1alpha1.S
 	if string(current.UID) != uid || !current.DeletionTimestamp.IsZero() {
 		return false, errClosed
 	}
-	if current.Status.OpenAISessionID != session.Status.OpenAISessionID {
+	if !sameRemoteSession(session, &current) {
 		return false, errors.New("remote identity changed before input delivery")
 	}
 	if err := g.sessionInputOpen(ctx, &current); err != nil {
 		return false, err
+	}
+	if submission.TargetTurn == "" {
+		if ready, _ := g.executionReady(ctx, &current); !ready {
+			return false, nil
+		}
 	}
 	return !spendHeld(&current, submission), nil
 }
@@ -565,23 +570,12 @@ func (g *Gateway) deliver(ctx context.Context, session *agentsv1alpha1.Session, 
 				return nil
 			})
 		}
-		if submission.TargetTurn != "" {
-			fresh, err := g.provider.SavedHistory(ctx, session.Status.OpenAISessionID)
-			if err != nil {
-				return err
-			}
-			if !historyOwnedBy(fresh, uid, history.ID, session.Status.OwnerScope) {
-				return errors.New("cancellation ownership changed")
-			}
-			if !activeTurn(fresh, submission.TargetTurn) {
-				if err := g.store.Update(ctx, uid, func(r *Record) error {
-					r.Submissions[i].Blocked = "Target turn ended; cancellation will not be retried"
-					return nil
-				}); err != nil {
-					return err
-				}
-				continue
-			}
+		cancelActive, err := g.cancellationTargetCurrent(ctx, session, uid, history.ID, submission, i)
+		if err != nil {
+			return err
+		}
+		if !cancelActive {
+			continue
 		}
 		allowed, err := g.deliveryAllowed(ctx, session, uid, submission)
 		if err != nil {
@@ -603,6 +597,12 @@ func (g *Gateway) deliver(ctx context.Context, session *agentsv1alpha1.Session, 
 		}); err != nil {
 			return err
 		}
+		// The database claim may have waited behind another transaction. Re-read
+		// compute and Session identity after that wait, before any provider POST.
+		allowed, err = g.claimedSendAllowed(ctx, session, uid, submission)
+		if err != nil || !allowed {
+			return err
+		}
 		sent++
 		if err := g.provider.SubmitInput(ctx, session.Status.OpenAISessionID, submission.RemoteKey, submission.Event); err != nil {
 			return err
@@ -612,6 +612,28 @@ func (g *Gateway) deliver(ctx context.Context, session *agentsv1alpha1.Session, 
 		}
 	}
 	return nil
+}
+
+func (g *Gateway) cancellationTargetCurrent(ctx context.Context, session *agentsv1alpha1.Session,
+	uid, historyID string, submission Submission, index int) (bool, error) {
+	if submission.TargetTurn == "" {
+		return true, nil
+	}
+	fresh, err := g.provider.SavedHistory(ctx, session.Status.OpenAISessionID)
+	if err != nil {
+		return false, err
+	}
+	if !historyOwnedBy(fresh, uid, historyID, session.Status.OwnerScope) {
+		return false, errors.New("cancellation ownership changed")
+	}
+	if activeTurn(fresh, submission.TargetTurn) {
+		return true, nil
+	}
+	err = g.store.Update(ctx, uid, func(r *Record) error {
+		r.Submissions[index].Blocked = "Target turn ended; cancellation will not be retried"
+		return nil
+	})
+	return false, err
 }
 
 func historyOwnedBy(history openaiapi.History, uid, remoteID, ownerScope string) bool {
@@ -733,6 +755,11 @@ func (g *Gateway) processActions(ctx context.Context, uid string, history openai
 		if !spendControlReady(&current) {
 			continue
 		}
+		if pending.Type == _functionCall && g.consequentialFunction(pending.Name) {
+			if ready, _ := g.executionReady(ctx, &current); !ready {
+				continue
+			}
+		}
 		if pending.Type == _computerApproval {
 			if action.Decision == "" {
 				continue
@@ -756,8 +783,11 @@ func (g *Gateway) processActions(ctx context.Context, uid string, history openai
 func (g *Gateway) processFunction(ctx context.Context, uid, id string, pending openaiapi.PendingAction, action Action, namespace string) error {
 
 	function, registered := g.functions[pending.Name]
-	consequential := pending.Name == _noteFunction || function.Consequential || !registered && pending.Name != _echoFunction
+	consequential := g.consequentialFunction(pending.Name)
 	if consequential && action.Decision == "" {
+		return nil
+	}
+	if consequential && action.Decision != _deny && !g.currentExecutionAllowed(ctx, uid) {
 		return nil
 	}
 	if len(action.Result) == 0 {
@@ -819,6 +849,10 @@ func (g *Gateway) processFunction(ctx context.Context, uid, id string, pending o
 						return err
 					}
 					callCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+					if !g.currentExecutionAllowed(callCtx, uid) {
+						cancel()
+						return nil
+					}
 					value, err := function.Execute(callCtx, Operation{ID: resultKey(uid, id), Namespace: namespace, Arguments: append(json.RawMessage(nil), pending.Arguments...)})
 					cancel()
 					if err != nil {
@@ -839,6 +873,11 @@ func (g *Gateway) processFunction(ctx context.Context, uid, id string, pending o
 		return err
 	}
 	return nil
+}
+
+func (g *Gateway) consequentialFunction(name string) bool {
+	function, registered := g.functions[name]
+	return name == _noteFunction || function.Consequential || !registered && name != _echoFunction
 }
 
 func (g *Gateway) saveResult(ctx context.Context, uid, id string, event json.RawMessage) error {
@@ -867,7 +906,7 @@ func toolResult(p openaiapi.PendingAction, success bool, output string) json.Raw
 	event := map[string]any{_typeField: "agent.session.input.tool_result", "turn_id": p.TurnID, "call_id": p.CallID, "success": success}
 	key := "output"
 	if !success {
-		key = "error"
+		key = _errorField
 	}
 	event[key] = output
 	raw, _ := json.Marshal(event)

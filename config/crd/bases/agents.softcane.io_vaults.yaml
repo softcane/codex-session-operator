@@ -60,6 +60,8 @@ spec:
                 maxLength: 256
                 minLength: 1
                 type: string
+            required:
+            - deletionPolicy
             type: object
             x-kubernetes-validations:
             - message: name and clearName conflict
@@ -149,10 +151,8 @@ spec:
         - spec
         type: object
         x-kubernetes-validations:
-        - message: new Vaults require deletionPolicy; an existing policy cannot be
-            removed
-          optionalOldSelf: true
-          rule: has(self.spec.deletionPolicy) || (oldSelf.hasValue() && !has(oldSelf.value().spec.deletionPolicy))
+        - message: Vaults require deletionPolicy
+          rule: has(self.spec.deletionPolicy)
     served: true
     storage: true
     subresources:

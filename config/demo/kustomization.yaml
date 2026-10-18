@@ -2,13 +2,14 @@
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 resources:
-- ../work
+- ../default
 - provider.yaml
-- postgres.yaml
 patches:
-- path: routes.yaml
 - path: provider_patch.yaml
 images:
 - name: controller
-  newName: codex-session-manager
+  newName: codex-session-controller
+  newTag: demo
+- name: gateway
+  newName: codex-session-gateway
   newTag: demo

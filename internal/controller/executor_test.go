@@ -32,13 +32,13 @@ type connectionStub struct {
 func (c *connectionStub) Observe(_, _ string) (openaiapi.Connection, error) { return c.state, c.err }
 func (*connectionStub) Forget(string)                                       {}
 
-var _ = Describe("Legacy executor lifecycle (pre-migration Kubernetes API)", func() {
-	useLegacySessionSchema()
+var _ = Describe("Executor lifecycle", func() {
 	var s *agentsv1alpha1.Session
 	var r *SessionReconciler
 	var provider *sessionProviderStub
 	var observer *connectionStub
 	var secret *corev1.Secret
+	var dependencies *currentSessionDependencies
 	step := func() {
 		_, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: client.ObjectKeyFromObject(s)})
 		Expect(err).NotTo(HaveOccurred())
@@ -56,14 +56,18 @@ var _ = Describe("Legacy executor lifecycle (pre-migration Kubernetes API)", fun
 	BeforeEach(func() {
 		ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{GenerateName: "executor-test-"}}
 		Expect(k8sClient.Create(ctx, ns)).To(Succeed())
-		s = &agentsv1alpha1.Session{ObjectMeta: metav1.ObjectMeta{Name: "demo", Namespace: ns.Name}, Spec: agentsv1alpha1.SessionSpec{}}
+		dependencies = readySelfHostedSessionDependencies(ns.Name)
+		s = &agentsv1alpha1.Session{ObjectMeta: metav1.ObjectMeta{Name: "demo", Namespace: ns.Name}, Spec: currentSessionSpec(dependencies)}
 		Expect(k8sClient.Create(ctx, s)).To(Succeed())
 		secret = &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: sandbox.ExecutorSecretName, Namespace: ns.Name}, Type: corev1.SecretTypeOpaque,
 			Data: map[string][]byte{sandbox.ExecutorSecretKey: []byte("test-only-placeholder")}}
 		Expect(k8sClient.Create(ctx, secret)).To(Succeed())
 		provider = &sessionProviderStub{}
 		observer = &connectionStub{state: openaiapi.Connection{Subscribed: true, Epoch: "stream-1"}}
-		r = &SessionReconciler{Client: k8sClient, APIReader: k8sClient, Scheme: k8sClient.Scheme(), OpenAI: provider, Connections: observer, ExecutorImage: testExecutorImage}
+		configured := &configuredSessionStub{lifecycle: provider}
+		r = &SessionReconciler{Client: k8sClient, APIReader: k8sClient, Scheme: k8sClient.Scheme(), OpenAI: provider,
+			Agents: dependencies.agents, Environments: dependencies.environments, Configuration: configured,
+			AgentOwnerScope: testAgentScope, Connections: observer, ExecutorImages: []string{testExecutorImage}}
 		step()
 		step()
 		step()
@@ -93,7 +97,7 @@ var _ = Describe("Legacy executor lifecycle (pre-migration Kubernetes API)", fun
 		Expect(pod.Spec.AutomountServiceAccountToken).To(HaveValue(BeFalse()))
 		Expect(pod.Spec.Containers).To(HaveLen(1))
 		container := pod.Spec.Containers[0]
-		Expect(container.Env).To(HaveLen(1))
+		Expect(container.Env).To(HaveLen(4))
 		Expect(container.Env[0].Name).To(Equal(sandbox.ExecutorSecretKey))
 		Expect(container.Env[0].Value).To(BeEmpty())
 		Expect(container.Env[0].ValueFrom.SecretKeyRef.Name).To(Equal(sandbox.ExecutorSecretName))
@@ -109,7 +113,7 @@ var _ = Describe("Legacy executor lifecycle (pre-migration Kubernetes API)", fun
 		Expect(read().ResourceVersion).To(Equal(first.ResourceVersion))
 		Expect(readPod().UID).To(Equal(pod.UID))
 		Expect(provider.creates).To(Equal(1))
-		r.ExecutorImage = "changed-platform-image"
+		r.ExecutorImages = []string{"changed-platform-image"}
 		step()
 		Expect(readPod().Spec.Containers[0].Image).To(Equal(testExecutorImage))
 	})
@@ -117,6 +121,7 @@ var _ = Describe("Legacy executor lifecycle (pre-migration Kubernetes API)", fun
 		pod := readPod()
 		pod.Status.Phase = corev1.PodRunning
 		pod.Status.Conditions = []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}
+		pod.Status.ContainerStatuses = []corev1.ContainerStatus{runningExecutorStatus(pod)}
 		Expect(k8sClient.Status().Update(ctx, pod)).To(Succeed())
 		step()
 		Expect(meta.IsStatusConditionFalse(read().Status.Conditions, "Ready")).To(BeTrue())
@@ -154,6 +159,7 @@ var _ = Describe("Legacy executor lifecycle (pre-migration Kubernetes API)", fun
 			pod := readPod()
 			pod.Status.Phase = corev1.PodRunning
 			pod.Status.Conditions = []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}
+			pod.Status.ContainerStatuses = []corev1.ContainerStatus{runningExecutorStatus(pod)}
 			Expect(k8sClient.Status().Update(ctx, pod)).To(Succeed())
 		}
 		healthy()
@@ -285,14 +291,16 @@ var _ = Describe("Legacy executor lifecycle (pre-migration Kubernetes API)", fun
 		Expect(err).NotTo(HaveOccurred())
 		r.Client = mgr.GetClient()
 		r.APIReader = mgr.GetAPIReader()
-		agents := &agentProviderStub{}
+		agents := dependencies.agents
 		r.Agents, r.AgentOwnerScope = agents, testAgentScope
-		provider.agents = agents
 		agentController := &AgentReconciler{Client: mgr.GetClient(), APIReader: mgr.GetAPIReader(), OpenAI: agents, OwnerScope: testAgentScope}
 		Expect(agentController.SetupWithManager(mgr)).To(Succeed())
-		environments := &environmentProviderStub{sessions: provider, runtimeStatus: testConnectedRuntime}
+		environments := dependencies.environments
+		environments.sessions = provider
+		environments.runtimeStatus = testConnectedRuntime
 		r.Environments = environments
-		environmentController := &EnvironmentReconciler{Client: mgr.GetClient(), APIReader: mgr.GetAPIReader(), OpenAI: environments, OwnerScope: testAgentScope}
+		environmentController := &EnvironmentReconciler{Client: mgr.GetClient(), APIReader: mgr.GetAPIReader(), OpenAI: environments,
+			OwnerScope: testAgentScope, ExecutorImages: []string{testExecutorImage}}
 		Expect(environmentController.SetupWithManager(mgr)).To(Succeed())
 		Expect(r.SetupWithManager(mgr)).To(Succeed())
 		managerCtx, cancel := context.WithCancel(ctx)

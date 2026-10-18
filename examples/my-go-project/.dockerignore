@@ -1,0 +1,7 @@
+.git
+.cache
+.tmp
+.private
+.artifacts
+.env
+bin

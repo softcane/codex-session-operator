@@ -6,7 +6,6 @@ import (
 	"errors"
 	"io"
 	"net/http"
-	"time"
 
 	openai "github.com/openai/openai-go/v3"
 	"github.com/openai/openai-go/v3/option"
@@ -141,12 +140,14 @@ func (c *Client) OpenMessageStream(ctx context.Context, id string) (MessageStrea
 		return nil, errors.New("default HTTP transport is unsupported")
 	}
 	transport := base.Clone()
-	transport.ResponseHeaderTimeout = 20 * time.Second
-	s := c.SDK.Beta.Agents.Sessions.Events.StreamStreaming(ctx, id,
-		option.WithMaxRetries(0), option.WithRequestTimeout(0),
-		option.WithHTTPClient(&http.Client{Transport: transport}))
-	if err := s.Err(); err != nil {
-		_ = s.Close()
+	transport.ResponseHeaderTimeout = callTimeout
+	s, cancel, err := openEventStream(
+		ctx,
+		c.SDK,
+		id,
+		eventStreamSettings{transport: transport, setupTimeout: callTimeout},
+	)
+	if err != nil {
 		transport.CloseIdleConnections()
 		return nil, safeError("subscribe", err)
 	}
@@ -157,5 +158,5 @@ func (c *Client) OpenMessageStream(ctx context.Context, id string) (MessageStrea
 			}
 			return nil
 		},
-		closeFn: func() error { err := s.Close(); transport.CloseIdleConnections(); return err }}, nil
+		closeFn: func() error { cancel(); err := s.Close(); transport.CloseIdleConnections(); return err }}, nil
 }

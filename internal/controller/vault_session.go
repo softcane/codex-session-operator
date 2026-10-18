@@ -34,10 +34,6 @@ const (
 	spendUnavailableReason = "SpendControlUnavailable"
 )
 
-func sessionConfigured(s *agentsv1alpha1.Session) bool {
-	return s.Spec.Agent != nil || s.Spec.Metadata != nil || len(s.Spec.VaultRefs) > 0 || s.Spec.SpendControl != nil
-}
-
 func spendControlDigest(spec *agentsv1alpha1.SessionSpendControl) string {
 	if spec == nil {
 		return ""
@@ -97,15 +93,11 @@ func decideSessionSpendUpdate(s *agentsv1alpha1.Session, remote openaiapi.Sessio
 func sessionMetadataUpdate(s *agentsv1alpha1.Session, remote openaiapi.Session) (string, map[string]string, bool, error) {
 	scope := s.Status.OwnerScope
 	if scope == "" {
-		scope = remote.OwnerScope
+		return "", nil, false, errors.New("session owner scope is missing")
 	}
 	metadata, err := openaiapi.VaultMetadata(s.Spec.Metadata, remote.Metadata, s.Status.ManagedMetadataKeys, string(s.UID), scope)
 	if err != nil {
 		return "", nil, false, err
-	}
-	// Legacy Sessions have no scope ownership key; preserve their existing identity.
-	if scope == "" {
-		delete(metadata, "owner_scope")
 	}
 	return scope, metadata, !reflect.DeepEqual(metadata, remote.Metadata), nil
 }
@@ -313,25 +305,17 @@ func (r *SessionReconciler) configuredAgent(ctx context.Context, s *agentsv1alph
 }
 
 func (r *SessionReconciler) syncSessionSettings(ctx context.Context, s *agentsv1alpha1.Session, remote openaiapi.Session) (ctrl.Result, bool, error) {
-	if remote.OwnerUID != string(s.UID) || remote.ID != s.Status.OpenAISessionID || (s.Status.OwnerScope != "" && remote.OwnerScope != s.Status.OwnerScope) {
+	if remote.OwnerUID != string(s.UID) || remote.ID != s.Status.OpenAISessionID || remote.OwnerScope != s.Status.OwnerScope {
 		result, err := r.problem(ctx, s, "OwnershipMismatch", "Session update ownership could not be verified", nil)
 		return result, true, err
-	}
-	if s.Status.CreationOnlyDigest == "" && s.Spec.Agent == nil && s.Spec.Metadata == nil && s.Spec.SpendControl == nil {
-		return ctrl.Result{}, false, nil
 	}
 	if r.Configuration == nil {
 		result, err := r.problem(ctx, s, "SessionProviderRequired", "Configure supported Session updates", nil)
 		return result, true, err
 	}
-	if s.Status.CreationOnlyDigest == "" {
-		// Legacy Sessions can gain mutable settings without being recreated. Capture
-		// observed immutable fields before the first permitted update; user creation-only
-		// overrides remain differences from their original empty override intent.
-		base := s.DeepCopy()
-		s.Status.CreationOnlyDigest = openaiapi.SessionCreationOnlyDigest(nil)
-		s.Status.CreationAgentDigest = openaiapi.SessionImmutableAgentDigest(remote.AgentConfiguration)
-		return ctrl.Result{RequeueAfter: time.Second}, true, r.patchStatus(ctx, s, base)
+	if s.Status.CreationOnlyDigest == "" || s.Status.CreationAgentDigest == "" {
+		result, err := r.problem(ctx, s, configurationMismatchReason, "Session creation configuration snapshot is missing", nil)
+		return result, true, err
 	}
 	changes := make(map[string]any)
 	agentChanges := openaiapi.SessionSettingsChanges(s.Spec.Agent, remote, s.Status.AppliedMutableDigest)
@@ -382,7 +366,7 @@ func (r *SessionReconciler) syncSessionSettings(ctx context.Context, s *agentsv1
 		result, problemErr := r.problem(ctx, s, "UpdateOutcomeUnknown", "Observe Session before retrying supported updates", err)
 		return result, true, problemErr
 	}
-	if updated.ID != remote.ID || updated.OwnerUID != string(s.UID) || (scope != "" && updated.OwnerScope != scope) {
+	if updated.ID != remote.ID || updated.OwnerUID != string(s.UID) || updated.OwnerScope != scope {
 		result, err := r.problem(ctx, s, "OwnershipMismatch", "Updated Session identity mismatch", nil)
 		return result, true, err
 	}
@@ -396,15 +380,11 @@ func (r *SessionReconciler) syncSessionSettings(ctx context.Context, s *agentsv1
 }
 
 func phase4AgentMatches(s *agentsv1alpha1.Session, remote openaiapi.Session) bool {
-	if s.Status.CreationOnlyDigest == "" {
-		return remote.Model == sessionModel(s) && (s.Status.AgentSnapshot == nil || (remote.AgentID == s.Status.AgentSnapshot.OpenAIAgentID && remote.AgentConfigurationDigest == s.Status.AgentSnapshot.ConfigurationDigest))
-	}
-	return (s.Status.AgentSnapshot == nil || remote.AgentID == s.Status.AgentSnapshot.OpenAIAgentID) && openaiapi.SessionImmutableAgentDigest(remote.AgentConfiguration) == s.Status.CreationAgentDigest
+	return s.Status.AgentSnapshot != nil && remote.AgentID == s.Status.AgentSnapshot.OpenAIAgentID &&
+		s.Status.CreationOnlyDigest != "" && s.Status.CreationAgentDigest != "" &&
+		openaiapi.SessionImmutableAgentDigest(remote.AgentConfiguration) == s.Status.CreationAgentDigest
 }
 func phase4VaultsMatch(s *agentsv1alpha1.Session, remote openaiapi.Session) bool {
-	if s.Status.CreationOnlyDigest == "" {
-		return true
-	}
 	expected := make([]string, 0, len(s.Status.VaultSnapshots))
 	for _, v := range s.Status.VaultSnapshots {
 		expected = append(expected, v.OpenAIVaultID)
@@ -425,11 +405,8 @@ func phase4CreationChanged(s *agentsv1alpha1.Session) bool {
 	}
 	slices.Sort(names)
 	slices.Sort(selected)
-	digest := s.Status.CreationOnlyDigest
-	if digest == "" {
-		digest = openaiapi.SessionCreationOnlyDigest(nil)
-	}
-	return !slices.Equal(names, selected) || digest != openaiapi.SessionCreationOnlyDigest(s.Spec.Agent)
+	return !slices.Equal(names, selected) || s.Status.CreationOnlyDigest == "" ||
+		s.Status.CreationOnlyDigest != openaiapi.SessionCreationOnlyDigest(s.Spec.Agent)
 }
 func (r *SessionReconciler) vaultSessionRequests(ctx context.Context, obj client.Object) []reconcile.Request {
 	var sessions agentsv1alpha1.SessionList

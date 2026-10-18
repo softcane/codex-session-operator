@@ -1,0 +1,22 @@
+apiVersion: agents.softcane.io/v1alpha1
+kind: Agent
+metadata:
+  name: my-go-maintainer
+  namespace: ${NAMESPACE}
+spec:
+  model: ${MODEL}
+  instructions: |
+    Maintain my-go-project using the task's requested mode.
+    Read /workspace/AGENTS.md and docs/architecture.md first.
+    Registered project skills live under /capabilities/my-go-project/skills.
+    Use golang-how-to before Go changes, investigate for diagnosis, fix-bug for
+    repairs and review-change before reporting completion.
+    Run make bootstrap, demonstrate regression failures, make the requested repair
+    and run make verify. Report actual commands and results.
+    Follow task authorization for commits, Git pushes and PR creation.
+    Never inspect or disclose credentials. Stop and report blocked work.
+  reasoning:
+    effort: high
+  multiAgent:
+    enabled: false
+  deletionPolicy: Delete

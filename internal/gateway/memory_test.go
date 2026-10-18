@@ -93,7 +93,7 @@ func (s *memoryStore) Update(ctx context.Context, uid string, change func(*Recor
 	if s.closed {
 		return errUnavailable
 	}
-	record := Record{Version: 1, UID: uid, Actions: make(map[string]Action), Notes: make(map[string]string)}
+	record := Record{Version: _recordVersion, UID: uid, Actions: make(map[string]Action), Notes: make(map[string]string)}
 	if raw, ok := s.records[uid]; ok {
 		if err := json.Unmarshal(raw, &record); err != nil {
 			return err
@@ -130,7 +130,7 @@ func (s *memoryStore) Purge(ctx context.Context, uid string) error {
 	if err := json.Unmarshal(raw, &record); err != nil {
 		return err
 	}
-	if !closedForPurge(record) || record.Issue != nil || record.Work != nil {
+	if !closedForPurge(record) || record.Work != nil {
 		return errors.New("record cannot be purged")
 	}
 	delete(s.records, uid)

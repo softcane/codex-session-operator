@@ -2,6 +2,31 @@
 const http = require('http');
 const agents = new Map(), vaults = new Map(), sessions = new Map();
 const templates = new Map(), runtimes = new Map(), credentials = new Map();
+const executorJobs = new Map();
+const eventStreams = new Map();
+let executorCommands = 0, executorStarts = 0;
+function finishJob(job, result, unknown=false) {
+  const session=sessions.get(job.session_id);
+  if(!session)return;
+  const command=session.items.find(item=>item.id==='command_'+job.turn_id);
+  const item={id:'command_'+job.turn_id,type:'command_execution',turn_id:job.turn_id,command:job.argv.join(' '),
+    cwd:result.cwd||'/workspace',status:unknown||result.exit_code!==0?'failed':'completed',
+    output:unknown?'Executor process was replaced during command; outcome unknown; automatic replay disabled':result.output};
+  if(!unknown)item.exit_code=result.exit_code;
+  if(command)Object.assign(command,item);else session.items.push(item);
+  session.items.push({id:'assistant_'+job.turn_id,type:'message',role:'assistant',turn_id:job.turn_id,
+    content:[{type:'output_text',text:unknown?'Interrupted command outcome is unknown; no automatic replay':'Simulated executor observed actual Pod files and test output'}]});
+  session.turns.find(turn=>turn.id===job.turn_id).status=unknown||result.exit_code!==0?'failed':'completed';
+  session.remote.status='idle';executorCommands++;executorJobs.delete(job.id);
+  if(!unknown)emit(session.id,{type:'agent.session.completed',session_id:session.id});
+}
+function emit(sessionID, value) {
+  for (const response of eventStreams.get(sessionID) || []) response.write('data: '+JSON.stringify(value)+'\n\n');
+}
+function environmentEvent(runtime, sessionID) {
+  return {type:'agent.session.environment.'+runtime.status,session_id:sessionID,
+    environment:{id:runtime.id,type:'self_hosted',status:runtime.status}};
+}
 let creates = 0, deletes = 0, eventPosts = 0, messageCommits = 0;
 let agentCreates = 0, vaultCreates = 0, templateCreates = 0, credentialCreates = 0, credentialWrites = 0;
 let control = {};
@@ -29,10 +54,25 @@ function message(session, text) {
   const turn = 'turn_' + (session.turns.length + 1);
   session.items.push({id: 'user_' + turn, type: 'message', role: 'user', turn_id: turn,
     content: [{type: 'input_text', text}]});
+  messageCommits++;
+  if (session.remote.environment.type === 'self_hosted') {
+    session.turns.push({id: turn, status: 'in_progress'});
+    session.remote.status = 'in_progress';
+    const interrupted=text.startsWith('SANDBOX_LONG_COMMAND');
+    const program = interrupted ? `const fs=require('node:fs');fs.writeFileSync('interrupted-started.json',JSON.stringify({pid:process.pid,stage:'running',job:process.argv[1]}));setInterval(()=>{},1000);` : `const fs=require('node:fs'),cp=require('node:child_process'),os=require('node:os');
+const nonce=fs.existsSync('proof.txt')?fs.readFileSync('proof.txt','utf8'):'';
+const baseline=cp.spawnSync('node',['--test','checkout.test.js'],{encoding:'utf8'});
+const value={nonce,hostname:os.hostname(),cwd:process.cwd(),test_exit:baseline.status,output:baseline.stdout+baseline.stderr};
+fs.writeFileSync('fixture-report.json',JSON.stringify(value));console.log(JSON.stringify(value));`;
+    executorJobs.set(session.remote.environment.id + ':' + turn, {id:session.remote.environment.id + ':' + turn,
+      environment_id:session.remote.environment.id,session_id:session.id,turn_id:turn,
+      argv:['node','-e',program,session.remote.environment.id+':'+turn],timeout_ms:interrupted?30000:15000,claimed:false,started:false});
+    return;
+  }
   session.items.push({id: 'assistant_' + turn, type: 'message', role: 'assistant', turn_id: turn,
     content: [{type: 'output_text', text: 'Fixture evidence observed; no external write performed'}]});
   session.turns.push({id: turn, status: 'completed'});
-  messageCommits++;
+  emit(session.id,{type:'agent.session.completed',session_id:session.id});
 }
 http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://fixture');
@@ -42,9 +82,48 @@ http.createServer(async (req, res) => {
     for await (const chunk of req) raw += chunk;
     try { body = JSON.parse(raw || '{}'); } catch { return reply(res, 400, {}); }
   }
+  if (url.pathname === '/executor/connect' || url.pathname === '/executor/disconnect') {
+    const runtime = runtimes.get(body.environment_id);
+    if (!runtime) return reply(res, 404, {});
+    const status = url.pathname.endsWith('disconnect') ? 'disconnected' : 'connected';
+    const changed = runtime.status !== status || runtime.instance !== body.instance;
+    if(status==='connected' && runtime.instance && runtime.instance!==body.instance) {
+      for(const job of [...executorJobs.values()]) if(job.environment_id===runtime.id && job.started && job.instance!==body.instance) finishJob(job,{},true);
+    }
+    runtime.status = status; runtime.instance = body.instance;
+    if(status==='connected')runtime.heartbeatCount=(runtime.heartbeatCount||0)+1;
+    runtime.connectedAt = Date.now(); runtime.hostname = body.hostname;
+    if (changed) for (const session of sessions.values()) if (session.remote.environment.id === runtime.id) emit(session.id,environmentEvent(runtime,session.id));
+    return reply(res, 200, {ok:true});
+  }
+  if (url.pathname === '/executor/commands') {
+    const jobs = control.executorHold ? [] : [...executorJobs.values()].filter(job => job.environment_id === url.searchParams.get('environment_id') && !job.claimed);
+    for (const job of jobs) job.claimed=true;
+    return reply(res, 200, jobs.map(job => ({id:job.id,argv:job.argv,timeout_ms:job.timeout_ms})));
+  }
+  if (url.pathname === '/executor/started') {
+    const job=executorJobs.get(body.id);
+    if(!job||job.environment_id!==body.environment_id)return reply(res,404,{});
+    if(!job.started) {
+      job.started=true;job.instance=body.instance;executorStarts++;
+      const session=sessions.get(job.session_id);
+      session.items.push({id:'command_'+job.turn_id,type:'command_execution',turn_id:job.turn_id,
+        command:job.argv.join(' '),cwd:'/workspace',status:'in_progress',output:''});
+    }
+    return reply(res,200,{ok:true});
+  }
+  if (url.pathname === '/executor/result') {
+    const job = executorJobs.get(body.id);
+    if (!job || job.environment_id !== body.environment_id) return reply(res,404,{});
+    const session = sessions.get(job.session_id);
+    if (!session) return reply(res,404,{});
+    finishJob(job,body);
+    return reply(res,200,{ok:true});
+  }
   if (url.pathname === '/control') {
     if (body.reset) control = {};
     control = {...control, ...body};
+    if (body.dropStreams) for (const streams of eventStreams.values()) for (const response of streams) response.destroy();
     if (body.mutateSession) {
       const session = sessions.get(body.mutateSession.id);
       if (session) Object.assign(session.remote, clone(body.mutateSession.fields));
@@ -52,7 +131,8 @@ http.createServer(async (req, res) => {
     return reply(res, 200, {ok: true});
   }
   if (url.pathname === '/counts') return reply(res, 200, {creates, deletes, eventPosts, messageCommits,
-    agentCreates, vaultCreates, templateCreates, credentialCreates, credentialWrites,
+    agentCreates, vaultCreates, templateCreates, credentialCreates, credentialWrites, executorCommands, executorStarts,
+    jobs:[...executorJobs.values()].map(job=>({id:job.id,session_id:job.session_id,turn_id:job.turn_id,started:job.started,instance:job.instance})),
     agents: [...agents.values()].map(a => ({id: a.id, name: a.name, metadata: a.metadata})),
     vaults: [...vaults.values()].map(v => ({id: v.id, metadata: v.metadata})),
     templates: [...templates.values()].map(t => ({id: t.id, name: t.name})),
@@ -105,12 +185,14 @@ http.createServer(async (req, res) => {
     const id = 'sess_fixture_' + creates;
     const agent = {...clone(agents.get(body.agent_id) || {}), ...clone(body.agent || {})};
     const environment = clone(body.environment || {});
-    if (environment.type === 'openai_hosted') {
+    if (environment.type === 'openai_hosted' || environment.type === 'self_hosted') {
       environment.id = 'env_fixture_' + creates;
-      runtimes.set(environment.id, {id: environment.id, status: 'connected', object: 'agent.environment'});
+      if (environment.type === 'self_hosted') environment.remote_url = 'https://provider-fixture.codex-session-operator-system.svc:8080/';
+      runtimes.set(environment.id, {id: environment.id, ...(environment.type==='self_hosted'?{type:'self_hosted'}:{}),
+        status:environment.type === 'self_hosted' ? 'pending' : 'connected', object: 'agent.environment'});
     }
     const remote = {id, object: 'agent.session', status: 'idle', agent,
-      environment, vault_ids: body.vault_ids || [], metadata: body.metadata, required_actions: []};
+      environment, vault_ids: body.vault_ids || [], metadata: body.metadata, spend_control:body.spend_control ? {...body.spend_control,consumed:0} : null, required_actions: []};
     const session = {id, remote, metadata: body.metadata, input: body.input, items: [], turns: [], keys: new Map()};
     sessions.set(id, session);
     if (body.input) message(session, body.input);
@@ -168,8 +250,13 @@ http.createServer(async (req, res) => {
   if (parts[4] === 'turns') return reply(res, 200, page(object.turns));
   if (parts[4] === 'events' && req.method === 'GET') {
     res.writeHead(200, {'Content-Type': 'text/event-stream'}); res.flushHeaders();
-    const timer = setInterval(() => res.write('data: '+JSON.stringify({type: 'agent.session.completed', session_id: object.id})+'\n\n'), 1000);
-    req.on('close', () => clearInterval(timer)); return;
+    if (!eventStreams.has(object.id)) eventStreams.set(object.id,new Set());
+    eventStreams.get(object.id).add(res);
+    const runtime=runtimes.get(object.remote.environment.id);
+    res.write('data: '+JSON.stringify(runtime && runtime.type==='self_hosted' ? environmentEvent(runtime,object.id) :
+      {type:'agent.session.completed',session_id:object.id})+'\n\n');
+    const timer=setInterval(()=>res.write(': fixture stream keepalive\n\n'),1000);
+    req.on('close',()=>{clearInterval(timer);eventStreams.get(object.id)?.delete(res);});return;
   }
   if (parts[4] === 'events' && req.method === 'POST') {
     eventPosts++;
@@ -187,3 +274,9 @@ http.createServer(async (req, res) => {
   }
   reply(res, 404, {});
 }).listen(Number(process.env.PORT || 8080), '0.0.0.0');
+setInterval(()=>{
+  for(const runtime of runtimes.values()) if(runtime.type==='self_hosted' && runtime.status==='connected' && Date.now()-runtime.connectedAt>5000) {
+    runtime.status='disconnected';
+    for(const session of sessions.values())if(session.remote.environment.id===runtime.id)emit(session.id,environmentEvent(runtime,session.id));
+  }
+},500);

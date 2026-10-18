@@ -1,24 +1,48 @@
-"""Regression tests for demo conversation requests and completion evidence."""
+"""Regression tests for acceptance transport and completion evidence."""
 
 import importlib.util
 import io
 import json
-import os
 from pathlib import Path
-import tempfile
 import unittest
 from unittest.mock import Mock, patch
 import urllib.error
 
-spec = importlib.util.spec_from_file_location("demo_client", Path(__file__).with_name("client.py"))
-client = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(client)
 runner_spec = importlib.util.spec_from_file_location("demo_runner", Path(__file__).with_name("run.py"))
 runner = importlib.util.module_from_spec(runner_spec)
 runner_spec.loader.exec_module(runner)
 
 
 class DemoTransportRecoveryTests(unittest.TestCase):
+    def test_dead_forward_is_rebound_before_replaying_the_same_keyed_request(self):
+        adapter, recover = Mock(), Mock()
+        body = {"text": "Accepted task"}
+        receipt = {"acceptance": "committed"}
+        adapter.request.side_effect = [OSError("port-forward exited"), (202, receipt)]
+        with patch.object(runner.time, "sleep"):
+            result = runner.ReplaySafeAPI(adapter, recover_transport=recover).request("/conversations", "POST", body, "stable")
+        self.assertEqual(result, (202, receipt))
+        recover.assert_called_once_with()
+        self.assertEqual(adapter.request.call_args_list[0], adapter.request.call_args_list[1])
+
+    def test_rebinding_does_not_hide_gateway_failure(self):
+        adapter, recover = Mock(), Mock(side_effect=RuntimeError("gateway never became healthy"))
+        adapter.request.side_effect = OSError("port-forward exited")
+        with self.assertRaisesRegex(RuntimeError, "gateway never became healthy"):
+            runner.ReplaySafeAPI(adapter, recover_transport=recover).request("/conversation")
+        adapter.request.assert_called_once()
+        recover.assert_called_once_with()
+
+    def test_application_rejection_and_unkeyed_mutation_do_not_rebind(self):
+        recover, adapter = Mock(), Mock()
+        adapter.request.return_value = (503, {"error": "application unavailable"})
+        self.assertEqual(runner.ReplaySafeAPI(adapter, recover_transport=recover).request("/conversation")[0], 503)
+        recover.assert_not_called()
+        adapter.request.side_effect = OSError("ambiguous unkeyed input")
+        with self.assertRaises(OSError):
+            runner.ReplaySafeAPI(adapter, recover_transport=recover).request("/conversations", "POST", {"text": "task"})
+        recover.assert_not_called()
+
     def test_lost_response_reuses_exact_key_path_and_body(self):
         body = {"route_id": "investigate", "text": "Evidence\r\nunchanged", "title": "Checkout"}
         receipt = {"conversation_id": "conv-example", "acceptance": "committed"}
@@ -57,7 +81,7 @@ class DemoTransportRecoveryTests(unittest.TestCase):
                 adapter = Mock()
                 adapter.request.side_effect = OSError("ambiguous request")
                 with patch.object(runner.time, "sleep") as sleep, self.assertRaises(OSError):
-                    runner.ReplaySafeAPI(adapter).request("/work-events", method, {"text": "Request"}, key)
+                    runner.ReplaySafeAPI(adapter).request("/conversations", method, {"text": "Request"}, key)
                 adapter.request.assert_called_once()
                 sleep.assert_not_called()
 
@@ -112,136 +136,88 @@ class DemoTransportRecoveryTests(unittest.TestCase):
         self.assertEqual(checks.calls[3][:2], ("rollout", "status"))
 
 
+class DemoGatewayForwardTargetTests(unittest.TestCase):
+    def deployment(self):
+        return {"metadata": {"generation": 2},
+                "spec": {"replicas": 2, "selector": {"matchLabels": {"app": "gateway"}}},
+                "status": {"observedGeneration": 2, "updatedReplicas": 2, "readyReplicas": 2, "availableReplicas": 2}}
+
+    def pod(self, name):
+        return {"metadata": {"name": name, "uid": name + "-uid"}, "status": {"phase": "Running",
+                "conditions": [{"type": "Ready", "status": "True"}],
+                "containerStatuses": [{"name": "gateway", "ready": True, "restartCount": 0, "state": {"running": {"startedAt": "now"}}}]}}
+
+    def test_forward_selects_a_current_healthy_pod_and_rejects_terminating_targets(self):
+        terminating, healthy = self.pod("a-old"), self.pod("c-healthy")
+        terminating["metadata"]["deletionTimestamp"] = "now"
+        checks = Mock()
+        checks.kubectl.side_effect = [json.dumps(self.deployment()), json.dumps({"items": [terminating, healthy, self.pod("d-healthy")]})]
+        self.assertEqual(runner.ready_gateway_pod(checks), "c-healthy")
+
+    def test_incomplete_rollout_and_crashed_application_cannot_be_used_for_rebinding(self):
+        checks = Mock()
+        deployment = self.deployment()
+        deployment["status"]["observedGeneration"] = 1
+        checks.kubectl.return_value = json.dumps(deployment)
+        self.assertIsNone(runner.ready_gateway_pod(checks))
+        checks.kubectl.assert_called_once()
+        crashed = self.pod("crashed")
+        crashed["status"]["containerStatuses"][0]["ready"] = False
+        crashed["status"]["containerStatuses"][0]["state"] = {"waiting": {"reason": "CrashLoopBackOff"}}
+        checks.kubectl.side_effect = [json.dumps(self.deployment()), json.dumps({"items": [self.pod("a-healthy"), crashed]})]
+        self.assertIsNone(runner.ready_gateway_pod(checks))
+
+    def test_healthy_restart_baseline_allows_cold_start_recovery_but_rejects_later_crashes(self):
+        checks, baseline = Mock(), {}
+        first, second = self.pod("a-gateway"), self.pod("b-gateway")
+        first["status"]["containerStatuses"][0]["restartCount"] = 2
+        checks.kubectl.side_effect = [json.dumps(self.deployment()), json.dumps({"items": [first, second]})]
+        self.assertEqual(runner.ready_gateway_pod(checks, baseline), "a-gateway")
+        self.assertEqual(baseline[first["metadata"]["uid"]], {"gateway": 2})
+        first["status"]["containerStatuses"][0]["restartCount"] = 3
+        checks.kubectl.side_effect = [json.dumps(self.deployment()), json.dumps({"items": [first, second]})]
+        with self.assertRaisesRegex(RuntimeError, "restarted after healthy observation"):
+            runner.ready_gateway_pod(checks, baseline)
+
+    def test_forward_binds_selected_pod_and_preserves_tunnel_diagnostics(self):
+        checks, log = Mock(), io.StringIO()
+        checks.cluster, checks.env = "codex-e2e-0123456789ab", {}
+        with patch.object(runner.helpers.subprocess, "Popen") as launch:
+            runner.helpers.start_forward(checks, 18082, pod="gateway-current", log=log)
+        self.assertIn("pod/gateway-current", launch.call_args.args[0])
+        self.assertNotIn("service/codex-session-operator-gateway", launch.call_args.args[0])
+        self.assertIs(launch.call_args.kwargs["stdout"], log)
+        self.assertEqual(launch.call_args.kwargs["stderr"], runner.helpers.subprocess.STDOUT)
+
+
 class DemoCompletionTests(unittest.TestCase):
     def test_acceptance_or_empty_history_is_not_completion(self):
         for value in ({"acceptance": "committed"}, {"history": {"turns": None}},
                       {"history": {"turns": []}}, {"history": {"turns": [{"status": "in_progress"}]}}):
             with self.subTest(value=value):
-                self.assertFalse(client.completed_history(value, 1))
+                self.assertFalse(runner.helpers.completed_history(value, 1))
 
     def test_completed_root_turn_count_proves_new_input(self):
         value = {"history": {"turns": [{"status": "completed"},
                   {"status": "completed", "subagent_id": "child"}]}}
-        self.assertTrue(client.completed_history(value, 1))
-        self.assertFalse(client.completed_history(value, 2))
+        self.assertTrue(runner.helpers.completed_history(value, 1))
+        self.assertFalse(runner.helpers.completed_history(value, 2))
         value["history"]["turns"].append({"status": "completed"})
-        self.assertTrue(client.completed_history(value, 2))
+        self.assertTrue(runner.helpers.completed_history(value, 2))
 
     def test_saved_failed_or_cancelled_turn_fails_wait(self):
         for status in ("failed", "cancelled"):
             with self.subTest(status=status), self.assertRaises(RuntimeError):
-                client.completed_history({"history": {"turns": [{"status": status}]}}, 1)
-
-    def test_existing_work_history_remains_supported(self):
-        value = {"conversation": {"history": {"turns": [{"status": "completed"}]}}}
-        self.assertTrue(client.completed_history(value, 1))
+                runner.helpers.completed_history({"history": {"turns": [{"status": status}]}}, 1)
 
     def test_closed_conversation_requires_verified_cleanup(self):
         for summary in ({"conversation_id": "conv-example", "state": "closed"},
                         {"conversation_id": "conv-example", "state": "closing", "cleaned": True},
                         {"conversation_id": "conv-example", "state": "closed", "cleaned": False}):
             with self.subTest(summary=summary):
-                self.assertFalse(client.cleaned_up({"summary": summary}))
-        self.assertTrue(client.cleaned_up({"summary": {
+                self.assertFalse(runner.helpers.cleaned_up({"summary": summary}))
+        self.assertTrue(runner.helpers.cleaned_up({"summary": {
             "conversation_id": "conv-example", "state": "closed", "cleaned": True}}))
-
-    def test_existing_work_wait_checks_all_attempts(self):
-        value = {"summary": {"state": "closed"}, "work": {"attempts": [{"cleaned": True}, {"cleaned": False}]}}
-        self.assertFalse(client.cleaned_up(value))
-        value["work"]["attempts"][1]["cleaned"] = True
-        self.assertTrue(client.cleaned_up(value))
-        self.assertFalse(client.cleaned_up({"summary": {"state": "closed"}}))
-
-
-class DemoConversationRequestTests(unittest.TestCase):
-    def setUp(self):
-        self.directory = tempfile.TemporaryDirectory(prefix="demo-client-test-")
-        self.addCleanup(self.directory.cleanup)
-        self.base = "/v1/namespaces/test-demo"
-        self.path = self.base + "/conversations/conv-example"
-        Path(self.directory.name, "curl.conf").write_text('header = "Authorization: Bearer test-placeholder"\n')
-
-    def invoke(self, arguments, responses=None):
-        captured = []
-        responses = iter(responses or [(202, {"acceptance": "committed"})])
-
-        def respond(request, **_kwargs):
-            captured.append(request)
-            status, value = next(responses)
-            response = io.BytesIO(json.dumps(value).encode())
-            response.status = status
-            return response
-
-        argv = ["demo-client.py", *arguments, "--demo-dir", self.directory.name]
-        with patch.object(client.sys, "argv", argv), patch.dict(os.environ, {"DEMO_NAMESPACE": "test-demo"}), \
-                patch.object(client.ssl, "create_default_context"), \
-                patch.object(client.urllib.request, "urlopen", side_effect=respond), \
-                patch.object(client.sys, "stdout", io.StringIO()), patch.object(client.sys, "stderr", io.StringIO()), \
-                patch.object(client.time, "sleep"):
-            result = client.main()
-        return result, captured
-
-    def test_create_uses_profile_and_retained_key(self):
-        result, requests = self.invoke(["conversation", "investigate-code", "--text", "Investigate", "--title", "Checkout",
-                                       "--key", "create-1"])
-        self.assertEqual(result, 0)
-        self.assertEqual(len(requests), 1)
-        request = requests[0]
-        self.assertEqual(request.full_url, "https://127.0.0.1:18082" + self.base + "/conversations")
-        self.assertEqual(request.method, "POST")
-        self.assertEqual(request.get_header("Idempotency-key"), "create-1")
-        self.assertEqual(json.loads(request.data), {"route_id": "investigate-code", "text": "Investigate", "title": "Checkout"})
-
-    def test_conversation_mutations_use_returned_identity(self):
-        for action, body in (("message", {"text": "Evidence"}), ("close", {}), ("restart", {"text": "Evidence"})):
-            with self.subTest(action=action):
-                arguments = [action, self.path, "--key", "operation-1"]
-                if action != "close":
-                    arguments += ["--text", "Evidence"]
-                result, requests = self.invoke(arguments)
-                self.assertEqual(result, 0)
-                self.assertEqual(requests[0].full_url, "https://127.0.0.1:18082" + self.path +
-                                 ("/messages" if action == "message" else "/" + action))
-                self.assertEqual(requests[0].get_header("Idempotency-key"), "operation-1")
-                self.assertEqual(json.loads(requests[0].data), body)
-
-    def test_restart_accepts_conversation_id(self):
-        result, requests = self.invoke(["restart", "conv-example", "--text", "Fresh", "--key", "restart-1"])
-        self.assertEqual(result, 0)
-        self.assertTrue(requests[0].full_url.endswith(self.path + "/restart"))
-
-    def test_message_accepts_returned_conversation_id(self):
-        identifier = "conv-" + "a" * 64
-        result, requests = self.invoke(["message", identifier, "--text", "Evidence", "--key", "message-1"])
-        self.assertEqual(result, 0)
-        self.assertTrue(requests[0].full_url.endswith(self.base + "/conversations/" + identifier + "/messages"))
-
-    def test_mutation_rejects_cross_namespace_or_nested_url(self):
-        for path in (self.path.replace("test-demo", "other"), self.path + "/messages", "../conv-example",
-                     self.path + "?x=1", self.path + "%2fmessages"):
-            with self.subTest(path=path), self.assertRaises(SystemExit) as raised:
-                self.invoke(["close", path, "--key", "close-1"])
-            self.assertEqual(raised.exception.code, 2)
-
-    def test_changes_require_client_supplied_key(self):
-        for action in ("conversation", "message", "close", "restart"):
-            with self.subTest(action=action), self.assertRaises(SystemExit) as raised:
-                self.invoke([action, "example", "--text", "Request"])
-            self.assertEqual(raised.exception.code, 2)
-
-    def test_wait_only_reads_and_never_resubmits_input(self):
-        result, requests = self.invoke(["get", self.path, "--wait-for", "completed", "--turns", "2"], responses=[
-            (200, {"history": {"turns": [{"status": "completed"}]}}),
-            (200, {"history": {"turns": [{"status": "completed"}, {"status": "completed"}]}})])
-        self.assertEqual(result, 0)
-        self.assertEqual(len(requests), 2)
-        self.assertTrue(all(request.method == "GET" and request.data is None for request in requests))
-
-    def test_existing_session_message_path_is_preserved(self):
-        result, requests = self.invoke(["message", "manual-session", "--text", "Request", "--key", "message-1"])
-        self.assertEqual(result, 0)
-        self.assertTrue(requests[0].full_url.endswith(self.base + "/sessions/manual-session/messages"))
-
 
 if __name__ == "__main__":
     unittest.main()

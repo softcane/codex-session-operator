@@ -11,6 +11,7 @@ import (
 	. "github.com/onsi/gomega"
 	agentsv1alpha1 "github.com/softcane/codex-session-operator/api/v1alpha1"
 	"github.com/softcane/codex-session-operator/internal/openaiapi"
+	"github.com/softcane/codex-session-operator/internal/sandbox"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -33,10 +34,9 @@ type sessionProviderStub struct {
 	hideDiscovery    bool
 	deleteFailure    bool
 	onCreate         func()
-	agents           *agentProviderStub
 }
 
-func (p *sessionProviderStub) CreateSelfHostedSession(_ context.Context, uid, workspace string) (openaiapi.Session, error) {
+func (p *sessionProviderStub) createSession(uid, workspace string) (openaiapi.Session, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.onCreate != nil {
@@ -48,22 +48,6 @@ func (p *sessionProviderStub) CreateSelfHostedSession(_ context.Context, uid, wo
 		return openaiapi.Session{}, errors.New("Create response lost after remote commit")
 	}
 	return p.remote, nil
-}
-func (p *sessionProviderStub) CreateAgentSession(ctx context.Context, uid, workspace, agentID string) (openaiapi.Session, error) {
-	remote, err := p.CreateSelfHostedSession(ctx, uid, workspace)
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	p.remote.AgentID = agentID
-	remote.AgentID = agentID
-	if p.agents != nil {
-		p.agents.mu.Lock()
-		defer p.agents.mu.Unlock()
-		p.remote.Model = p.agents.remote.Model
-		p.remote.AgentConfigurationDigest = openaiapi.AgentConfigurationDigest(p.agents.remote.Config)
-		p.remote.AgentBlockReason, p.remote.AgentBlockMessage = openaiapi.AgentSessionBlock(p.agents.remote.Config)
-		remote = p.remote
-	}
-	return remote, err
 }
 
 func (p *sessionProviderStub) GetSession(_ context.Context, id string) (openaiapi.Session, error) {
@@ -144,6 +128,89 @@ type staleClient struct {
 	stale *agentsv1alpha1.Session
 }
 
+type currentSessionDependencies struct {
+	agent        *agentsv1alpha1.Agent
+	environment  *agentsv1alpha1.Environment
+	agents       *agentProviderStub
+	environments *environmentProviderStub
+}
+
+func readySelfHostedSessionDependencies(namespace string) *currentSessionDependencies {
+	agent := &agentsv1alpha1.Agent{ObjectMeta: metav1.ObjectMeta{GenerateName: "session-agent-", Namespace: namespace},
+		Spec: agentsv1alpha1.AgentSpec{Model: openaiapi.SessionModel, DeletionPolicy: deletePolicy}}
+	environment := &agentsv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{GenerateName: "session-environment-", Namespace: namespace},
+		Spec: agentsv1alpha1.EnvironmentSpec{Mode: testSelfHostedMode, DeletionPolicy: deletePolicy,
+			SelfHosted: &agentsv1alpha1.SelfHostedEnvironment{Image: testExecutorImage, Architecture: "amd64",
+				WorkspaceDirectory: defaultWorkspace, WorkspaceSize: "1Gi",
+				WorkspaceStorage: &agentsv1alpha1.WorkspaceStorage{Type: sandbox.WorkspaceStorageEphemeral}}}}
+	Expect(k8sClient.Create(ctx, agent)).To(Succeed())
+	Expect(k8sClient.Create(ctx, environment)).To(Succeed())
+	for _, object := range []client.Object{environment, agent} {
+		DeferCleanup(func() {
+			current := object.DeepCopyObject().(client.Object)
+			if err := k8sClient.Get(ctx, client.ObjectKeyFromObject(object), current); apierrors.IsNotFound(err) {
+				return
+			} else {
+				Expect(err).NotTo(HaveOccurred())
+			}
+			current.SetFinalizers(nil)
+			Expect(k8sClient.Update(ctx, current)).To(Succeed())
+			Expect(client.IgnoreNotFound(k8sClient.Delete(ctx, current))).To(Succeed())
+		})
+	}
+	agents := &agentProviderStub{}
+	environments := &environmentProviderStub{}
+	agentController := &AgentReconciler{Client: k8sClient, APIReader: k8sClient, OpenAI: agents, OwnerScope: testAgentScope}
+	environmentController := &EnvironmentReconciler{Client: k8sClient, APIReader: k8sClient, OpenAI: environments,
+		OwnerScope: testAgentScope, ExecutorImages: []string{testExecutorImage}}
+	for _, value := range []struct {
+		reconciler reconcile.Reconciler
+		object     client.Object
+	}{{agentController, agent}, {environmentController, environment}} {
+		for range 3 {
+			_, err := value.reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(value.object)})
+			Expect(err).NotTo(HaveOccurred())
+		}
+	}
+	Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(agent), agent)).To(Succeed())
+	Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(environment), environment)).To(Succeed())
+	return &currentSessionDependencies{agent: agent, environment: environment, agents: agents, environments: environments}
+}
+
+func currentSessionSpec(dependencies *currentSessionDependencies) agentsv1alpha1.SessionSpec {
+	return agentsv1alpha1.SessionSpec{
+		AgentRef:       &agentsv1alpha1.AgentReference{Name: dependencies.agent.Name},
+		EnvironmentRef: &agentsv1alpha1.AgentReference{Name: dependencies.environment.Name},
+		SpendControl:   &agentsv1alpha1.SessionSpendControl{Mode: spendModeUnlimited},
+	}
+}
+
+func readyHostedSessionEnvironment(namespace string) (*agentsv1alpha1.Environment, *environmentProviderStub) {
+	environment := &agentsv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{GenerateName: "session-environment-", Namespace: namespace},
+		Spec: agentsv1alpha1.EnvironmentSpec{Mode: openaiHostedMode, DeletionPolicy: deletePolicy,
+			OpenAIHosted: &agentsv1alpha1.HostedEnvironment{Network: agentsv1alpha1.HostedNetwork{Access: testDisabledNetwork}}}}
+	Expect(k8sClient.Create(ctx, environment)).To(Succeed())
+	provider := &environmentProviderStub{runtimeStatus: testConnectedRuntime}
+	reconciler := &EnvironmentReconciler{Client: k8sClient, APIReader: k8sClient, OpenAI: provider, OwnerScope: testAgentScope}
+	for range 3 {
+		_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(environment)})
+		Expect(err).NotTo(HaveOccurred())
+	}
+	Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(environment), environment)).To(Succeed())
+	DeferCleanup(func() {
+		var current agentsv1alpha1.Environment
+		if err := k8sClient.Get(ctx, client.ObjectKeyFromObject(environment), &current); apierrors.IsNotFound(err) {
+			return
+		} else {
+			Expect(err).NotTo(HaveOccurred())
+		}
+		current.Finalizers = nil
+		Expect(k8sClient.Update(ctx, &current)).To(Succeed())
+		Expect(client.IgnoreNotFound(k8sClient.Delete(ctx, &current))).To(Succeed())
+	})
+	return environment, provider
+}
+
 func (c *staleClient) Get(_ context.Context, _ client.ObjectKey, obj client.Object, _ ...client.GetOption) error {
 	session, ok := obj.(*agentsv1alpha1.Session)
 	if !ok {
@@ -162,8 +229,7 @@ func (s interceptStatus) Patch(ctx context.Context, obj client.Object, patch cli
 	return s.SubResourceWriter.Patch(ctx, obj, patch, opts...)
 }
 
-var _ = Describe("Legacy remote Session lifecycle (pre-migration Kubernetes API)", func() {
-	useLegacySessionSchema()
+var _ = Describe("Remote Session lifecycle", func() {
 	var resource *agentsv1alpha1.Session
 	var provider *sessionProviderStub
 	var reconciler *SessionReconciler
@@ -176,11 +242,14 @@ var _ = Describe("Legacy remote Session lifecycle (pre-migration Kubernetes API)
 	step := func() error { _, err := reconciler.Reconcile(ctx, request); return err }
 	provision := func() { Expect(step()).To(Succeed()); Expect(step()).To(Succeed()) }
 	BeforeEach(func() {
-		resource = &agentsv1alpha1.Session{ObjectMeta: metav1.ObjectMeta{GenerateName: "session-", Namespace: testNamespace, Finalizers: []string{otherTestFinalizer}}, Spec: agentsv1alpha1.SessionSpec{}}
-		Expect(k8sClient.Create(ctx, resource)).To(Succeed())
+		fixture := newDependencyScenarioFixture()
+		fixture.ready()
+		resource = fixture.newSession(fixture.namespace)
+		resource.Finalizers = append(resource.Finalizers, otherTestFinalizer)
+		Expect(k8sClient.Update(ctx, resource)).To(Succeed())
 		request = reconcile.Request{NamespacedName: client.ObjectKeyFromObject(resource)}
-		provider = &sessionProviderStub{}
-		reconciler = &SessionReconciler{Client: k8sClient, APIReader: k8sClient, OpenAI: provider}
+		provider = fixture.sessions
+		reconciler = fixture.sessionController
 	})
 	AfterEach(func() {
 		// Tests that intentionally block cleanup must release their simulated external
@@ -195,14 +264,15 @@ var _ = Describe("Legacy remote Session lifecycle (pre-migration Kubernetes API)
 			s := read()
 			Expect(s.Finalizers).To(ContainElements(sessionFinalizer, otherTestFinalizer))
 			Expect(s.Status.CreationAttempted).To(BeTrue())
-			Expect(s.Status.CreationWorkspaceDirectory).To(Equal(defaultWorkspace))
+			Expect(s.Status.AgentSnapshot).NotTo(BeNil())
+			Expect(s.Status.EnvironmentSnapshot).NotTo(BeNil())
 		}
 		provision()
 		first := read()
-		Expect(first.Status.OpenAISessionID).To(Equal(testSessionID))
+		Expect(first.Status.OpenAISessionID).To(Equal(provider.remote.ID))
 		Expect(first.Status.EnvironmentID).To(Equal("env_test"))
-		Expect(first.Status.Phase).To(Equal("Connecting"))
-		Expect(meta.FindStatusCondition(first.Status.Conditions, "Ready").Status).To(Equal(metav1.ConditionFalse))
+		Expect(first.Status.Phase).To(Equal("Ready"))
+		Expect(meta.FindStatusCondition(first.Status.Conditions, "Ready").Status).To(Equal(metav1.ConditionTrue))
 		for range 5 {
 			Expect(step()).To(Succeed())
 		}
@@ -216,7 +286,10 @@ var _ = Describe("Legacy remote Session lifecycle (pre-migration Kubernetes API)
 		s := read()
 		Expect(s.Status.OpenAISessionID).To(BeEmpty())
 		Expect(meta.FindStatusCondition(s.Status.Conditions, "RemoteSessionCreated").Reason).To(Equal(creationOutcomeUnknownReason))
-		reconciler = &SessionReconciler{Client: k8sClient, APIReader: k8sClient, OpenAI: provider}
+		restarted := *reconciler
+		restarted.Client = k8sClient
+		restarted.APIReader = k8sClient
+		reconciler = &restarted
 		for range 4 {
 			Expect(step()).To(Succeed())
 		}
@@ -264,7 +337,7 @@ var _ = Describe("Legacy remote Session lifecycle (pre-migration Kubernetes API)
 		Expect(read().Status.OpenAISessionID).To(BeEmpty())
 		Expect(step()).To(Succeed())
 		Expect(provider.creates).To(Equal(1))
-		Expect(read().Status.OpenAISessionID).To(Equal(testSessionID))
+		Expect(read().Status.OpenAISessionID).To(Equal(provider.remote.ID))
 	})
 	It("does not create when the optimistic claim conflicts; retry preserves unrelated metadata", func() {
 		failOnce := true
@@ -336,24 +409,6 @@ var _ = Describe("Legacy remote Session lifecycle (pre-migration Kubernetes API)
 		Expect(read().Finalizers).To(ContainElement(sessionFinalizer))
 		Expect(provider.deletes).To(BeZero())
 	})
-	It("reports a changed workspace for the current generation without creating a replacement", func() {
-		provision()
-		s := read()
-		s.Spec.WorkspaceDirectory = "/other"
-		Expect(k8sClient.Update(ctx, s)).To(Succeed())
-		Expect(step()).To(Succeed())
-		s = read()
-		condition := meta.FindStatusCondition(s.Status.Conditions, "ConfigurationCurrent")
-		Expect(condition.Reason).To(Equal("RequiresNewSession"))
-		Expect(condition.ObservedGeneration).To(Equal(s.Generation))
-		Expect(s.Status.CreationWorkspaceDirectory).To(Equal(defaultWorkspace))
-		Expect(provider.creates).To(Equal(1))
-	})
-	It("validates absolute workspace paths with the real CRD", func() {
-		s := read()
-		s.Spec.WorkspaceDirectory = "relative"
-		Expect(apierrors.IsInvalid(k8sClient.Update(ctx, s))).To(BeTrue())
-	})
 	It("allows only one of two concurrent reconcilers to send create", func() {
 		Expect(step()).To(Succeed())
 		barrier := &barrierReader{Reader: k8sClient, arrived: make(chan struct{}, 2), release: make(chan struct{})}
@@ -412,7 +467,7 @@ var _ = Describe("Legacy remote Session lifecycle (pre-migration Kubernetes API)
 		Expect(k8sClient.Delete(ctx, old)).To(Succeed())
 		replacement := &agentsv1alpha1.Session{ObjectMeta: metav1.ObjectMeta{
 			Name: request.Name, Namespace: request.Namespace, Finalizers: []string{otherTestFinalizer}},
-			Spec: agentsv1alpha1.SessionSpec{}}
+			Spec: *resource.Spec.DeepCopy()}
 		Expect(k8sClient.Create(ctx, replacement)).To(Succeed())
 		Expect(replacement.UID).NotTo(Equal(oldUID))
 		s := read()

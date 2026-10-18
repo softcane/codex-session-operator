@@ -8,7 +8,6 @@ import (
 	"io"
 	"reflect"
 	"strconv"
-	"strings"
 	"testing"
 	"time"
 
@@ -21,9 +20,9 @@ import (
 )
 
 const (
-	_workWorkerVault       = "evidence-vault"
-	_workWorkerEnvironment = "runtime-v1"
-	_workWorkerUnlimited   = "unlimited"
+	_workWorkerVault       = _profileTestVault
+	_workWorkerEnvironment = _profileTestEnvironment
+	_workWorkerUnlimited   = _testWorkUnlimited
 )
 
 type workWorkerWriter struct {
@@ -69,36 +68,34 @@ func (w *workWorkerWriter) Delete(ctx context.Context, obj client.Object, opts .
 	return w.Client.Delete(ctx, obj, opts...)
 }
 
-func workerWorkRoute() WorkRoute {
-	return WorkRoute{ID: "worker-route", Namespace: _testNamespace, Source: "ci", Agent: "investigator-v1",
+func workerWorkRoute() profileRoute {
+	return profileRoute{ID: _profileTestName, Namespace: _testNamespace, Source: _profileSourceName, Agent: _profileTestAgent,
 		Environment: _workWorkerEnvironment, Vaults: []string{_workWorkerVault},
 		SpendControl: &agentsv1alpha1.SessionSpendControl{Mode: _workWorkerUnlimited}}
 }
 
 func workerWorkGateway(t *testing.T, store Storage, mode string) (*Gateway, *workWorkerWriter, string) {
 	t.Helper()
-	route := workerWorkRoute()
-	environment := &agentsv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{Namespace: route.Namespace, Name: route.Environment},
-		Spec: agentsv1alpha1.EnvironmentSpec{Mode: mode}}
+	_, objects := readyProfileObjects(_testNamespace)
+	for _, object := range objects {
+		if environment, ok := object.(*agentsv1alpha1.Environment); ok {
+			environment.Spec.Mode = mode
+		}
+	}
 	provider := simulatorForTest()
 	provider.remotePresent = false
-	g, k8s := testGateway(t, store, provider, environment)
-	id := workIdentity(route.Namespace, route.ID, route.Source, "pipeline-123")
-	writer := &workWorkerWriter{Client: k8s, store: store, workID: id}
-	if err := g.EnableWork(writer, []WorkRoute{route}); err != nil {
+	g, k8s := testGateway(t, store, provider, objects...)
+	writer := &workWorkerWriter{Client: k8s, store: store}
+	if err := g.EnableProfiles(writer); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.Update(t.Context(), id, func(record *Record) error {
-		record.Namespace = route.Namespace
-		record.Name = workSessionName(id, 1)
-		record.Work = &Work{ID: id, RouteID: route.ID, Source: route.Source, ExternalID: "pipeline-123", State: _workOpen,
-			Attempts: []WorkAttempt{{Number: 1, SessionName: record.Name, Policy: workPolicy(route, id, 1)}},
-			Events:   []WorkEvent{workerWorkEvent("task-1", _workTask, "Investigate this failing CI run.", 1)}}
-		return nil
-	}); err != nil {
+	record, _, err := g.createConversation(t.Context(), Principal{Namespace: _testNamespace, Subject: _testConversationSubject},
+		"worker-route", ConversationInput{RouteID: _profileTestName, Text: "Investigate this failing CI run."})
+	if err != nil {
 		t.Fatal(err)
 	}
-	return g, writer, id
+	writer.workID = record.UID
+	return g, writer, record.UID
 }
 
 func workerWorkEvent(id, kind, text string, attempt int) WorkEvent {
@@ -126,52 +123,9 @@ func workerWorkSession(t *testing.T, writer client.Reader, record Record) *agent
 	return &session
 }
 
-func TestWorkRoutesRejectUnknownPolicyAndCopySelection(t *testing.T) {
-	route := workerWorkRoute()
-	limit := int64(100)
-	route.SpendControl = &agentsv1alpha1.SessionSpendControl{Mode: "limited", LimitCents: &limit}
-	routes, err := ParseWorkRoutes(mustJSON(t, []WorkRoute{route}))
-	if err != nil || len(routes) != 1 {
-		t.Fatal(routes, err)
-	}
-	tests := []struct {
-		name string
-		raw  string
-	}{
-		{name: "secret", raw: `[{"id":"x","secret":"private"}]`},
-		{name: "trailing", raw: string(mustJSON(t, []WorkRoute{route})) + `{}`},
-		{name: "empty", raw: `[]`},
-		{name: "missing spend", raw: `[{"id":"x","source":"ci","namespace":"team","agent":"a","environment":"e"}]`},
-		{name: "cross namespace", raw: strings.ReplaceAll(string(mustJSON(t, []WorkRoute{route})), route.Agent, "other/agent")},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if _, err := ParseWorkRoutes([]byte(tt.raw)); err == nil {
-				t.Fatal("invalid route accepted")
-			}
-		})
-	}
-	g, k8s := testGateway(t, testStore(t), simulatorForTest())
-	if err := g.EnableWork(k8s, []WorkRoute{route}); err != nil {
-		t.Fatal(err)
-	}
-	route.Vaults[0] = "changed"
-	*route.SpendControl.LimitCents = 200
-	selected := g.workRoutes[route.ID]
-	if selected.Vaults[0] != _workWorkerVault || *selected.SpendControl.LimitCents != 100 {
-		t.Fatal("retained mutable route configuration")
-	}
-	policy := workPolicy(selected, "work-opaque", 1)
-	policy.VaultRefs[0].Name = "another"
-	*policy.SpendControl.LimitCents = 300
-	if selected.Vaults[0] != _workWorkerVault || *selected.SpendControl.LimitCents != 100 || policy.Agent != nil {
-		t.Fatal("policy aliases route or overrides saved Agent")
-	}
-}
-
 func TestWorkWorkerReusesSessionAndQueuesTaskBeforeEvidence(t *testing.T) {
 	store := testStore(t)
-	g, writer, id := workerWorkGateway(t, store, "selfHosted")
+	g, writer, id := workerWorkGateway(t, store, _selfHostedMode)
 	if err := store.Update(t.Context(), id, func(record *Record) error {
 		record.Work.Events = append(record.Work.Events, workerWorkEvent("logs-1", _workEvidence, "Additional log evidence.", 1))
 		return nil
@@ -204,7 +158,7 @@ func TestWorkWorkerReusesSessionAndQueuesTaskBeforeEvidence(t *testing.T) {
 	if err := g.workSessionOpen(t.Context(), session); err != nil {
 		t.Fatal(err)
 	}
-	if err := g.validateWorkSession(t.Context(), session, &agentsv1alpha1.SessionEnvironmentSnapshot{Name: _workWorkerEnvironment, Profile: agentsv1alpha1.EnvironmentSpec{Mode: "selfHosted"}}); err != nil {
+	if err := g.validateWorkSession(t.Context(), session, &agentsv1alpha1.SessionEnvironmentSnapshot{Name: _workWorkerEnvironment, UID: _profileTestEnvironmentUID, Profile: agentsv1alpha1.EnvironmentSpec{Mode: _selfHostedMode}}); err != nil {
 		t.Fatal(err)
 	}
 	session.Status.Phase = _readyCondition
@@ -249,7 +203,7 @@ func TestWorkWorkerNoneModeReservesInitialInput(t *testing.T) {
 }
 
 func TestWorkWorkerRecoversAfterCommitCreateAndEnqueue(t *testing.T) {
-	store, dsn := postgresForTest(t, 32)
+	store, dsn := postgresForTest(t)
 	g, writer, id := workerWorkGateway(t, store, _noneMode)
 	writer.loseCreate = true
 	if err := g.syncWork(context.Background(), id); !errors.Is(err, io.ErrUnexpectedEOF) {
@@ -287,7 +241,7 @@ func TestWorkWorkerRecoversAfterCommitCreateAndEnqueue(t *testing.T) {
 
 func TestWorkWorkerDoesNotRepeatAmbiguousBeforeCommitCreate(t *testing.T) {
 	store := testStore(t)
-	g, writer, id := workerWorkGateway(t, store, "selfHosted")
+	g, writer, id := workerWorkGateway(t, store, _selfHostedMode)
 	writer.failCreate = io.ErrUnexpectedEOF
 	if err := g.syncWork(context.Background(), id); !errors.Is(err, io.ErrUnexpectedEOF) {
 		t.Fatal(err)
@@ -305,7 +259,7 @@ func TestWorkWorkerDoesNotRepeatAmbiguousBeforeCommitCreate(t *testing.T) {
 
 func TestWorkWorkerRetriesDefinitiveCreateRejection(t *testing.T) {
 	store := testStore(t)
-	g, writer, id := workerWorkGateway(t, store, "selfHosted")
+	g, writer, id := workerWorkGateway(t, store, _selfHostedMode)
 	writer.failCreate = apierrors.NewForbidden(schema.GroupResource{Resource: _sessionsSegment}, "fixture", errors.New("denied"))
 	if err := g.syncWork(context.Background(), id); !apierrors.IsForbidden(err) {
 		t.Fatal(err)
@@ -324,7 +278,7 @@ func TestWorkWorkerRetriesDefinitiveCreateRejection(t *testing.T) {
 
 func TestWorkWorkerClosesAndRequiresExplicitNewAttempt(t *testing.T) {
 	store := testStore(t)
-	g, writer, id := workerWorkGateway(t, store, "selfHosted")
+	g, writer, id := workerWorkGateway(t, store, _selfHostedMode)
 	if err := g.syncWork(context.Background(), id); err != nil {
 		t.Fatal(err)
 	}
@@ -353,7 +307,8 @@ func TestWorkWorkerClosesAndRequiresExplicitNewAttempt(t *testing.T) {
 		record.Work.State = _workOpen
 		record.Name = workSessionName(id, 2)
 		record.Work.Attempts = append(record.Work.Attempts, WorkAttempt{Number: 2, SessionName: record.Name,
-			Policy: workPolicy(workerWorkRoute(), id, 2)})
+			ConversationID: conversationID(id, 2), Policy: workPolicy(workerWorkRoute(), id, 2),
+			Profile: copyProfileProvenance(record.Work.Attempts[0].Profile)})
 		record.Work.Events = append(record.Work.Events, workerWorkEvent("restart-1", _workRestart, "Reinvestigate with new evidence.", 2))
 		return nil
 	}); err != nil {
@@ -376,7 +331,7 @@ func TestWorkWorkerClosesAndRequiresExplicitNewAttempt(t *testing.T) {
 
 func TestWorkWorkerNeverReplacesDeletedBoundSession(t *testing.T) {
 	store := testStore(t)
-	g, writer, id := workerWorkGateway(t, store, "selfHosted")
+	g, writer, id := workerWorkGateway(t, store, _selfHostedMode)
 	if err := g.syncWork(context.Background(), id); err != nil {
 		t.Fatal(err)
 	}
@@ -398,9 +353,9 @@ func TestWorkWorkerNeverReplacesDeletedBoundSession(t *testing.T) {
 func TestWorkWorkerRejectsForeignObjectAndUIDRecreation(t *testing.T) {
 	t.Run("unclaimed foreign object", func(t *testing.T) {
 		store := testStore(t)
-		g, writer, id := workerWorkGateway(t, store, "selfHosted")
+		g, writer, id := workerWorkGateway(t, store, _selfHostedMode)
 		record := workerWorkRecord(t, store, id)
-		foreign := &agentsv1alpha1.Session{ObjectMeta: metav1.ObjectMeta{Namespace: record.Namespace, Name: record.Name, UID: "foreign"},
+		foreign := &agentsv1alpha1.Session{ObjectMeta: metav1.ObjectMeta{Namespace: record.Namespace, Name: record.Name, UID: _testForeignUID},
 			Spec: *record.Work.Attempts[0].Policy.DeepCopy()}
 		if err := writer.Client.Create(context.Background(), foreign); err != nil {
 			t.Fatal(err)
@@ -411,7 +366,7 @@ func TestWorkWorkerRejectsForeignObjectAndUIDRecreation(t *testing.T) {
 	})
 	t.Run("bound UID recreated", func(t *testing.T) {
 		store := testStore(t)
-		g, writer, id := workerWorkGateway(t, store, "selfHosted")
+		g, writer, id := workerWorkGateway(t, store, _selfHostedMode)
 		if err := g.syncWork(context.Background(), id); err != nil {
 			t.Fatal(err)
 		}
@@ -437,7 +392,7 @@ func TestWorkWorkerRejectsForeignObjectAndUIDRecreation(t *testing.T) {
 
 func TestWorkWorkerCloseBeforeTaskTombstoneNeedsNoSession(t *testing.T) {
 	store := testStore(t)
-	g, writer, id := workerWorkGateway(t, store, "selfHosted")
+	g, writer, id := workerWorkGateway(t, store, _selfHostedMode)
 	if err := store.Update(t.Context(), id, func(record *Record) error {
 		record.Name = ""
 		record.Work.State = _workClosed
@@ -454,7 +409,7 @@ func TestWorkWorkerCloseBeforeTaskTombstoneNeedsNoSession(t *testing.T) {
 
 func TestWorkWorkerClosingAmbiguousCreateRequiresAudit(t *testing.T) {
 	store := testStore(t)
-	g, writer, id := workerWorkGateway(t, store, "selfHosted")
+	g, writer, id := workerWorkGateway(t, store, _selfHostedMode)
 	writer.failCreate = io.ErrUnexpectedEOF
 	if err := g.syncWork(context.Background(), id); !errors.Is(err, io.ErrUnexpectedEOF) {
 		t.Fatal(err)
@@ -473,7 +428,7 @@ func TestWorkWorkerClosingAmbiguousCreateRequiresAudit(t *testing.T) {
 
 func TestWorkWorkerForcedDeletionDoesNotForgetRemoteSession(t *testing.T) {
 	store := testStore(t)
-	g, writer, id := workerWorkGateway(t, store, "selfHosted")
+	g, writer, id := workerWorkGateway(t, store, _selfHostedMode)
 	if err := g.syncWork(context.Background(), id); err != nil {
 		t.Fatal(err)
 	}

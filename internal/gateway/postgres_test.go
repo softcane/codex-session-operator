@@ -23,18 +23,30 @@ import (
 )
 
 const (
-	_testApprover = "approver"
-	_testExternal = "external"
-	_testOriginal = "original"
-	_testLegacy   = "legacy"
+	_testApprover  = "approver"
+	_testExternal  = "external"
+	_testOriginal  = "original"
+	_testUncertain = "uncertain"
 )
 
-func postgresForTest(t testing.TB, active int) (*PostgreSQLStore, string) {
+func postgresForTest(t testing.TB) (*PostgreSQLStore, string) {
 	t.Helper()
-	return postgresForTestLimits(t, active, 100000)
+	return postgresForTestLimits(t, 32, 100000)
 }
 
 func postgresForTestLimits(t testing.TB, active, retained int) (*PostgreSQLStore, string) {
+	t.Helper()
+	dsn := postgresDatabaseForTest(t)
+	options := PostgreSQLConfig{DSN: dsn, MaxActive: active, MaxRecords: retained, AllowInsecureLocal: true}
+	store, err := OpenPostgreSQL(context.Background(), options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	return store, dsn
+}
+
+func postgresDatabaseForTest(t testing.TB) string {
 	t.Helper()
 	dsn := os.Getenv("GATEWAY_TEST_POSTGRES")
 	if dsn == "" {
@@ -58,21 +70,15 @@ func postgresForTestLimits(t testing.TB, active, retained int) (*PostgreSQLStore
 	if config.Database != "postgres" {
 		t.Fatal("test DSN must name postgres database")
 	}
-	options := PostgreSQLConfig{DSN: dsn, MaxActive: active, MaxRecords: retained, AllowInsecureLocal: true}
-	store, err := OpenPostgreSQL(ctx, options)
-	if err != nil {
-		t.Fatal(err)
-	}
 	t.Cleanup(func() {
-		_ = store.Close()
 		_, _ = admin.Exec(ctx, "DROP DATABASE "+pgx.Identifier{database}.Sanitize()+" WITH (FORCE)")
 		_ = admin.Close(ctx)
 	})
-	return store, dsn
+	return dsn
 }
 
 func TestPostgreSQLStorageBehavior(t *testing.T) {
-	store, _ := postgresForTest(t, 32)
+	store, _ := postgresForTest(t)
 	t.Run("atomic mutation and caller ownership", func(t *testing.T) {
 		if err := store.Update(t.Context(), "contract", func(r *Record) error { r.Namespace = _testNamespace; r.Notes["a"] = _testOriginal; return nil }); err != nil {
 			t.Fatal(err)
@@ -89,18 +95,18 @@ func TestPostgreSQLStorageBehavior(t *testing.T) {
 	})
 	t.Run("namespace binding and isolation", func(t *testing.T) { checkNamespaceBinding(t, store) })
 	t.Run("receipt replay and changed input", func(t *testing.T) {
-		g, _, _ := workHTTPGateway(t, store)
-		body := string(mustJSON(t, workInput("backend-event", _workTask, "Investigate")))
-		first := request(g, http.MethodPost, _workEventPath, _token, "", body)
+		g, _, _ := profileConversationGateway(t, store)
+		body := _profileTestBody
+		first := request(g, http.MethodPost, _conversationPath, _token, "backend-event", body)
 		if first.Code != 202 {
 			t.Fatal(first.Code, first.Body.String())
 		}
-		second := request(g, http.MethodPost, _workEventPath, _token, "", body)
+		second := request(g, http.MethodPost, _conversationPath, _token, "backend-event", body)
 		if second.Code != 202 || second.Body.String() != first.Body.String() {
 			t.Fatal("receipt changed")
 		}
-		changed := strings.Replace(body, "Investigate", "Changed", 1)
-		if response := request(g, http.MethodPost, _workEventPath, _token, "", changed); response.Code != 409 {
+		changed := strings.Replace(body, "Inspect the repository", "Changed", 1)
+		if response := request(g, http.MethodPost, _conversationPath, _token, "backend-event", changed); response.Code != 409 {
 			t.Fatal(response.Code)
 		}
 	})
@@ -155,15 +161,15 @@ func TestPostgreSQLStorageBehavior(t *testing.T) {
 }
 
 func TestPostgreSQLConcurrentAcceptance(t *testing.T) {
-	store, dsn := postgresForTest(t, 32)
+	store, dsn := postgresForTest(t)
 	other, err := OpenPostgreSQL(context.Background(), PostgreSQLConfig{DSN: dsn, AllowInsecureLocal: true})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer func() { _ = other.Close() }()
-	g1, _, _ := workHTTPGateway(t, store)
-	g2, _, _ := workHTTPGateway(t, other)
-	body := string(mustJSON(t, workInput("concurrent-delivery", _workTask, "once")))
+	g1, _, _ := profileConversationGateway(t, store)
+	g2, _, _ := profileConversationGateway(t, other)
+	body := _profileTestBody
 	responses := make(chan string, 20)
 	var wg sync.WaitGroup
 	for i := range 20 {
@@ -172,7 +178,7 @@ func TestPostgreSQLConcurrentAcceptance(t *testing.T) {
 			if i%2 == 1 {
 				g = g2
 			}
-			r := request(g, http.MethodPost, _workEventPath, _token, "", body)
+			r := request(g, http.MethodPost, _conversationPath, _token, "concurrent-delivery", body)
 			responses <- fmt.Sprintf("%d:%s", r.Code, r.Body.String())
 		})
 	}
@@ -194,65 +200,64 @@ func TestPostgreSQLConcurrentAcceptance(t *testing.T) {
 	if err != nil || len(records) != 1 || len(records[0].Work.Events) != 1 {
 		t.Fatal("duplicate acceptance", err)
 	}
-	input := workInput("concurrent-delivery", _workTask, "once")
-	input.WorkID = "other-work"
-	if r := request(g2, http.MethodPost, _workEventPath, _token, "", string(mustJSON(t, input))); r.Code != 409 {
-		t.Fatal("delivery ID reused across work", r.Code)
+	changed := strings.Replace(body, "Inspect the repository", "different", 1)
+	if r := request(g2, http.MethodPost, _conversationPath, _token, "concurrent-delivery", changed); r.Code != 409 {
+		t.Fatal("creation key accepted changed input", r.Code)
 	}
 }
 
-func TestPostgreSQLRetentionAndQuotas(t *testing.T) {
-	store, _ := postgresForTest(t, 2)
-	g, _, _ := workHTTPGateway(t, store)
-
-	var original string
-	for i := range 48 {
-		input := workInput(fmt.Sprintf("close-%d", i), _workClose, "")
-		input.WorkID = fmt.Sprintf("retained-%d", i)
-		body := string(mustJSON(t, input))
-		r := request(g, http.MethodPost, _workEventPath, _token, "", body)
-		if r.Code != 202 {
-			t.Fatal(i, r.Code, r.Body.String())
+func TestPostgreSQLArchiveErasesPayloadsAndPreservesReplay(t *testing.T) {
+	store, _ := postgresForTest(t)
+	const privateText = "synthetic-private-archive-content"
+	session := testSession()
+	g, _ := testGateway(t, store, simulatorForTest(), session)
+	if err := g.enqueue(t.Context(), session, "archive-payload", privateText, "", nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Update(t.Context(), _testUID, func(r *Record) error {
+		r.Closed = true
+		r.History.Items = []json.RawMessage{inputEvent(privateText)}
+		r.Notes["private"] = privateText
+		appendEvent(r, inputEvent(privateText))
+		r.Actions["action"] = Action{
+			Pending: openaiapi.PendingAction{Type: _functionCall, CallID: "call", Arguments: mustJSON(t, map[string]string{"text": privateText}), Request: inputEvent(privateText)},
+			Result:  inputEvent(privateText), OperationID: "operation", Decision: _approve, Active: true,
 		}
-		if i == 0 {
-			original = r.Body.String()
-		}
-		id := workIdentity(_testNamespace, input.RouteID, g.workRoutes[input.RouteID].Source, input.WorkID)
-		if err := store.Archive(t.Context(), id); err != nil {
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		if err := store.Archive(t.Context(), _testUID); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if records, err := store.ActiveRecords(t.Context()); err != nil || len(records) != 0 {
-		t.Fatal("retained identities entered the worker scan", err)
+	archived, err := store.Get(t.Context(), _testUID)
+	if err != nil {
+		t.Fatal(err)
 	}
-	summaries, err := store.RecordSummaries(context.Background(), _testNamespace, _workSegment)
-	if err != nil || len(summaries) != 48 {
-		t.Fatal("retained source index incomplete", err)
+	if strings.Contains(string(mustJSON(t, archived)), privateText) {
+		t.Fatal("archive retained conversation payloads")
 	}
-	for _, record := range summaries {
-		if len(record.Work.Events) != 0 || record.History.ID != "" {
-			t.Fatal("source listing loaded retained payloads")
+	if archived.Actions["action"].OperationID != "operation" || archived.Actions["action"].Decision != _approve || archived.Submissions[0].ReplayDigest == "" {
+		t.Fatal("archive lost immutable action or replay identity")
+	}
+	backup, err := store.Backup(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fresh, _ := postgresForTest(t)
+	if _, err := fresh.Restore(t.Context(), backup); err != nil {
+		t.Fatal(err)
+	}
+	for _, backend := range []*PostgreSQLStore{store, fresh} {
+		g.store = backend
+		if err := g.enqueue(t.Context(), session, "archive-payload", privateText, "", nil); err != nil {
+			t.Fatalf("exact archived replay failed: %v", err)
 		}
-	}
-	input := workInput("close-0", _workClose, "")
-	input.WorkID = "retained-0"
-	if r := request(g, http.MethodPost, _workEventPath, _token, "", string(mustJSON(t, input))); r.Code != 202 || r.Body.String() != original {
-		t.Fatal("archive lost replay receipt")
-	}
-	if err := store.Update(t.Context(), "active-1", func(r *Record) error { r.Namespace = _testNamespace; return nil }); err != nil {
-		t.Fatal(err)
-	}
-	if err := store.Update(t.Context(), "active-2", func(r *Record) error { r.Namespace = _testNamespace; return nil }); err != nil {
-		t.Fatal(err)
-	}
-	if r := request(g, http.MethodPost, _workEventPath, _token, "", string(mustJSON(t, workInput("new-active", _workTask, "reserved")))); r.Code == 202 {
-		t.Fatal("active reservations bypassed")
-	}
-	if err := store.Update(t.Context(), "active-1", func(r *Record) error { r.Closed = true; return nil }); err != nil {
-		t.Fatal(err)
-	}
-	if r := request(g, http.MethodPost, _workEventPath, _token, "", string(mustJSON(t, workInput("new-active", _workTask, "reserved")))); r.Code != 202 {
-		t.Fatal("retained history consumed active capacity", r.Code)
+		if err := g.enqueue(t.Context(), session, "archive-payload", "changed", "", nil); !errors.Is(err, errConflict) {
+			t.Fatalf("changed archived replay accepted: %v", err)
+		}
 	}
 }
 
@@ -284,16 +289,16 @@ func (w *heldReceiptWriter) Write(raw []byte) (int, error) {
 }
 
 func TestPostgreSQLBackupRestore(t *testing.T) {
-	store, _ := postgresForTest(t, 32)
-	g, _, _ := workHTTPGateway(t, store)
-	response := request(g, http.MethodPost, _workEventPath, _token, "", string(mustJSON(t, workInput("restore-pending", _workTask, "preserve"))))
+	store, _ := postgresForTest(t)
+	g, _, _ := profileConversationGateway(t, store)
+	response := request(g, http.MethodPost, _conversationPath, _token, "restore-pending", _profileTestBody)
 	if response.Code != 202 {
 		t.Fatal(response.Code)
 	}
-	if err := store.Update(t.Context(), _testLegacy, func(r *Record) error {
+	if err := store.Update(t.Context(), _testUncertain, func(r *Record) error {
 		r.Namespace = _testNamespace
 		r.RemoteID = "original-remote"
-		r.Submissions = []Submission{{Key: _testLegacy, Attempts: 1, Text: "old input"}}
+		r.Submissions = []Submission{{Key: _testUncertain, RemoteKey: wireKey(_testUncertain, _testUncertain), Attempts: 1, Text: "uncertain input"}}
 		r.Actions["call"] = Action{Decision: _approve, DecidedBy: "alice", OperationID: "original-operation", AttemptedAt: new(time.Now())}
 		return nil
 	}); err != nil {
@@ -309,10 +314,10 @@ func TestPostgreSQLBackupRestore(t *testing.T) {
 		t.Fatal(err)
 	}
 	// The backup predates a remote outcome marker; restoring it must stay gated.
-	if err := store.Update(t.Context(), _testLegacy, func(r *Record) error { r.Submissions[0].Accepted = true; return nil }); err != nil {
+	if err := store.Update(t.Context(), _testUncertain, func(r *Record) error { r.Submissions[0].Accepted = true; return nil }); err != nil {
 		t.Fatal(err)
 	}
-	fresh, _ := postgresForTest(t, 32)
+	fresh, _ := postgresForTest(t)
 	started := time.Now()
 	report, err := fresh.Restore(context.Background(), backup)
 	if err != nil {
@@ -336,24 +341,24 @@ func TestPostgreSQLBackupRestore(t *testing.T) {
 	audit := make([]Reconciliation, 0, len(report.Digests))
 	for uid, digest := range report.Digests {
 		audit = append(audit, Reconciliation{UID: uid, Digest: digest,
-			Reference: "test exact Kubernetes/provider audit", Blocked: uid == _testLegacy, Verified: uid != _testLegacy})
+			Reference: "test exact Kubernetes/provider audit", Blocked: uid == _testUncertain, Verified: uid != _testUncertain})
 	}
 	if err := fresh.ResumeDelivery(t.Context(), audit); err != nil {
 		t.Fatal(err)
 	}
-	legacy, err := fresh.Get(context.Background(), _testLegacy)
-	if err != nil || !legacy.DeliveryHeld || legacy.Submissions[0].RemoteKey != "" || legacy.Actions["call"].OperationID != "original-operation" {
+	uncertain, err := fresh.Get(context.Background(), _testUncertain)
+	if err != nil || !uncertain.DeliveryHeld || uncertain.Submissions[0].RemoteKey != wireKey(_testUncertain, _testUncertain) || uncertain.Actions["call"].OperationID != "original-operation" {
 		t.Fatal("restore lost unresolved claims", err)
 	}
 	if _, err := fresh.Restore(t.Context(), backup); err == nil {
 		t.Fatal("restore overwrote live database")
 	}
-	if err := store.Update(t.Context(), _testLegacy, func(r *Record) error { r.Submissions[0].Accepted = true; return nil }); err != nil {
+	if err := store.Update(t.Context(), _testUncertain, func(r *Record) error { r.Submissions[0].Accepted = true; return nil }); err != nil {
 		t.Fatal(err)
 	}
 
-	legacy, _ = store.Get(context.Background(), _testLegacy)
-	if !legacy.Submissions[0].Accepted {
+	uncertain, _ = store.Get(context.Background(), _testUncertain)
+	if !uncertain.Submissions[0].Accepted {
 		t.Fatal("database update reverted acceptance")
 	}
 }
@@ -371,14 +376,15 @@ func TestPostgreSQLCrashProof(t *testing.T) {
 	if stage == "" {
 		t.Skip("requires database SIGKILL harness")
 	}
-	store, err := OpenPostgreSQL(context.Background(), PostgreSQLConfig{
+	options := PostgreSQLConfig{
 		DSN: os.Getenv("GATEWAY_TEST_POSTGRES"), AllowInsecureLocal: true,
-	})
+	}
+	store, err := OpenPostgreSQL(context.Background(), options)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer func() { _ = store.Close() }()
-	g, _, _ := workHTTPGateway(t, store)
+	g, _, _ := profileConversationGateway(t, store)
 	if stage == "serve" {
 		// The integration harness kills this process after the database commit,
 		// while the real HTTP connection has received neither headers nor body.
@@ -390,8 +396,8 @@ func TestPostgreSQLCrashProof(t *testing.T) {
 		t.Log("CRASH_HTTP_LISTENER_READY")
 		t.Fatal(server.ListenAndServe())
 	}
-	body := string(mustJSON(t, workInput("crash-proof", _workTask, "durably accepted")))
-	receipt := request(g, http.MethodPost, _workEventPath, _token, "", body)
+	body := `{"route_id":"payments","text":"durably accepted"}`
+	receipt := request(g, http.MethodPost, _conversationPath, _token, "crash-proof", body)
 	if receipt.Code != http.StatusAccepted {
 		t.Fatal(receipt.Code)
 	}
@@ -407,7 +413,7 @@ func TestPostgreSQLCrashProof(t *testing.T) {
 		t.Fatal("process crash lost original receipt", err)
 	}
 	changed := strings.Replace(body, "durably accepted", "different", 1)
-	if response := request(g, http.MethodPost, _workEventPath, _token, "", changed); response.Code != http.StatusConflict {
+	if response := request(g, http.MethodPost, _conversationPath, _token, "crash-proof", changed); response.Code != http.StatusConflict {
 		t.Fatal("process crash lost replay conflict", response.Code)
 	}
 }
@@ -428,7 +434,7 @@ func (c *commitDisconnect) Read(raw []byte) (int, error) {
 }
 
 func TestPostgreSQLUnknownCommitAndDisconnect(t *testing.T) {
-	store, _ := postgresForTest(t, 32)
+	store, _ := postgresForTest(t)
 	armed := new(atomic.Bool)
 	config := store.pool.Config()
 	config.ConnConfig.DefaultQueryExecMode = pgx.QueryExecModeSimpleProtocol
@@ -474,7 +480,7 @@ func TestPostgreSQLUnknownCommitAndDisconnect(t *testing.T) {
 }
 
 func TestPostgreSQLWorkerFencingAndOperationRecovery(t *testing.T) {
-	store, _ := postgresForTest(t, 32)
+	store, _ := postgresForTest(t)
 	first, release, err := store.ClaimWorker(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -563,7 +569,7 @@ func checkNamespaceBinding(t *testing.T, store Storage) {
 }
 
 func TestPostgreSQLLeaseExpiryDuringMutation(t *testing.T) {
-	store, _ := postgresForTest(t, 32)
+	store, _ := postgresForTest(t)
 	if err := store.Update(t.Context(), "expiry", func(r *Record) error { r.Namespace = _testNamespace; return nil }); err != nil {
 		t.Fatal(err)
 	}
@@ -585,12 +591,12 @@ func TestPostgreSQLLeaseExpiryDuringMutation(t *testing.T) {
 }
 
 func TestPostgreSQLRetainedQuotaReservesConversation(t *testing.T) {
-	store, _ := postgresForTest(t, 32)
+	store, _ := postgresForTest(t)
 	if _, err := store.pool.Exec(context.Background(), "UPDATE gateway_meta SET max_records=1 WHERE id=1"); err != nil {
 		t.Fatal("configure retained quota")
 	}
-	g, _, _ := workHTTPGateway(t, store)
-	response := request(g, http.MethodPost, _workEventPath, _token, "", string(mustJSON(t, workInput("no-room-for-conversation", _workTask, "reserved"))))
+	g, _, _ := profileConversationGateway(t, store)
+	response := request(g, http.MethodPost, _conversationPath, _token, "no-room-for-conversation", _profileTestBody)
 	if response.Code == 202 {
 		t.Fatal("accepted work without its future conversation capacity")
 	}
@@ -606,7 +612,7 @@ func seedCompletedRecord(t *testing.T, store Storage) {
 		r.Namespace = _testNamespace
 		r.Closed = true
 		r.RemoteID = "completed-remote"
-		r.Submissions = []Submission{{Key: "completed-input", RemoteKey: "completed-original-key", Accepted: true, Text: "completed input"}}
+		r.Submissions = []Submission{{Key: "completed-input", RemoteKey: wireKey("completed", "completed-input"), Accepted: true, Text: "completed input"}}
 		r.Actions["completed-call"] = Action{Decision: _approve, DecidedBy: "alice", OperationID: "completed-operation", Result: json.RawMessage(`{"type":"agent.session.input.tool_result","success":true}`)}
 		return nil
 	}); err != nil {

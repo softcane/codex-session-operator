@@ -59,12 +59,14 @@ type EnvironmentReconciler struct {
 	GatewayEnabled                   bool
 	ExecutorImages, CapabilityImages []string
 	WorkspaceStorageClasses          []string
+	RepositoryURLs                   []string
 }
 
 // +kubebuilder:rbac:groups=agents.softcane.io,resources=environments,verbs=get;list;watch;patch
 // +kubebuilder:rbac:groups=agents.softcane.io,resources=environments/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=agents.softcane.io,resources=environments/finalizers,verbs=update;patch
 // +kubebuilder:rbac:groups="",resources=secrets,resourceNames=codex-environment,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=secrets,resourceNames=codex-repository,verbs=get;list;watch
 
 func (r *EnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	var environment agentsv1alpha1.Environment
@@ -105,13 +107,32 @@ func (r *EnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		if err := sandbox.ValidateProfile(environment.Spec.SelfHosted, r.ExecutorImages, r.CapabilityImages, r.WorkspaceStorageClasses); err != nil {
 			return r.environmentProblem(ctx, &environment, invalidConfigurationReason, err.Error(), nil)
 		}
+		if err := sandbox.ValidateRepositoryApproval(environment.Spec.SelfHosted.Repository, r.RepositoryURLs); err != nil {
+			return r.environmentProblem(ctx, &environment, invalidConfigurationReason, err.Error(), nil)
+		}
+		sourceVersion, err := readRepositorySource(ctx, r.reader(), environment.Namespace, environment.Spec.SelfHosted.Repository)
+		if err != nil {
+			return r.environmentProblem(ctx, &environment, "ProtectedSourceUnavailable", "Protected repository source is unavailable or invalid", err)
+		}
 		base := environment.DeepCopy()
 		environment.Status.OwnerScope = r.OwnerScope
-		environment.Status.ConfigurationDigest = openaiapi.EnvironmentDigest(environment.Spec, nil)
+		environment.Status.SourceVersion = sourceVersion
+		environment.Status.ConfigurationDigest = openaiapi.EnvironmentDigest(environment.Spec, sourceVersion)
 		environmentCondition(&environment, metav1.ConditionTrue, "ProfileValidated", "Local profile is validated; each Session owns its compute")
 		return ctrl.Result{RequeueAfter: observationInterval}, r.patchEnvironmentStatus(ctx, &environment, base)
 	}
 	return r.reconcileHostedEnvironment(ctx, &environment)
+}
+
+func readRepositorySource(ctx context.Context, reader client.Reader, namespace string, repository *agentsv1alpha1.RepositorySpec) (*agentsv1alpha1.EnvironmentSourceVersion, error) {
+	if repository == nil || repository.CredentialSecretRef == nil {
+		return nil, nil
+	}
+	var secret corev1.Secret
+	if err := reader.Get(ctx, client.ObjectKey{Namespace: namespace, Name: sandbox.RepositorySecretName}, &secret); err != nil {
+		return nil, errors.New("protected repository source could not be read")
+	}
+	return sandbox.RepositoryCredentialSource(repository, &secret)
 }
 
 func (r *EnvironmentReconciler) reconcileHostedEnvironment(ctx context.Context, environment *agentsv1alpha1.Environment) (ctrl.Result, error) {
@@ -319,8 +340,18 @@ func (r *EnvironmentReconciler) releaseEnvironment(ctx context.Context, environm
 }
 
 const protectedEnvironmentIndex = "spec.openaiHosted.protectedSource"
+const protectedRepositoryIndex = "spec.selfHosted.repositoryCredentialSource"
 
 func (r *EnvironmentReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	if err := mgr.GetFieldIndexer().IndexField(context.Background(), &agentsv1alpha1.Environment{}, protectedRepositoryIndex, func(obj client.Object) []string {
+		environment, ok := obj.(*agentsv1alpha1.Environment)
+		if !ok || environment.Spec.SelfHosted == nil || environment.Spec.SelfHosted.Repository == nil || environment.Spec.SelfHosted.Repository.CredentialSecretRef == nil {
+			return nil
+		}
+		return []string{sandbox.RepositorySecretName}
+	}); err != nil {
+		return err
+	}
 	if err := mgr.GetFieldIndexer().IndexField(context.Background(), &agentsv1alpha1.Environment{}, protectedEnvironmentIndex, func(obj client.Object) []string {
 		environment, ok := obj.(*agentsv1alpha1.Environment)
 		if !ok || !openaiapi.HostedNeedsSecret(environment.Spec.OpenAIHosted) {
@@ -340,10 +371,31 @@ func (r *EnvironmentReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	if err := mgr.Add(protectedCache); err != nil {
 		return err
 	}
+	repositoryCache, err := cache.New(mgr.GetConfig(), cache.Options{Scheme: mgr.GetScheme(), ReaderFailOnMissingInformer: true,
+		ByObject: map[client.Object]cache.ByObject{&corev1.Secret{}: {Field: fields.OneTermEqualSelector("metadata.name", sandbox.RepositorySecretName)}}})
+	if err != nil {
+		return err
+	}
+	if err := mgr.Add(repositoryCache); err != nil {
+		return err
+	}
 	return ctrl.NewControllerManagedBy(mgr).For(&agentsv1alpha1.Environment{}).
 		Watches(&agentsv1alpha1.Session{}, handler.EnqueueRequestsFromMapFunc(sessionEnvironmentRequests)).
 		WatchesRawSource(source.Kind(protectedCache, &corev1.Secret{}, handler.TypedEnqueueRequestsFromMapFunc(r.protectedEnvironmentRequests))).
+		WatchesRawSource(source.Kind(repositoryCache, &corev1.Secret{}, handler.TypedEnqueueRequestsFromMapFunc(r.protectedRepositoryRequests))).
 		Named("environment").Complete(r)
+}
+
+func (r *EnvironmentReconciler) protectedRepositoryRequests(ctx context.Context, secret *corev1.Secret) []reconcile.Request {
+	var environments agentsv1alpha1.EnvironmentList
+	if err := r.List(ctx, &environments, client.InNamespace(secret.Namespace), client.MatchingFields{protectedRepositoryIndex: sandbox.RepositorySecretName}); err != nil {
+		return nil
+	}
+	requests := make([]reconcile.Request, 0, len(environments.Items))
+	for i := range environments.Items {
+		requests = append(requests, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(&environments.Items[i])})
+	}
+	return requests
 }
 
 func (r *EnvironmentReconciler) protectedEnvironmentRequests(ctx context.Context, secret *corev1.Secret) []reconcile.Request {

@@ -14,6 +14,7 @@ import (
 
 	agentsv1alpha1 "github.com/softcane/codex-session-operator/api/v1alpha1"
 	"github.com/softcane/codex-session-operator/internal/openaiapi"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -121,6 +122,10 @@ func (p *simulator) SavedHistory(context.Context, string) (openaiapi.History, er
 	_ = json.Unmarshal(raw, &result)
 	return result, nil
 }
+
+func (p *simulator) ConnectionState(_ context.Context, id string) (openaiapi.HistoryEnvironment, error) {
+	return openaiapi.HistoryEnvironment{ID: id, Type: _selfHostedProviderType, Status: _connectedStatus}, nil
+}
 func (p *simulator) OpenMessageStream(ctx context.Context, _ string) (openaiapi.MessageStream, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -132,6 +137,9 @@ func (p *simulator) OpenMessageStream(ctx context.Context, _ string) (openaiapi.
 func testGateway(t *testing.T, store Storage, p *simulator, objects ...client.Object) (*Gateway, client.Client) {
 	t.Helper()
 	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
 	if err := agentsv1alpha1.AddToScheme(scheme); err != nil {
 		t.Fatal(err)
 	}
@@ -178,7 +186,7 @@ func simulatorForTest() *simulator {
 }
 
 func TestDurableRetryAfterLostAcceptanceAndRestart(t *testing.T) {
-	store, dsn := postgresForTest(t, 32)
+	store, dsn := postgresForTest(t)
 	p := simulatorForTest()
 	p.lose = true
 	g, _ := testGateway(t, store, p, testSession())
@@ -597,25 +605,6 @@ func TestPendingCallIgnoresJSONFormattingAndKeyOrder(t *testing.T) {
 	p.history.Actions[0].Arguments = json.RawMessage(`{"b":3,"a":1}`)
 	if err := g.sync(context.Background(), "uid-1"); err == nil {
 		t.Fatal("actual argument change was allowed")
-	}
-}
-
-func TestLegacyPendingSubmissionKeepsItsPreviouslySentKey(t *testing.T) {
-	store := testStore(t)
-	p := simulatorForTest()
-	g, _ := testGateway(t, store, p, testSession())
-	_ = request(g, http.MethodPost, _testMessagePath, _token, _testLegacy, `{"text":"old pending payload"}`)
-	if err := store.Update(t.Context(), "uid-1", func(r *Record) error { r.Submissions[0].RemoteKey = ""; r.Submissions[0].Attempts = 1; return nil }); err != nil {
-		t.Fatal(err)
-	}
-	// Simulate old gateway delivery committing before losing its response.
-	p.keys[_testLegacy] = string(mustRecord(t, store).Submissions[0].Event)
-	p.commits = 1
-	if err := g.sync(context.Background(), "uid-1"); err != nil {
-		t.Fatal(err)
-	}
-	if p.commits != 1 || mustRecord(t, store).Submissions[0].RemoteKey != _testLegacy {
-		t.Fatal("migration changed an ambiguous submission key")
 	}
 }
 

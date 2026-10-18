@@ -1,5 +1,5 @@
-# Optional direct-Session example. The work gateway creates its own Session;
-# do not apply this file when testing "one event creates one Session".
+# Optional direct-Session example. Profile-based conversations create their own
+# Sessions, so do not apply this file when testing conversation creation.
 apiVersion: agents.softcane.io/v1alpha1
 kind: Session
 metadata:
@@ -12,6 +12,4 @@ spec:
     name: demo-text-v1
   spendControl:
     mode: unlimited
-  workspaceDirectory: /workspace
-# In none mode this path is configuration, not a mounted workspace. First input
-# through POST /sessions/demo-direct-session/messages triggers remote creation.
+# In none mode, first input through the Session message API triggers remote creation.

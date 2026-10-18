@@ -5,4 +5,5 @@ resources:
 - agents_v1alpha1_environment.yaml
 - agents_v1alpha1_vault.yaml
 - agents_v1alpha1_vaultcredential.yaml
+- agents_v1alpha1_profile.yaml
 # +kubebuilder:scaffold:manifestskustomizesamples

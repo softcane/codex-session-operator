@@ -309,7 +309,7 @@ var _ = Describe("Vault and protected credential lifecycle", func() {
 		current.Spec.Metadata = &metadata
 		Expect(k8sClient.Update(ctx, current)).To(Succeed())
 		vr.Client = &interceptClient{Client: k8sClient, beforeStatusPatch: func(obj client.Object) error {
-			return apierrors.NewConflict(schema.GroupResource{Group: agentsv1alpha1.GroupVersion.Group, Resource: "vaults"}, obj.GetName(), errors.New("concurrent metadata claim"))
+			return apierrors.NewConflict(schema.GroupResource{Group: agentsv1alpha1.SchemeGroupVersion.Group, Resource: "vaults"}, obj.GetName(), errors.New("concurrent metadata claim"))
 		}}
 		Expect(apierrors.IsConflict(stepVault())).To(BeTrue())
 		Expect(p.updates).To(BeZero())

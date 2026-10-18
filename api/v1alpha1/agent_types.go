@@ -59,9 +59,8 @@ type AgentSpec struct {
 	// +kubebuilder:validation:MaxItems=64
 	// +listType=atomic
 	Tools *[]AgentTool `json:"tools,omitempty"`
-	// +optional
 	// +kubebuilder:validation:Enum=Delete;Retain
-	DeletionPolicy string `json:"deletionPolicy,omitempty"`
+	DeletionPolicy string `json:"deletionPolicy"`
 }
 
 // AgentReasoning replaces the complete remote reasoning object.
@@ -270,7 +269,7 @@ type AgentStatus struct {
 
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
-// +kubebuilder:validation:XValidation:rule="has(self.spec.deletionPolicy) || (oldSelf.hasValue() && !has(oldSelf.value().spec.deletionPolicy))",message="new Agents require deletionPolicy; an existing policy cannot be removed",optionalOldSelf=true
+// +kubebuilder:validation:XValidation:rule="has(self.spec.deletionPolicy)",message="Agents require deletionPolicy"
 
 // Agent is the Schema for the agents API
 type Agent struct {

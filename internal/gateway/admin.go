@@ -32,8 +32,7 @@ var _ remotePurgeObserver = (*openaiapi.Client)(nil)
 var errRemotePurgeBlocked = errors.New("remote Session absence not proven")
 
 func closedForPurge(record Record) bool {
-	return record.Closed || record.Issue != nil && record.Issue.Cleaned ||
-		record.Work != nil && record.Work.State == _workClosed
+	return record.Closed || record.Work != nil && record.Work.State == _workClosed
 }
 
 func (g *Gateway) handleAdminRecords(w http.ResponseWriter, r *http.Request, parts []string, principal Principal) {
@@ -84,12 +83,8 @@ func (g *Gateway) handleAdminRecords(w http.ResponseWriter, r *http.Request, par
 		writeJSON(w, http.StatusOK, record)
 		return
 	}
-	if record.Issue != nil {
-		http.Error(w, "Issue source replay record cannot be purged", http.StatusConflict)
-		return
-	}
 	if record.Work != nil {
-		http.Error(w, "Work replay record cannot be purged", http.StatusConflict)
+		http.Error(w, "Conversation replay record cannot be purged", http.StatusConflict)
 		return
 	}
 	var session agentsv1alpha1.Session
@@ -125,12 +120,7 @@ func summarizeClosedRecords(records []Record, namespace string) []closedRecordSu
 		if record.Namespace != namespace || !closedForPurge(record) {
 			continue
 		}
-		summary := closedRecordSummary{
-			UID: record.UID, Name: record.Name, Purgeable: record.Issue == nil && record.Work == nil,
-		}
-		if record.Issue != nil {
-			summary.SourceID = record.Issue.ID
-		}
+		summary := closedRecordSummary{UID: record.UID, Name: record.Name, Purgeable: record.Work == nil}
 		if record.Work != nil {
 			summary.SourceID = record.Work.ID
 		}

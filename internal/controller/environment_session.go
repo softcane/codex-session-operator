@@ -21,7 +21,6 @@ import (
 
 // EnvironmentSessionProvider creates either mode with a resolved in-memory request.
 type EnvironmentSessionProvider interface {
-	CreateEnvironmentSession(context.Context, string, string, map[string]any) (openaiapi.Session, error)
 	GetHostedRuntime(context.Context, string) (openaiapi.HostedRuntime, error)
 	GetTemplate(context.Context, string) (openaiapi.Template, error)
 }
@@ -30,10 +29,7 @@ var _ EnvironmentSessionProvider = (*openaiapi.Client)(nil)
 
 func (r *SessionReconciler) resolveEnvironment(ctx context.Context, s *agentsv1alpha1.Session) (*agentsv1alpha1.SessionEnvironmentSnapshot, map[string]any, string, string, error) {
 	if s.Spec.EnvironmentRef == nil {
-		return nil, nil, "", "", nil
-	}
-	if s.Spec.WorkspaceDirectory != "" && s.Spec.WorkspaceDirectory != defaultWorkspace {
-		return nil, nil, invalidConfigurationReason, "Session workspaceDirectory is legacy-only; configure the referenced Environment workspace", nil
+		return nil, nil, invalidConfigurationReason, "Session environmentRef is required", nil
 	}
 	if r.Environments == nil || r.AgentOwnerScope == "" {
 		return nil, nil, "EnvironmentProviderRequired", "Configure the Environment provider and installation/project scope", nil
@@ -54,17 +50,11 @@ func (r *SessionReconciler) resolveEnvironment(ctx context.Context, s *agentsv1a
 	snapshot := &agentsv1alpha1.SessionEnvironmentSnapshot{Name: environment.Name, UID: string(environment.UID), Generation: environment.Generation,
 		OpenAITemplateID: environment.Status.OpenAITemplateID, ConfigurationDigest: environment.Status.ConfigurationDigest, Profile: *profile}
 	if profile.Mode == "selfHosted" {
-		if err := sandbox.ValidateProfile(profile.SelfHosted, append([]string{r.ExecutorImage}, r.ExecutorImages...), r.CapabilityImages, r.WorkspaceStorageClasses); err != nil {
-			return nil, nil, invalidConfigurationReason, err.Error(), nil
+		fields, reason, message, err := r.resolveSelfHostedEnvironment(ctx, s, reader, &environment, profile, snapshot)
+		if reason != "" || err != nil {
+			return nil, nil, reason, message, err
 		}
-		if openaiapi.EnvironmentDigest(*profile, nil) != environment.Status.ConfigurationDigest {
-			return nil, nil, environmentNotReadyReason, "Local profile digest is stale", nil
-		}
-		paths := make([]string, 0, len(profile.SelfHosted.Capabilities))
-		for _, capability := range profile.SelfHosted.Capabilities {
-			paths = append(paths, capability.Path)
-		}
-		return snapshot, map[string]any{_wireType: "self_hosted", "workspace_directory": profile.SelfHosted.WorkspaceDirectory, "capability_directories": paths}, "", "", nil
+		return snapshot, fields, "", "", nil
 	}
 	if profile.Mode == _noneMode && r.Gateway != nil {
 		if openaiapi.EnvironmentDigest(*profile, nil) != environment.Status.ConfigurationDigest {
@@ -100,6 +90,30 @@ func (r *SessionReconciler) resolveEnvironment(ctx context.Context, s *agentsv1a
 	snapshot.SourceVersion = source
 	snapshot.ObservableDigest = openaiapi.ObservableEnvironmentDigest(fields)
 	return snapshot, fields, "", "", nil
+}
+
+func (r *SessionReconciler) resolveSelfHostedEnvironment(ctx context.Context, s *agentsv1alpha1.Session,
+	reader client.Reader, environment *agentsv1alpha1.Environment, profile *agentsv1alpha1.EnvironmentSpec,
+	snapshot *agentsv1alpha1.SessionEnvironmentSnapshot) (map[string]any, string, string, error) {
+	if err := sandbox.ValidateProfile(profile.SelfHosted, r.ExecutorImages, r.CapabilityImages, r.WorkspaceStorageClasses); err != nil {
+		return nil, invalidConfigurationReason, err.Error(), nil
+	}
+	if err := sandbox.ValidateRepositoryApproval(profile.SelfHosted.Repository, r.RepositoryURLs); err != nil {
+		return nil, invalidConfigurationReason, err.Error(), nil
+	}
+	source, err := readRepositorySource(ctx, reader, s.Namespace, profile.SelfHosted.Repository)
+	if err != nil {
+		return nil, "ProtectedSourceUnavailable", "Could not resolve protected repository source", err
+	}
+	if openaiapi.EnvironmentDigest(*profile, source) != environment.Status.ConfigurationDigest || !reflect.DeepEqual(source, environment.Status.SourceVersion) {
+		return nil, environmentNotReadyReason, "Local profile digest is stale", nil
+	}
+	snapshot.SourceVersion = source
+	paths := make([]string, 0, len(profile.SelfHosted.Capabilities))
+	for _, capability := range profile.SelfHosted.Capabilities {
+		paths = append(paths, capability.Path)
+	}
+	return map[string]any{_wireType: "self_hosted", "workspace_directory": profile.SelfHosted.WorkspaceDirectory, "capability_directories": paths}, "", "", nil
 }
 
 func (r *SessionReconciler) trackHosted(ctx context.Context, s *agentsv1alpha1.Session, remote openaiapi.Session, base *agentsv1alpha1.Session) (ctrl.Result, error) {

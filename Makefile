@@ -1,6 +1,8 @@
-IMG ?= controller:latest
+CONTROLLER_IMG ?= controller:latest
+GATEWAY_IMG ?= gateway:latest
 EXECUTOR_IMG ?=
 EXECUTOR_BUILD_IMG ?= codex-executor:0.162.0-alpha.20
+APPLICATION_EXECUTOR_IMG ?= my-go-project-executor:latest
 CONTAINER_TOOL ?= docker
 PLATFORMS ?= linux/amd64,linux/arm64
 export GOTOOLCHAIN ?= $(shell awk '$$1 == "toolchain" {print $$2; exit}' go.mod)
@@ -28,15 +30,17 @@ vet: ## Run go vet.
 	go vet ./...
 
 GO_TEST_FLAGS ?= -race -shuffle=on -count=1
-.PHONY: test test-helpers test-storage-postgres test-e2e demo
+.PHONY: test test-helpers test-storage-postgres test-e2e test-sandbox-live demo
 test: manifests generate fmt vet setup-envtest ## Run Go unit and Kubernetes envtest tests.
 	KUBEBUILDER_ASSETS="$(shell "$(ENVTEST)" use $(ENVTEST_K8S_VERSION) --bin-dir "$(LOCALBIN)" -p path)" go test $(GO_TEST_FLAGS) ./... -coverprofile cover.out
-test-helpers: ## Test the public no-key clients and provider fixture; requires Node.js.
+test-helpers: ## Test deployment helpers and the simulated provider; requires Node.js.
 	python3 -B -m unittest discover -s test/e2e -p 'test_*.py'
 test-storage-postgres: ## Run Go database unit/fault/crash tests against disposable PostgreSQL.
 	python3 -B test/postgres.py
-test-e2e: manifests generate kustomize test-helpers ## Run one isolated Kind suite: conversations and all five CRD lifecycles; no API key.
+test-e2e: manifests generate kustomize test-helpers ## Run one isolated Kind suite: conversations and all six CRD lifecycles; no API key.
 	python3 -B test/e2e/run.py $(E2E_ARGS)
+test-sandbox-live: manifests generate kustomize ## Verify a real repository using restricted OpenAI credentials and a limited budget.
+	python3 -B test/e2e/live.py $(LIVE_ARGS)
 demo: manifests generate kustomize test-helpers ## Run the same no-key suite and keep its successful local playground.
 	python3 -B test/e2e/run.py --keep
 
@@ -57,29 +61,42 @@ dependencies-check: ## Verify checksums and reject module drift.
 	go mod tidy -diff
 
 ##@ Build
-.PHONY: build run docker-build docker-push docker-build-executor docker-buildx
-build: manifests generate fmt vet ## Build manager, gateway and store administration binaries.
+.PHONY: build run docker-build-images docker-build-controller docker-build-gateway docker-push-controller docker-push-gateway docker-build-executor docker-build-application-executor docker-buildx-controller docker-buildx-gateway
+build: manifests generate fmt vet ## Build controller, gateway, administration, client and repository helper binaries.
 	go build -o bin/manager cmd/main.go
 	go build -o bin/gateway ./cmd/gateway
-	go build -o bin/gateway-store ./cmd/gateway-store
+	go build -o bin/gateway-admin ./cmd/gateway-admin
+	go build -o bin/gateway-client ./cmd/gateway-client
+	go build -o bin/workspace-bootstrap ./cmd/workspace-bootstrap
 run: manifests generate fmt vet ## Run the controller locally against the selected kubeconfig.
 	go run ./cmd/main.go
-docker-build: ## Build the operator image containing all three binaries.
-	$(CONTAINER_TOOL) build --target operator $(if $(BASE_IMAGE),--build-arg BASE_IMAGE=$(BASE_IMAGE)) -t $(IMG) .
-docker-push: ## Push the operator image.
-	$(CONTAINER_TOOL) push $(IMG)
+docker-build-images: docker-build-controller docker-build-gateway docker-build-executor ## Build all shared production images.
+docker-build-controller: ## Build the controller-only image.
+	$(CONTAINER_TOOL) build --target controller $(if $(BASE_IMAGE),--build-arg BASE_IMAGE=$(BASE_IMAGE)) -t $(CONTROLLER_IMG) .
+docker-build-gateway: ## Build the gateway service and operational tools image.
+	$(CONTAINER_TOOL) build --target gateway $(if $(BASE_IMAGE),--build-arg BASE_IMAGE=$(BASE_IMAGE)) -t $(GATEWAY_IMG) .
+docker-push-controller: ## Push the controller image.
+	$(CONTAINER_TOOL) push $(CONTROLLER_IMG)
+docker-push-gateway: ## Push the gateway image.
+	$(CONTAINER_TOOL) push $(GATEWAY_IMG)
 docker-build-executor: ## Build the separate executor target from the same Dockerfile.
 	$(CONTAINER_TOOL) build --target executor -t $(or $(EXECUTOR_IMG),$(EXECUTOR_BUILD_IMG)) .
-docker-buildx: ## Build and push the operator image for amd64 and arm64.
-	$(CONTAINER_TOOL) buildx build --target operator --push --platform=$(PLATFORMS) $(if $(BASE_IMAGE),--build-arg BASE_IMAGE=$(BASE_IMAGE)) --tag $(IMG) .
+docker-build-application-executor: docker-build-executor ## Build the my-go-project executor layer with its Go and compiler tools.
+	$(CONTAINER_TOOL) build -f examples/my-go-project/sandbox/Dockerfile.executor --build-arg EXECUTOR_BASE=$(or $(EXECUTOR_IMG),$(EXECUTOR_BUILD_IMG)) -t $(APPLICATION_EXECUTOR_IMG) examples/my-go-project
+docker-buildx-controller: ## Build and push the controller image for amd64 and arm64.
+	$(CONTAINER_TOOL) buildx build --target controller --push --platform=$(PLATFORMS) $(if $(BASE_IMAGE),--build-arg BASE_IMAGE=$(BASE_IMAGE)) --tag $(CONTROLLER_IMG) .
+docker-buildx-gateway: ## Build and push the gateway image for amd64 and arm64.
+	$(CONTAINER_TOOL) buildx build --target gateway --push --platform=$(PLATFORMS) $(if $(BASE_IMAGE),--build-arg BASE_IMAGE=$(BASE_IMAGE)) --tag $(GATEWAY_IMG) .
 
-.PHONY: build-installer build-gateway-installer
-build-installer: manifests generate kustomize ## Render dist/install.yaml without modifying source overlays; optional executor digest.
-	python3 -B hack/render-installer.py --kustomize "$(KUSTOMIZE)" --image "$(IMG)" $(if $(EXECUTOR_IMG),--executor-image "$(EXECUTOR_IMG)") --overlay default --output dist/install.yaml
-build-gateway-installer: manifests generate kustomize ## Render dist/gateway.yaml with operator, gateway and sample work routes; provision PostgreSQL separately.
-	python3 -B hack/render-installer.py --kustomize "$(KUSTOMIZE)" --image "$(IMG)" $(if $(EXECUTOR_IMG),--executor-image "$(EXECUTOR_IMG)") --overlay work --output dist/gateway.yaml
+.PHONY: build-installer
+build-installer: manifests generate kustomize ## Render the combined controller and gateway release manifest.
+	python3 -B hack/render-installer.py --kustomize "$(KUSTOMIZE)" --controller-image "$(CONTROLLER_IMG)" --gateway-image "$(GATEWAY_IMG)" $(if $(EXECUTOR_IMG),--executor-image "$(EXECUTOR_IMG)") --output dist/install.yaml
 
 ##@ Deployment
+.PHONY: local-up
+local-up: manifests generate kustomize ## Start fresh codex-local infrastructure for hands-on real OpenAI use; creates no agent/session CRs.
+	python3 -B hack/local-up.py --kustomize "$(KUSTOMIZE)" $(LOCAL_ARGS)
+
 KUBE_CONTEXT ?=
 ignore-not-found ?= false
 .PHONY: install uninstall deploy undeploy
@@ -92,6 +109,9 @@ uninstall: manifests kustomize ## Delete CRDs from an explicitly selected KUBE_C
 deploy: build-installer ## Deploy dist/install.yaml into an explicitly selected KUBE_CONTEXT.
 	@test -n "$(KUBE_CONTEXT)" || { echo 'Set KUBE_CONTEXT explicitly.' >&2; exit 1; }
 	"$(KUBECTL)" --context "$(KUBE_CONTEXT)" apply -f dist/install.yaml
+	"$(KUBECTL)" --context "$(KUBE_CONTEXT)" wait --for=condition=Established crd/agents.agents.softcane.io crd/environments.agents.softcane.io crd/profiles.agents.softcane.io crd/sessions.agents.softcane.io crd/vaultcredentials.agents.softcane.io crd/vaults.agents.softcane.io --timeout=60s
+	"$(KUBECTL)" --context "$(KUBE_CONTEXT)" rollout status deployment/codex-session-operator-controller-manager --namespace codex-session-operator-system --timeout=5m
+	"$(KUBECTL)" --context "$(KUBE_CONTEXT)" rollout status deployment/codex-session-operator-gateway --namespace codex-session-operator-system --timeout=5m
 undeploy: build-installer ## Remove operator resources from an explicitly selected KUBE_CONTEXT.
 	@test -n "$(KUBE_CONTEXT)" || { echo 'Set KUBE_CONTEXT explicitly.' >&2; exit 1; }
 	"$(KUBECTL)" --context "$(KUBE_CONTEXT)" delete --ignore-not-found=$(ignore-not-found) -f dist/install.yaml

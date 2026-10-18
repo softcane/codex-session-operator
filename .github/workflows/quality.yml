@@ -29,9 +29,28 @@ jobs:
       - name: Test with race detection and randomized order
         run: make test
       - name: Test PostgreSQL durability
+        env:
+          CODEX_TEST_REPORT_DIR: ${{ runner.temp }}/codex-reports
         run: make test-storage-postgres
+      - name: Validate coordinated release bundle
+        run: |
+          make build-installer \
+            CONTROLLER_IMG=registry.invalid/codex-controller:test \
+            GATEWAY_IMG=registry.invalid/codex-gateway:test
+          test "$(grep -c '^kind: Deployment$' dist/install.yaml)" -eq 2
+          ! grep -q '^kind: Job$' dist/install.yaml
+          grep -q 'image: registry.invalid/codex-controller:test' dist/install.yaml
+          test "$(grep -c 'image: registry.invalid/codex-gateway:test' dist/install.yaml)" -eq 1
       - name: Reject generated source drift
         run: git diff --exit-code -- go.mod go.sum api config
+      - name: Retain allowlisted durability evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: postgres-durability-evidence
+          path: ${{ runner.temp }}/codex-reports/codex-storage-pg-*/report.json
+          if-no-files-found: warn
+          retention-days: 14
 
   checks:
     name: Lint and vulnerabilities
@@ -82,6 +101,16 @@ jobs:
           sudo install -m 0755 "$RUNNER_TEMP/kind" /usr/local/bin/kind
           sudo install -m 0755 "$RUNNER_TEMP/kubectl" /usr/local/bin/kubectl
       - name: Run the isolated Kind lifecycle
+        env:
+          CODEX_TEST_REPORT_DIR: ${{ runner.temp }}/codex-reports
         run: make test-e2e
       - name: Reject generated source drift
         run: git diff --exit-code -- go.mod go.sum api config
+      - name: Retain allowlisted simulated acceptance evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: simulated-sandbox-evidence
+          path: ${{ runner.temp }}/codex-reports/codex-e2e-*/public/report.json
+          if-no-files-found: warn
+          retention-days: 14

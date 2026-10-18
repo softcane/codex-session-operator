@@ -168,39 +168,6 @@ func TestScenarioGatewayRejectsWritesToUnreadyRemoteSession(t *testing.T) {
 	}
 }
 
-func TestScenarioGatewayClosedWorkRejectsEveryMutation(t *testing.T) {
-	for _, kind := range []string{_scenarioMessage, _scenarioCancel, _scenarioApproval} {
-		t.Run(kind, func(t *testing.T) {
-			store := testStore(t)
-			p := simulatorForTest()
-			p.history.Actions = []openaiapi.PendingAction{scenarioPendingAction()}
-			session := testSession()
-			session.Annotations = map[string]string{_workAnnotation: "scenario-closed-work"}
-			g, _ := testGateway(t, store, p, session)
-			scenarioRecover(t, g, store, p)
-			if err := store.Update(t.Context(), "scenario-closed-work", func(r *Record) error {
-				r.Namespace = _testNamespace
-				r.Work = &Work{ID: r.UID, State: _workClosing, Attempts: []WorkAttempt{
-					{Number: 1, SessionName: session.Name, SessionUID: string(session.UID),
-						CreationClaimed: true, InitialQueued: true, Policy: session.Spec},
-				}}
-				return nil
-			}); err != nil {
-				t.Fatal(err)
-			}
-			before := mustRecord(t, store)
-			response := scenarioMutation(g, kind)
-			if response.Code != http.StatusGone {
-				t.Fatalf("%s accepted after work close: %d %s", kind, response.Code, response.Body.String())
-			}
-			after := mustRecord(t, store)
-			if !reflect.DeepEqual(before.Actions, after.Actions) || !reflect.DeepEqual(before.Submissions, after.Submissions) {
-				t.Fatal("closed attempt persisted mutation")
-			}
-		})
-	}
-}
-
 func TestScenarioGatewayConsoleDeletionRetainsHistoryAndJoinsStream(t *testing.T) {
 	store := testStore(t)
 	p := simulatorForTest()
@@ -456,7 +423,7 @@ func TestScenarioGatewaySpendVerificationPausesTurnsAndAllowsTargetCancellation(
 		reason string
 		digest string
 	}{
-		{name: "stale limited readiness", mode: _scenarioLimited, reason: "Observed"},
+		{name: "stale limited readiness", mode: _scenarioLimited, reason: _testObservedReason},
 		{name: "unconfirmed unlimited update", mode: _testWorkUnlimited,
 			reason: "SpendControlOutcomeUnknown", digest: "claimed-update"},
 		{name: "unverified unlimited readback", mode: _testWorkUnlimited, reason: "SpendControlUnverified"},
@@ -605,128 +572,5 @@ func TestScenarioGatewayTargetCancellationRechecksCompleteRemoteOwnership(t *tes
 				t.Fatal("targeted cancellation ignored fresh ownership drift", field, err, p.posts)
 			}
 		})
-	}
-}
-
-func TestScenarioGatewayWorkHistorySurvivesMissingOrRecreatedCR(t *testing.T) {
-	for _, recreate := range []bool{false, true} {
-		name := "missing CR"
-		if recreate {
-			name = "different UID at same name"
-		}
-		t.Run(name, func(t *testing.T) {
-			store := testStore(t)
-			g, writer, id := workerWorkGateway(t, store, "selfHosted")
-			if err := g.syncWork(t.Context(), id); err != nil {
-				t.Fatal(err)
-			}
-			record := workerWorkRecord(t, store, id)
-			session := workerWorkSession(t, writer, record)
-			uid := string(session.UID)
-			if err := store.Update(t.Context(), uid, func(r *Record) error {
-				r.History.ID = "retained-history"
-				return nil
-			}); err != nil {
-				t.Fatal(err)
-			}
-			if err := writer.Client.Delete(t.Context(), session); err != nil {
-				t.Fatal(err)
-			}
-			if recreate {
-				session.UID = "foreign-uid"
-				session.ResourceVersion = ""
-				if err := writer.Client.Create(t.Context(), session); err != nil {
-					t.Fatal(err)
-				}
-			}
-			before := workerWorkRecord(t, store, id)
-			response := request(g, http.MethodGet, "/v1/namespaces/team/work/"+id, _token, "", "")
-			if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), "retained-history") ||
-				strings.Contains(response.Body.String(), `"session_url"`) {
-				t.Fatalf("old history lost or foreign CR advertised: %d %s", response.Code, response.Body.String())
-			}
-			if after := workerWorkRecord(t, store, id); !reflect.DeepEqual(before, after) || writer.creates != 1 {
-				t.Fatal("reading history changed work or recreated its Session")
-			}
-			response = request(g, http.MethodGet, "/v1/namespaces/foreign/work/"+id, _token, "", "")
-			if response.Code != http.StatusNotFound || strings.Contains(response.Body.String(), "retained-history") {
-				t.Fatal("work history leaked across namespaces", response.Code)
-			}
-		})
-	}
-}
-
-func TestScenarioGatewayWorkCloseReplayAndRestartSurvivePostgreSQLReopen(t *testing.T) {
-	store, dsn := postgresForTest(t, 32)
-	g, writer, _ := workerWorkGateway(t, store, "selfHosted")
-	// Use HTTP acceptance to exercise the route-scoped receipt index as well as
-	// the worker. The fixture's independent work record remains untouched.
-	input := WorkInput{RouteID: workerWorkRoute().ID, WorkID: "scenario-durable-work",
-		EventID: "scenario-task", Kind: _workTask, Text: "Investigate durable work"}
-	body := string(mustJSON(t, input))
-	first := request(g, http.MethodPost, _workEventPath, _token, "", body)
-	if first.Code != http.StatusAccepted {
-		t.Fatal(first.Code, first.Body.String())
-	}
-	id := workIdentity(_testNamespace, input.RouteID, workerWorkRoute().Source, input.WorkID)
-	writer.workID = id
-	if err := g.syncWork(t.Context(), id); err != nil {
-		t.Fatal(err)
-	}
-	old := workerWorkSession(t, writer, workerWorkRecord(t, store, id))
-	input.EventID, input.Kind, input.Text = "scenario-close", _workClose, ""
-	closeBody := string(mustJSON(t, input))
-	closed := request(g, http.MethodPost, _workEventPath, _token, "", closeBody)
-	if closed.Code != http.StatusAccepted {
-		t.Fatal(closed.Code, closed.Body.String())
-	}
-	for range 2 {
-		if err := g.syncWork(t.Context(), id); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if err := store.Close(); err != nil {
-		t.Fatal(err)
-	}
-	reopened, err := OpenPostgreSQL(t.Context(), PostgreSQLConfig{DSN: dsn, AllowInsecureLocal: true})
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = reopened.Close() })
-	g.store = reopened
-	writer.store = reopened
-	for _, expected := range []struct {
-		body    string
-		receipt string
-	}{
-		{body: body, receipt: first.Body.String()},
-		{body: closeBody, receipt: closed.Body.String()},
-	} {
-		response := request(g, http.MethodPost, _workEventPath, _token, "", expected.body)
-		if response.Code != http.StatusAccepted || response.Body.String() != expected.receipt {
-			t.Fatal("reopen lost original accepted receipt", response.Code, response.Body.String())
-		}
-	}
-	input.EventID, input.Kind, input.Text = "late-task", _workTask, "Late duplicate work"
-	if response := request(g, http.MethodPost, _workEventPath, _token, "", string(mustJSON(t, input))); response.Code != http.StatusConflict {
-		t.Fatal("tombstone did not reject new task", response.Code)
-	}
-	input.EventID, input.Kind, input.Text = "explicit-restart", _workRestart, "Investigate again"
-	if response := request(g, http.MethodPost, _workEventPath, _token, "", string(mustJSON(t, input))); response.Code != http.StatusAccepted {
-		t.Fatal("explicit restart rejected", response.Code, response.Body.String())
-	}
-	if err := g.syncWork(t.Context(), id); err != nil {
-		t.Fatal(err)
-	}
-	current := workerWorkRecord(t, reopened, id)
-	if writer.creates != 2 || len(current.Work.Attempts) != 2 || current.Work.Attempts[1].SessionUID == string(old.UID) {
-		t.Fatal("restart duplicated or adopted prior attempt")
-	}
-	if err := g.workSessionOpen(t.Context(), old); err == nil {
-		t.Fatal("prior attempt accepted direct input after reopen and restart")
-	}
-	var remaining agentsv1alpha1.SessionList
-	if err := writer.List(t.Context(), &remaining, client.InNamespace(_testNamespace)); err != nil || len(remaining.Items) != 1 {
-		t.Fatal("close/restart left an unexpected Session", err, len(remaining.Items))
 	}
 }

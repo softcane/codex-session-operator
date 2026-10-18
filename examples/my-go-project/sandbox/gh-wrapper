@@ -1,0 +1,8 @@
+#!/bin/sh
+set +x
+set -eu
+if [ -r /repository-credentials/token ]; then
+    GH_TOKEN="$(cat /repository-credentials/token)"
+    export GH_TOKEN
+fi
+exec /usr/bin/gh "$@"

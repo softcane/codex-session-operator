@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Run the public conversation and five-CRD lifecycle suite in isolated Kind.
+"""Run public conversations, six-CRD lifecycle and actual sandbox Pods in isolated Kind.
 
 No real API credentials or inference. --keep retains a successful demo for CLI
-and browser inspection; failures and ordinary runs remove only their own cluster.
+inspection; failures and ordinary runs remove only their own cluster.
 """
 
 import argparse
@@ -22,24 +22,32 @@ import urllib.error
 import uuid
 
 import gateway_tls
-from reporting import report_path
+from reporting import report_path, public_report
 
 import support as helpers
-import client as demo_client
 import lifecycle
+import sandbox
+import cli
+import faults
 
 ROOT = helpers.ROOT
 ensure = helpers.ensure
 NS = helpers.NS
 GATEWAY = "codex-session-operator-gateway"
-TAG = "codex-session-manager:demo"
+CONTROLLER_TAG = "codex-session-controller:demo"
+GATEWAY_TAG = "codex-session-gateway:demo"
 FIXTURE_TAG = "codex-provider-fixture:demo"
 
 
 class ReplaySafeAPI:
     """Recover tunnel failures only when a request can keep its replay identity."""
-    def __init__(self, api, attempts=3, retry_delay=0.5):
+    def __init__(self, api, attempts=3, retry_delay=0.5, recover_transport=None):
         self.api, self.attempts, self.retry_delay = api, attempts, retry_delay
+        self.recover_transport = recover_transport
+
+    @property
+    def base(self):
+        return self.api.base
 
     def request(self, path, method="GET", body=None, key=None):
         frozen = None if body is None else json.dumps(body)
@@ -52,7 +60,48 @@ class ReplaySafeAPI:
             except (urllib.error.URLError, OSError):
                 if attempt + 1 == attempts:
                     raise
+                if self.recover_transport is not None:
+                    self.recover_transport()
                 time.sleep(self.retry_delay)
+
+
+def ready_gateway_pod(checks, restart_baseline=None):
+    """Select a healthy current Pod instead of a service's transient rollout target."""
+    deployment = json.loads(checks.kubectl("get", "deployment", GATEWAY, "-n", NS, "-o", "json"))
+    status, metadata = deployment.get("status", {}), deployment["metadata"]
+    replicas = deployment["spec"].get("replicas", 1)
+    if status.get("observedGeneration", 0) < metadata["generation"] or any(
+            status.get(field, 0) != replicas for field in ("updatedReplicas", "readyReplicas", "availableReplicas")):
+        return None
+    labels = deployment["spec"]["selector"]["matchLabels"]
+    ensure(labels, "Gateway Deployment has no Pod selector")
+    selector = ",".join(key + "=" + value for key, value in sorted(labels.items()))
+    pods = json.loads(checks.kubectl("get", "pods", "-n", NS, "-l", selector, "-o", "json"))["items"]
+    active = [pod for pod in pods if not pod["metadata"].get("deletionTimestamp")]
+    baseline = restart_baseline if restart_baseline is not None else {}
+    healthy_names = []
+    for pod in sorted(active, key=lambda value: value["metadata"]["name"]):
+        state = pod.get("status", {})
+        containers = state.get("containerStatuses", [])
+        previous = baseline.get(pod["metadata"]["uid"], {})
+        ensure(not any(container.get("restartCount", 0) > previous[container["name"]]
+                       for container in containers if container["name"] in previous),
+               "Gateway application restarted after healthy observation; refusing to hide it through tunnel recovery")
+        healthy = state.get("phase") == "Running" and any(
+            condition.get("type") == "Ready" and condition.get("status") == "True" for condition in state.get("conditions", []))
+        if healthy and containers and all(
+                container.get("ready") and
+                container.get("state", {}).get("running") for container in containers):
+            healthy_names.append(pod["metadata"]["name"])
+        else:
+            return None
+    if not healthy_names or len(healthy_names) != replicas:
+        return None
+    for pod in active:
+        baseline.setdefault(pod["metadata"]["uid"], {
+            container["name"]: container.get("restartCount", 0)
+            for container in pod["status"]["containerStatuses"]})
+    return healthy_names[0]
 
 
 def replace_gateway_pods(checks):
@@ -99,25 +148,20 @@ def prepare_manual(directory, kubeconfig, token, port):
 
 def test_conversations(checks, api, base, run, evidence, report, replace_gateway, fixture_counts):
     """Exercise public conversation identities against real deployed storage and CRs."""
-    api = ReplaySafeAPI(api)
     vault_name, route_id = "demo-conversation-vault", "demo-conversation"
     checks.apply({"apiVersion": "agents.softcane.io/v1alpha1", "kind": "Vault",
                   "metadata": {"name": vault_name, "namespace": NS},
                   "spec": {"deletionPolicy": "Delete"}})
     vault = checks.wait("conversation Vault Ready", lambda: value if
                        helpers.current_ready(value := checks.get("vault", vault_name)) else None)
-    config = json.loads(checks.kubectl("get", "configmap", "gateway-work-routes", "-n", NS, "-o", "json"))
-    routes = json.loads(config["data"]["routes.json"])
-    routes.append({"id": route_id, "namespace": NS, "source": "manual-conversation",
-                   "agent": "demo-investigator-v1", "environment": "demo-text-v1",
-                   "vaults": [vault_name], "spend_control": {"mode": "unlimited"}})
-    checks.apply({"apiVersion": "v1", "kind": "ConfigMap",
-                  "metadata": {"name": "gateway-work-routes", "namespace": NS},
-                  "data": {"routes.json": json.dumps(routes)}})
+    profile = {"id": route_id, "namespace": NS, "agent": "demo-investigator-v1",
+               "environment": "demo-text-v1", "vaults": [vault_name],
+               "spend_control": {"mode": "unlimited"}}
+    helpers.apply_profile(checks, profile)
     replace_gateway()
     status, catalog = api.request(base + "/catalog")
     ensure(status == 200 and any(route["id"] == route_id and route["ready"]
-                                for route in catalog["work_routes"]), "Configured conversation profile is not ready")
+                                for route in catalog["profiles"]), "Configured conversation profile is not ready")
     counts_before = fixture_counts()
     collection = base + "/conversations"
     text = "CONVERSATION_INITIAL_" + run + ": explain the supplied checkout failure."
@@ -151,7 +195,7 @@ def test_conversations(checks, api, base, run, evidence, report, replace_gateway
 
     def completed(turns, selected=path):
         value = detail(selected)
-        return value if value and demo_client.completed_history(value, turns) else None
+        return value if value and helpers.completed_history(value, turns) else None
 
     initial = checks.wait("conversation initial input produced saved completed history", lambda: completed(1))
     summary = initial["summary"]
@@ -199,7 +243,7 @@ def test_conversations(checks, api, base, run, evidence, report, replace_gateway
            "Conversation message replay accepted changed content")
     second = checks.wait("conversation second saved completed root turn", lambda: completed(2))
     ensure(second["summary"]["session_uid"] == uid, "Follow-up replaced the conversation Session")
-    # A route revision is chosen for a new attempt; existing conversations keep
+    # A Profile revision is chosen for a new attempt; existing conversations keep
     # their frozen Agent/Environment/Vault/spend policy through a gateway restart.
     next_environment = "demo-conversation-text-v2"
     checks.apply({"apiVersion": "agents.softcane.io/v1alpha1", "kind": "Environment",
@@ -207,17 +251,18 @@ def test_conversations(checks, api, base, run, evidence, report, replace_gateway
                   "spec": {"mode": "none", "deletionPolicy": "Delete"}})
     checks.wait("revised conversation Environment Ready", lambda:
                 helpers.current_ready(checks.get("environment", next_environment)))
-    routes[-1] = {**routes[-1], "environment": next_environment, "vaults": []}
-    checks.apply({"apiVersion": "v1", "kind": "ConfigMap",
-                  "metadata": {"name": "gateway-work-routes", "namespace": NS},
-                  "data": {"routes.json": json.dumps(routes)}})
+    profile = {**profile, "environment": next_environment, "vaults": []}
+    helpers.apply_profile(checks, profile)
+    live_catalog = api.request(base + "/catalog")[1]
+    ensure(any(route["id"] == route_id and route["environment"] == next_environment for route in live_catalog["profiles"]),
+           "Live Profile edit required a gateway restart")
     replace_gateway()
     restored = checks.wait("conversation recovered after gateway replacement", lambda: completed(2))
     ensure(restored["summary"]["session_uid"] == uid and
            checks.get("session", name)["status"]["openaiSessionID"] == sid,
            "Gateway replacement changed conversation identity")
     ensure(restored["summary"]["environment"] == "demo-text-v1" and restored["summary"]["vaults"] == [vault_name],
-           "A route revision rewrote the existing conversation policy")
+           "A Profile revision rewrote the existing conversation policy")
     ensure(create() == (202, receipt) and
            api.request(path + "/messages", "POST", followup, message_key) == (202, message_receipt),
            "Gateway replacement lost original conversation acceptance receipts")
@@ -227,16 +272,26 @@ def test_conversations(checks, api, base, run, evidence, report, replace_gateway
            "Conversation retries after process replacement duplicated remote work")
     evidence.write("conversation-after-gateway-replacement.json", restored)
     report["checks"]["conversationFollowupAndGatewayReplacementRecovery"] = True
+    original_profile = checks.get("profile", route_id)
+    checks.kubectl("delete", "profile", route_id, "-n", NS, "--wait=true", "--timeout=90s")
+    checks.wait("retired Profile rejects fresh selection", lambda:
+                api.request(collection, "POST", body, "retired-profile-"+run)[0] == 404)
+    ensure(create() == (202, receipt) and detail()["summary"]["session_uid"] == uid,
+           "Profile retirement changed replay or cascaded its existing Session")
+    helpers.apply_profile(checks, profile)
+    ensure(checks.get("profile", route_id)["metadata"]["uid"] != original_profile["metadata"]["uid"],
+           "Profile recreation did not establish a new identity")
+    report["checks"]["liveProfileEditRetirementRecreationAndFrozenAttempt"] = True
 
     close_key = "conversation-close-" + run
     status, close_receipt = api.request(path + "/close", "POST", {}, close_key)
     ensure(status == 202 and close_receipt["conversation_id"] == conversation_id, "Conversation close was not accepted")
     ensure(api.request(path + "/close", "POST", {}, close_key) == (202, close_receipt), "Close receipt was not stable")
     retained = checks.wait("conversation cleanup retained readable history", lambda: value
-                          if (value := detail()) and demo_client.cleaned_up(value) else None)
+                          if (value := detail()) and helpers.cleaned_up(value) else None)
     ensure(checks.get("session", name) is None and not any(value["id"] == sid for value in fixture_counts()["sessions"]),
            "Closed conversation left local or remote Session running")
-    ensure(demo_client.completed_history(retained, 2), "Conversation close discarded its saved history")
+    ensure(helpers.completed_history(retained, 2), "Conversation close discarded its saved history")
     ensure(api.request(path + "/messages", "POST", {"text": "late input"}, "late-" + run)[0] == 410,
            "Closed conversation accepted fresh input")
     restart_body, restart_key = {"text": "CONVERSATION_RESTART_" + run + ": begin a fresh investigation."}, "conversation-restart-" + run
@@ -270,7 +325,7 @@ def test_conversations(checks, api, base, run, evidence, report, replace_gateway
     ensure(api.request(new_path + "/close", "POST", {}, "conversation-close-new-" + run)[0] == 202,
            "Fresh conversation could not close")
     checks.wait("fresh conversation cleaned", lambda: value if (value := detail(new_path)) and
-                demo_client.cleaned_up(value) else None)
+                helpers.cleaned_up(value) else None)
     ensure(fixture_counts()["sessions"] == [], "Conversation cleanup left remote work running")
     evidence.write("conversation-old-retained.json", old)
     evidence.write("conversation-restart-receipt.json", restarted_receipt)
@@ -291,8 +346,9 @@ def main():
     directory.mkdir(mode=0o700)
     kubeconfig = directory / "kubeconfig"
     token = secrets.token_hex(32)
-    checks = helpers.Checks(kubeconfig, cluster, {"demo-token": token})
-    evidence = helpers.Evidence(directory, [token])
+    other_token = secrets.token_hex(32)
+    checks = helpers.Checks(kubeconfig, cluster, {"demo-token": token, "other-token": other_token})
+    evidence = helpers.Evidence(directory, [token, other_token])
     config = Path.home() / ".kube/config"
     before = config.read_bytes() if config.exists() else None
     existing = checks.run(["kind", "get", "clusters"]).splitlines()
@@ -301,20 +357,26 @@ def main():
               "sourceHashes": helpers.source_hashes(),
               "provider": "simulated Agents API; no real OpenAI inference", "result": "failed"}
     created, forward = False, None
+    forward_logs = []
     crd_before = None
     try:
-        checks.run(["make", "docker-build", "IMG=" + TAG], timeout=1200)
+        checks.run(["go", "build", "-trimpath", "-o", str(ROOT / "bin/gateway-client"), "./cmd/gateway-client"], timeout=180)
+        checks.run(["make", "docker-build-controller", "CONTROLLER_IMG=" + CONTROLLER_TAG], timeout=1200)
+        checks.run(["make", "docker-build-gateway", "GATEWAY_IMG=" + GATEWAY_TAG], timeout=1200)
         checks.run(["docker", "build", "--target", "test-provider", "-t", FIXTURE_TAG, "."])
+        sandbox_fixture = sandbox.prepare(checks, directory, run, evidence)
         created = True
         checks.run(["kind", "create", "cluster", "--name", cluster, "--image", helpers.NODE_IMAGE,
                     "--kubeconfig", str(kubeconfig), "--wait", "120s"])
         kubeconfig.chmod(0o600)
-        checks.run(["kind", "load", "docker-image", TAG, FIXTURE_TAG, "--name", cluster])
+        checks.run(["kind", "load", "docker-image", CONTROLLER_TAG, GATEWAY_TAG, FIXTURE_TAG,
+                    sandbox_fixture["executor"], sandbox_fixture["repository"], "--name", cluster])
         checks.apply({"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": NS,
                       "labels": {"pod-security.kubernetes.io/enforce": "restricted"}}})
         checks.secret("openai-application", {"OPENAI_API_KEY": "fixture-only-no-real-key"})
         checks.secret("gateway-auth", {"principals.json": json.dumps([
-            {"token": token, "subject": "demo-user", "namespace": NS}])})
+            {"token": token, "subject": "demo-user", "namespace": NS},
+            {"token": other_token, "subject": "other-user", "namespace": "profile-scope"}])})
         certificate = gateway_tls.provision(checks, directory)
         (directory / "gateway.key").chmod(0o600)
         evidence.protect([(directory / "gateway.key").read_text()])
@@ -322,17 +384,24 @@ def main():
         evidence.protect([base64.b64decode(internal["data"]["token"]).decode()])
         checks.apply({"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": "provider-fixture", "namespace": NS},
                       "data": {"server.js": (ROOT / "test/e2e/provider.js").read_text()}})
-        checks.secret("gateway-database", {"url": "postgres://postgres@gateway-postgres:5432/postgres?sslmode=disable"})
+        database_url = "postgres://postgres@gateway-postgres:5432/postgres?sslmode=disable"
+        checks.secret("gateway-database", {"url": database_url})
         manifest = checks.run([str(ROOT / "bin/kustomize"), "build", "config/demo"])
         evidence.write("install.yaml", manifest)
         report["images"] = {tag: checks.run(["docker", "image", "inspect", tag, "--format", "{{.Id}}"])
-                            for tag in (TAG, FIXTURE_TAG)}
+                            for tag in (CONTROLLER_TAG, GATEWAY_TAG, FIXTURE_TAG,
+                                        sandbox_fixture["executorBase"], sandbox_fixture["executor"],
+                                        sandbox_fixture["repository"])}
         ensure(helpers.source_hashes() == report["sourceHashes"], "Sources changed during build; rerun acceptance")
         report["manifestSHA256"] = hashlib.sha256(manifest.encode()).hexdigest()
+        # The gateway fails closed when its database is unavailable. Start the
+        # disposable database first instead of relying on container restart timing.
+        checks.kubectl("apply", "-f", "config/demo/postgres.yaml")
+        checks.kubectl("rollout", "status", "deployment/gateway-postgres", "-n", NS, "--timeout=180s")
         checks.kubectl("apply", "-f", "-", data=manifest)
         checks.kubectl("wait", "--for=condition=Established", "crd/agents.agents.softcane.io",
                        "crd/environments.agents.softcane.io", "crd/sessions.agents.softcane.io",
-                       "crd/vaults.agents.softcane.io", "crd/vaultcredentials.agents.softcane.io", "--timeout=60s")
+                       "crd/vaults.agents.softcane.io", "crd/vaultcredentials.agents.softcane.io", "crd/profiles.agents.softcane.io", "--timeout=60s")
         crd_before = lifecycle.crd_hashes(checks)
         report["crdSchemaHashes"] = crd_before
         checks.kubectl("wait", "pod/provider-fixture", "-n", NS, "--for=condition=Ready", "--timeout=90s")
@@ -344,6 +413,12 @@ def main():
             checks.kubectl("apply", "-f", "config/demo/" + filename)
             checks.wait(resource + " Ready", lambda resource=resource, name=name:
                         helpers.current_ready(checks.get(resource, name)))
+        checks.kubectl("apply", "-f", "config/demo/profile.yaml")
+        checks.wait("demo Profile Ready", lambda:
+                    helpers.current_ready(checks.get("profile", "demo-investigation")))
+        demo_profile = {"id": "demo-investigation", "namespace": NS, "agent": "demo-investigator-v1",
+                        "environment": "demo-text-v1", "spend_control": {"mode": "unlimited"}}
+        sandbox_runtime = sandbox.install(checks, sandbox_fixture, evidence)
         checks.kubectl("apply", "--dry-run=server", "-f", "config/demo/session.yaml")
         report["checks"]["yamlAndDirectSessionAdmission"] = True
 
@@ -351,112 +426,77 @@ def main():
             available.bind(("127.0.0.1", 0))
             port = available.getsockname()[1]
         context = ssl.create_default_context(cafile=str(certificate))
-        api = helpers.API(port, token, context)
+        raw_api = helpers.API(port, token, context)
         base = "/v1/namespaces/" + NS
-
-        def start_forward():
-            return helpers.start_forward(checks, port)
+        gateway_restart_baseline = {}
 
         def available_gateway():
             try:
-                return api.request(base + "/catalog")[0] == 200
+                return forward.poll() is None and raw_api.request(base + "/catalog")[0] == 200
             except (OSError, urllib.error.URLError):
                 return False
+
+        def rebind_forward():
+            nonlocal forward
+            stop_forward(forward)
+            forward = None
+            pod = checks.wait("current gateway Pod is healthy after rollout",
+                              lambda: ready_gateway_pod(checks, gateway_restart_baseline), 60)
+            log_path = directory / ("gateway-forward-" + str(len(forward_logs) + 1) + ".log")
+            log = log_path.open("w")
+            log_path.chmod(0o600)
+            forward_logs.append(log)
+            forward = helpers.start_forward(checks, port, pod=pod, log=log)
+            checks.wait("gateway listening through current healthy Pod", available_gateway, 60)
 
         def replace_gateway():
             nonlocal forward
             stop_forward(forward)
             forward = None
             replace_gateway_pods(checks)
-            forward = start_forward()
-            checks.wait("gateway listening after process replacement", available_gateway)
+            rebind_forward()
+
+        api = ReplaySafeAPI(raw_api, recover_transport=rebind_forward)
 
         def fixture_counts():
             return json.loads(checks.kubectl("exec", "pod/provider-fixture", "-n", NS, "--", "node", "-e",
                 "fetch('http://localhost:8080/counts').then(r=>r.json()).then(v=>console.log(JSON.stringify(v)))"))
 
-        def event(filename, **changes):
-            body = json.loads((ROOT / "config/demo" / filename).read_text())
-            body["work_id"] = "smoke-" + run
-            body.update(changes)
-            # Delivery IDs are route-scoped, including across different work IDs.
-            # Leave the checked-in sample identities unused for manual testing.
-            body["event_id"] = "smoke-" + run + "-" + body["event_id"]
-            return api.request(base + "/work-events", "POST", body)
-
-        forward = start_forward()
-        checks.wait("authenticated gateway listening", available_gateway)
+        rebind_forward()
+        gateway_principal = "system:serviceaccount:" + NS + ":codex-session-operator-gateway"
+        for verb, namespace, expected in (("get", NS, "yes"), ("get", "profile-scope", "no"), ("list", NS, "no")):
+            ensure(checks.kubectl("auth", "can-i", verb, "pods", "-n", namespace, "--as=" + gateway_principal,
+                                 allowed=(0, 1)) == expected, "Gateway Pod observation RBAC exceeded or lacked its namespace get-only grant")
+        report["checks"]["gatewayPodObservationNamespaceGetOnly"] = True
+        checks.apply({"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": "profile-scope"}})
+        for kind, name, specification in (
+            ("Agent", "scoped-agent", {"model": "gpt-6-luna", "deletionPolicy": "Delete"}),
+            ("Environment", "scoped-environment", {"mode": "none", "deletionPolicy": "Delete"})):
+            checks.apply({"apiVersion": "agents.softcane.io/v1alpha1", "kind": kind,
+                          "metadata": {"name": name, "namespace": "profile-scope"}, "spec": specification})
+            def scoped_ready(kind=kind, name=name):
+                raw = checks.kubectl("get", kind.lower(), name, "-n", "profile-scope", "-o", "json")
+                return helpers.current_ready(json.loads(raw))
+            checks.wait("other namespace dependency current Ready", scoped_ready, 180)
+        shared_name = demo_profile["id"]
+        helpers.apply_profile(checks, {"id": shared_name, "namespace": "profile-scope", "agent": "scoped-agent",
+            "environment": "scoped-environment", "spend_control": {"mode": "limited", "limitCents": 500}})
+        other_api = helpers.API(port, other_token, context)
+        status, other_catalog = other_api.request("/v1/namespaces/profile-scope/catalog")
+        ensure(status == 200 and any(route["id"] == shared_name and route["agent"] == "scoped-agent" for route in other_catalog["profiles"]),
+               "Same-named Profile did not remain independent in the other namespace")
+        ensure(any(route["id"] == shared_name and route["agent"] == "demo-investigator-v1" for route in api.request(base + "/catalog")[1]["profiles"]),
+               "Other namespace Profile replaced the original selection")
+        ensure(other_api.request(base + "/catalog")[0] == 404, "Profile catalog crossed the authenticated namespace")
+        report["checks"]["sameNamedProfilesRemainNamespaceScoped"] = True
         unauthorized = helpers.API(port, "", context)
-        ensure(unauthorized.request(base + "/work")[0] == 401, "Unauthenticated gateway request was accepted")
-        status, receipt = event("task.json")
-        ensure(status == 202 and receipt["attempt"] == 1, "Task was not durably accepted")
-        path = receipt["work_url"]
-        evidence.write("receipt.json", receipt)
-        ensure(event("task.json") == (202, receipt), "Duplicate task changed its original receipt")
-        ensure(event("task.json", text="changed content")[0] == 409, "Changed duplicate did not conflict")
-
-        def view():
-            status, value = api.request(path)
-            return value if status == 200 else None
-
-        def completed(turn_count, attempt):
-            value = view()
-            if not value or value["summary"]["attempt"] != attempt or not value.get("conversation"):
-                return None
-            turns = value["conversation"]["history"].get("turns") or []
-            return value if len(turns) == turn_count and all(t["status"] == "completed" for t in turns) else None
-
-        initial = checks.wait("task produced one saved completed turn", lambda: completed(1, 1))
-        name, uid, sid = (initial["summary"]["session_name"], initial["summary"]["session_uid"],
-                          initial["status"]["openaiSessionID"])
-        session = checks.get("session", name)
-        ensure(session["spec"]["agentRef"]["name"] == "demo-investigator-v1" and
-               session["spec"]["environmentRef"]["name"] == "demo-text-v1", "Generated Session references differ from route")
-        ensure(not session["status"].get("podName"), "Text-only environment created an executor")
-        sessions = json.loads(checks.kubectl("get", "sessions", "-n", NS, "-o", "json"))["items"]
-        ensure(len(sessions) == 1 and fixture_counts()["creates"] == 1, "Duplicate task created extra Sessions")
-        report["checks"]["authenticationAcceptanceReplayConflictAndOneSession"] = True
-
-        ensure(event("evidence.json")[0] == 202, "Evidence was not accepted")
-        followup = checks.wait("evidence produced a second turn in the same Session", lambda: completed(2, 1))
-        ensure(followup["summary"]["session_uid"] == uid, "Evidence replaced the Session")
-        evidence.write("before-restart.json", followup)
-        replace_gateway()
-        restored = checks.wait("saved conversation recovered", lambda: completed(2, 1))
-        ensure(restored["summary"]["session_uid"] == uid and restored["status"]["openaiSessionID"] == sid,
-               "Gateway restart changed Session identity")
-        ensure(event("task.json") == (202, receipt), "Replay after restart lost the original receipt")
-        counts = fixture_counts()
-        ensure(counts["creates"] == 1 and counts["messageCommits"] == 2, "Gateway restart duplicated remote work")
-        evidence.write("after-restart.json", restored)
-        report["checks"]["sameSessionEvidenceAndGatewayRestartRecovery"] = True
-
-        def closed():
-            value = view()
-            return value if value and value["summary"]["state"] == "closed" and \
-                all(a["cleaned"] for a in value["work"]["attempts"]) else None
-
-        ensure(event("close.json")[0] == 202, "Close was not accepted")
-        retained = checks.wait("Session deleted; work audit retained", closed)
-        ensure(checks.get("session", name) is None and fixture_counts()["sessions"] == [], "Close left a Session running")
-        ensure(len(retained["conversation"]["history"]["turns"]) == 2, "Close lost saved history")
-        ensure(event("task.json") == (202, receipt), "Close lost task replay identity")
-        ensure(event("evidence.json", event_id="late-evidence")[0] == 409, "Closed work accepted new evidence")
-        ensure(event("restart.json")[0] == 202, "Explicit restart was not accepted after cleanup")
-        restarted = checks.wait("explicit restart created attempt two", lambda: completed(1, 2))
-        ensure(restarted["summary"]["session_uid"] != uid and fixture_counts()["creates"] == 2,
-               "Explicit restart did not create a new Session")
-        ensure(event("task.json") == (202, receipt), "New attempt changed the old task receipt")
-        ensure(event("close.json", event_id="close-002")[0] == 202, "Second close was not accepted")
-        retained = checks.wait("second attempt cleaned; both attempts retained", closed)
-        ensure(fixture_counts()["sessions"] == [] and len(retained["work"]["attempts"]) == 2,
-               "Second cleanup or retained attempts are incomplete")
-        evidence.write("closed-work.json", retained)
-        report["checks"]["closureRetainedHistoryAndExplicitNewAttempt"] = True
+        ensure(unauthorized.request(base + "/catalog")[0] == 401, "Unauthenticated gateway request was accepted")
         test_conversations(checks, api, base, run, evidence, report, replace_gateway, fixture_counts)
-        ensure(event("task.json") == (202, receipt), "Conversation flow invalidated the existing Work receipt")
+        cli.run(checks, api, base, directory, token, certificate, report, evidence, run, replace_gateway, fixture_counts)
         evidence.protect(["lifecycle-secret-v1", "lifecycle-secret-v2"])
-        lifecycle.run(checks, ReplaySafeAPI(api), base, report, replace_gateway, fixture_counts)
+        sandbox.run(checks, api, base, report, evidence, sandbox_runtime, replace_gateway, fixture_counts)
+        faults.run(checks, api, base, report, evidence, sandbox_runtime, fixture_counts)
+        lifecycle.run(checks, api, base, report, replace_gateway, fixture_counts)
         ensure(lifecycle.crd_hashes(checks) == crd_before, "Acceptance changed shipped CRD schemas")
         report["checks"]["unchangedShippedCRDSchemas"] = True
         ensure(helpers.source_hashes() == report["sourceHashes"], "Sources changed during acceptance")
@@ -475,12 +515,39 @@ def main():
                 evidence.write(name, checks.kubectl(*command))
             except Exception:
                 report["diagnosticsIncomplete"] = True
+        try:
+            pods = json.loads(checks.kubectl("get", "pods", "-n", NS, "-o", "json"))["items"]
+            for pod in pods:
+                name = pod["metadata"]["name"]
+                if pod["metadata"].get("labels", {}).get("app.kubernetes.io/component") == "gateway":
+                    for previous in (False, True):
+                        if previous and not any(container.get("restartCount", 0) for container in pod.get("status", {}).get("containerStatuses", [])):
+                            continue
+                        try:
+                            command = ["logs", name, "-n", NS, "-c", "gateway"]
+                            if previous:
+                                command.append("--previous")
+                            evidence.write(name + ("-previous" if previous else "") + ".log", checks.kubectl(*command))
+                        except Exception:
+                            report["diagnosticsIncomplete"] = True
+                    continue
+                if not name.startswith("executor-"):
+                    continue
+                for container in ("executor", "repository-prepare"):
+                    try:
+                        evidence.write(name + "-" + container + ".log", checks.kubectl("logs", name, "-n", NS, "-c", container))
+                    except Exception:
+                        report["diagnosticsIncomplete"] = True
+        except Exception:
+            report["diagnosticsIncomplete"] = True
     finally:
         cleanup_errors = []
         try:
             stop_forward(forward)
         except Exception as error:
             cleanup_errors.append("port-forward: " + type(error).__name__)
+        for log in forward_logs:
+            log.close()
         keep = args.keep and report["result"] == "passed" and not cleanup_errors
         if created and not keep:
             try:
@@ -507,14 +574,13 @@ def main():
             report["cleanupErrors"] = cleanup_errors
         report["clusterKept"] = keep
         evidence.write("report.json", report)
+        public_report(directory, report)
     print("Demo", report["result"] + "; report:", directory / "report.json", flush=True)
     if report["result"] == "passed" and report["clusterKept"]:
         prepare_manual(directory, kubeconfig, token, port)
         print("For manual testing: source " + shlex.quote(str(directory / "env.sh")), flush=True)
         print('Then: kubectl -n "$DEMO_NAMESPACE" port-forward --address 127.0.0.1 service/' +
               GATEWAY + ' "$DEMO_PORT:8082"', flush=True)
-        print("UI: https://127.0.0.1:" + str(port) + "/ui", flush=True)
-        print("Use the bearer token from private " + str(directory / "curl.conf") + " in the UI token field.", flush=True)
         print("The disposable HTTPS certificate is self-signed; trust " + str(directory / "gateway.crt") + " for this local demo.", flush=True)
         print("Cleanup: kind delete cluster --name " + cluster, flush=True)
     return 0 if report["result"] == "passed" else 1

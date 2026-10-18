@@ -3,18 +3,22 @@ package sandbox
 import (
 	"errors"
 	"path"
+	"regexp"
 	"slices"
 	"strings"
 
 	agentsv1alpha1 "github.com/softcane/codex-session-operator/api/v1alpha1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
+	"k8s.io/apimachinery/pkg/util/validation"
 )
 
 const (
 	capabilityMountPath  = "/capabilities"
 	capabilityVolumeName = "capabilities"
 )
+
+var capabilityName = regexp.MustCompile(`^[a-z]([a-z0-9-]{0,30}[a-z0-9])?$`)
 
 // ValidateProfile enforces fixed platform security and approved image contracts.
 func ValidateProfile(profile *agentsv1alpha1.SelfHostedEnvironment, executorImages, capabilityImages, storageClasses []string) error {
@@ -37,6 +41,9 @@ func ValidateProfile(profile *agentsv1alpha1.SelfHostedEnvironment, executorImag
 	if err := ValidateWorkspaceStorage(profile.WorkspaceStorage, storageClasses); err != nil {
 		return err
 	}
+	if err := ValidateRepository(profile.Repository); err != nil {
+		return err
+	}
 	if _, err := ProfileResources(profile.Resources); err != nil {
 		return err
 	}
@@ -44,9 +51,19 @@ func ValidateProfile(profile *agentsv1alpha1.SelfHostedEnvironment, executorImag
 		if ValidateImage(capability.Image) != nil || !slices.Contains(capabilityImages, capability.Image) {
 			return errors.New("capability image must be pinned and approved by platform configuration")
 		}
-		if capability.Path != "/capabilities/"+capability.Name || (capability.Type != "plugin" && capability.Type != "skills") {
-			return errors.New("capability path must select its unique registered root")
+		if err := validateCapability(capability); err != nil {
+			return err
 		}
+	}
+	return nil
+}
+
+func validateCapability(capability agentsv1alpha1.LocalCapability) error {
+	if !capabilityName.MatchString(capability.Name) || len(validation.IsDNS1123Label("capability-"+capability.Name)) != 0 {
+		return errors.New("capability name must produce a valid container name")
+	}
+	if capability.Path != "/capabilities/"+capability.Name || (capability.Type != "plugin" && capability.Type != "skills") {
+		return errors.New("capability path must select its unique registered root")
 	}
 	return nil
 }
@@ -54,7 +71,7 @@ func ValidateProfile(profile *agentsv1alpha1.SelfHostedEnvironment, executorImag
 // ValidateWorkspaceStorage requires an approved class and an explicit PVC policy.
 func ValidateWorkspaceStorage(storage *agentsv1alpha1.WorkspaceStorage, storageClasses []string) error {
 	if storage == nil {
-		return nil // Existing Environment profiles keep ephemeral workspaces.
+		return nil // Omission selects an ephemeral workspace.
 	}
 	switch storage.Type {
 	case WorkspaceStorageEphemeral:
@@ -114,6 +131,10 @@ func ApplyProfile(pod *corev1.Pod, profile *agentsv1alpha1.SelfHostedEnvironment
 		return err
 	}
 	pod.Spec.Containers[0].Resources = resources
+	pod.Spec.Containers[0].Env = append(pod.Spec.Containers[0].Env,
+		corev1.EnvVar{Name: "GOCACHE", Value: path.Join(profile.WorkspaceDirectory, ".cache", "go-build")},
+		corev1.EnvVar{Name: "GOMODCACHE", Value: path.Join(profile.WorkspaceDirectory, ".cache", "go-mod")},
+		corev1.EnvVar{Name: "GOPATH", Value: path.Join(profile.WorkspaceDirectory, ".cache", "go")})
 	pod.Spec.NodeSelector = map[string]string{"kubernetes.io/arch": profile.Architecture}
 	size, err := resource.ParseQuantity(profile.WorkspaceSize)
 	if err != nil {
@@ -133,6 +154,9 @@ func ApplyProfile(pod *corev1.Pod, profile *agentsv1alpha1.SelfHostedEnvironment
 	pod.Spec.Volumes = append(pod.Spec.Volumes, corev1.Volume{Name: capabilityVolumeName, VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{SizeLimit: new(resource.MustParse("1Gi"))}}})
 	pod.Spec.Containers[0].VolumeMounts = append(pod.Spec.Containers[0].VolumeMounts, corev1.VolumeMount{Name: capabilityVolumeName, MountPath: capabilityMountPath, ReadOnly: true})
 	for _, capability := range profile.Capabilities {
+		if err := validateCapability(capability); err != nil {
+			return err
+		}
 		// All interpolated path components are constrained by admission and validation.
 		check := "test -d " + capability.Path + "/skills"
 		if capability.Type == "plugin" {

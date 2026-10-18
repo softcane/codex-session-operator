@@ -15,7 +15,7 @@ func TestLimitedSpendPausesMessagesAndQueuedDeliveryUntilCurrentReady(t *testing
 	p := simulatorForTest()
 	session := testSession()
 	session.Generation = 2
-	session.Spec.SpendControl = &agentsv1alpha1.SessionSpendControl{Mode: "limited", LimitCents: func() *int64 { n := int64(100); return &n }()}
+	session.Spec.SpendControl = &agentsv1alpha1.SessionSpendControl{Mode: _scenarioLimited, LimitCents: func() *int64 { n := int64(100); return &n }()}
 	g, k8s := testGateway(t, store, p, session)
 	path := _testMessagePath
 	if got := request(g, http.MethodPost, path, _token, "first", `{"text":"hello"}`).Code; got != http.StatusServiceUnavailable {
@@ -34,7 +34,7 @@ func TestLimitedSpendPausesMessagesAndQueuedDeliveryUntilCurrentReady(t *testing
 	if err := k8s.Get(t.Context(), client.ObjectKeyFromObject(session), &saved); err != nil {
 		t.Fatal(err)
 	}
-	saved.Status.Conditions = []metav1.Condition{{Type: "Ready", Status: metav1.ConditionTrue, Reason: "Observed", Message: "Ready", LastTransitionTime: metav1.Now(), ObservedGeneration: 1}}
+	saved.Status.Conditions = []metav1.Condition{{Type: "Ready", Status: metav1.ConditionTrue, Reason: _testObservedReason, Message: "Ready", LastTransitionTime: metav1.Now(), ObservedGeneration: 1}}
 	if err := k8s.Update(t.Context(), &saved); err != nil {
 		t.Fatal(err)
 	}

@@ -48,7 +48,7 @@ func TestWorkSessionCannotBypassMissingGatewayPolicy(t *testing.T) {
 		WithObjects(environment, session).Build()
 	provider := &sessionProviderStub{}
 	r := &SessionReconciler{Client: k8s, APIReader: k8s, Scheme: scheme, OpenAI: provider,
-		Environments: &environmentProviderStub{}, ExecutorImage: testExecutorImage, AgentOwnerScope: testAgentScope}
+		Environments: &environmentProviderStub{}, ExecutorImages: []string{testExecutorImage}, AgentOwnerScope: testAgentScope}
 	request := reconcile.Request{NamespacedName: client.ObjectKeyFromObject(session)}
 	for range 2 {
 		if _, err := r.Reconcile(context.Background(), request); err != nil {
@@ -60,7 +60,7 @@ func TestWorkSessionCannotBypassMissingGatewayPolicy(t *testing.T) {
 		t.Fatal(err)
 	}
 	condition := meta.FindStatusCondition(observed.Status.Conditions, readyCondition)
-	if condition == nil || condition.Reason != "InvestigationPolicyRequired" ||
+	if condition == nil || condition.Reason != "SessionPolicyRequired" ||
 		observed.Status.CreationAttempted || provider.creates != 0 {
 		t.Fatalf("gateway work created remotely without its policy gate: %+v", observed.Status)
 	}

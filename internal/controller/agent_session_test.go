@@ -9,17 +9,19 @@ import (
 	agentsv1alpha1 "github.com/softcane/codex-session-operator/api/v1alpha1"
 	"github.com/softcane/codex-session-operator/internal/openaiapi"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
 
-var _ = Describe("Legacy Agent-backed Session creation", func() {
-	useLegacySessionSchema()
+var _ = Describe("Agent-backed Session creation", func() {
 	var agent *agentsv1alpha1.Agent
 	var sessions []*agentsv1alpha1.Session
 	var agents *agentProviderStub
+	var environment *agentsv1alpha1.Environment
+	var environments *environmentProviderStub
 	var provider *sessionProviderStub
 	var agentController *AgentReconciler
 	var sessionController *SessionReconciler
@@ -37,7 +39,9 @@ var _ = Describe("Legacy Agent-backed Session creation", func() {
 		return &current
 	}
 	newSession := func(name string) *agentsv1alpha1.Session {
-		s := &agentsv1alpha1.Session{ObjectMeta: metav1.ObjectMeta{GenerateName: "saved-session-", Namespace: testNamespace}, Spec: agentsv1alpha1.SessionSpec{AgentRef: &agentsv1alpha1.AgentReference{Name: name}}}
+		s := &agentsv1alpha1.Session{ObjectMeta: metav1.ObjectMeta{GenerateName: "saved-session-", Namespace: testNamespace}, Spec: agentsv1alpha1.SessionSpec{
+			AgentRef: &agentsv1alpha1.AgentReference{Name: name}, EnvironmentRef: &agentsv1alpha1.AgentReference{Name: environment.Name},
+			SpendControl: &agentsv1alpha1.SessionSpendControl{Mode: spendModeUnlimited}}}
 		Expect(k8sClient.Create(ctx, s)).To(Succeed())
 		sessions = append(sessions, s)
 		return s
@@ -52,9 +56,12 @@ var _ = Describe("Legacy Agent-backed Session creation", func() {
 		agent = &agentsv1alpha1.Agent{ObjectMeta: metav1.ObjectMeta{GenerateName: "saved-agent-", Namespace: testNamespace}, Spec: agentsv1alpha1.AgentSpec{Model: openaiapi.SessionModel, DeletionPolicy: deletePolicy}}
 		Expect(k8sClient.Create(ctx, agent)).To(Succeed())
 		agents = &agentProviderStub{}
-		provider = &sessionProviderStub{agents: agents}
+		provider = &sessionProviderStub{}
+		environment, environments = readyHostedSessionEnvironment(testNamespace)
 		agentController = &AgentReconciler{Client: k8sClient, APIReader: k8sClient, OpenAI: agents, OwnerScope: testAgentScope}
-		sessionController = &SessionReconciler{Client: k8sClient, APIReader: k8sClient, OpenAI: provider, Agents: agents, AgentOwnerScope: testAgentScope}
+		configuration := &dependencyScenarioSessionProvider{configuredSessionStub: configuredSessionStub{lifecycle: provider}, agents: agents}
+		sessionController = &SessionReconciler{Client: k8sClient, APIReader: k8sClient, OpenAI: provider, Agents: agents,
+			Environments: environments, Configuration: configuration, AgentOwnerScope: testAgentScope}
 	})
 	AfterEach(func() {
 		for _, s := range sessions {
@@ -138,7 +145,7 @@ var _ = Describe("Legacy Agent-backed Session creation", func() {
 		Expect(sessionStep(s)).To(Succeed())
 		Expect(sessionStep(s)).To(Succeed())
 		current := read(s)
-		current.Spec.AgentRef = nil
+		current.Spec.AgentRef.Name = "another-agent"
 		Expect(k8sClient.Update(ctx, current)).To(Succeed())
 		Expect(sessionStep(s)).To(Succeed())
 		condition := meta.FindStatusCondition(read(s).Status.Conditions, "ConfigurationCurrent")
@@ -169,8 +176,7 @@ var _ = Describe("Legacy Agent-backed Session creation", func() {
 		provider.onCreate = func() {
 			agents.mu.Lock()
 			defer agents.mu.Unlock()
-			agents.remote.Model = updatedTestModel
-			agents.remote.Config[agentModelField] = updatedTestModel
+			agents.remote.Config["instructions"] = "changed after Session resolution"
 		}
 		Expect(sessionStep(s)).To(Succeed())
 		Expect(sessionStep(s)).To(Succeed())
@@ -183,10 +189,21 @@ var _ = Describe("Legacy Agent-backed Session creation", func() {
 
 // verifyAgentDependencyWatches uses the suite's single registered manager.
 func verifyAgentDependencyWatches(namespace string) {
-
+	environment := &agentsv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{GenerateName: "watch-agent-environment-", Namespace: namespace},
+		Spec: agentsv1alpha1.EnvironmentSpec{Mode: openaiHostedMode, DeletionPolicy: deletePolicy,
+			OpenAIHosted: &agentsv1alpha1.HostedEnvironment{Network: agentsv1alpha1.HostedNetwork{Access: testDisabledNetwork}}}}
+	Expect(k8sClient.Create(ctx, environment)).To(Succeed())
+	Eventually(func() bool {
+		if err := k8sClient.Get(ctx, client.ObjectKeyFromObject(environment), environment); err != nil {
+			return false
+		}
+		return meta.IsStatusConditionTrue(environment.Status.Conditions, readyCondition)
+	}, 10*time.Second, 20*time.Millisecond).Should(BeTrue())
 	agent := &agentsv1alpha1.Agent{ObjectMeta: metav1.ObjectMeta{GenerateName: "watch-agent-", Namespace: namespace}, Spec: agentsv1alpha1.AgentSpec{Model: openaiapi.SessionModel, DeletionPolicy: deletePolicy}}
 	Expect(k8sClient.Create(ctx, agent)).To(Succeed())
-	session := &agentsv1alpha1.Session{ObjectMeta: metav1.ObjectMeta{GenerateName: "watch-session-", Namespace: namespace}, Spec: agentsv1alpha1.SessionSpec{AgentRef: &agentsv1alpha1.AgentReference{Name: agent.Name}}}
+	session := &agentsv1alpha1.Session{ObjectMeta: metav1.ObjectMeta{GenerateName: "watch-session-", Namespace: namespace}, Spec: agentsv1alpha1.SessionSpec{
+		AgentRef: &agentsv1alpha1.AgentReference{Name: agent.Name}, EnvironmentRef: &agentsv1alpha1.AgentReference{Name: environment.Name},
+		SpendControl: &agentsv1alpha1.SessionSpendControl{Mode: spendModeUnlimited}}}
 	Expect(k8sClient.Create(ctx, session)).To(Succeed())
 	Eventually(func() string {
 		var current agentsv1alpha1.Session
@@ -211,6 +228,10 @@ func verifyAgentDependencyWatches(namespace string) {
 	Eventually(func() bool {
 		var current agentsv1alpha1.Agent
 		return client.IgnoreNotFound(k8sClient.Get(ctx, client.ObjectKeyFromObject(agent), &current)) == nil && current.Name == ""
+	}, 5*time.Second, 20*time.Millisecond).Should(BeTrue())
+	Expect(k8sClient.Delete(ctx, environment)).To(Succeed())
+	Eventually(func() bool {
+		return apierrors.IsNotFound(k8sClient.Get(ctx, client.ObjectKeyFromObject(environment), &agentsv1alpha1.Environment{}))
 	}, 5*time.Second, 20*time.Millisecond).Should(BeTrue())
 }
 

@@ -1,30 +1,26 @@
 package gateway
 
 import (
-	"errors"
 	"time"
 
 	agentsv1alpha1 "github.com/softcane/codex-session-operator/api/v1alpha1"
 )
 
 const (
-	_workAnnotation  = "agents.softcane.io/work-source"
-	_workOpen        = "open"
-	_workClosing     = "closing"
-	_workClosed      = "closed"
-	_workTask        = "task"
-	_workEvidence    = "evidence"
-	_workClose       = "close"
-	_workRestart     = "restart"
-	_maxWorkRoutes   = 256
-	_maxWorkAttempts = 16
+	_workAnnotation         = "agents.softcane.io/work-source"
+	_workOpen               = "open"
+	_workClosing            = "closing"
+	_workClosed             = "closed"
+	_workTask               = "task"
+	_workEvidence           = "evidence"
+	_workClose              = "close"
+	_workRestart            = "restart"
+	_conversationRecordKind = "conversation"
+	_maxWorkAttempts        = 16
 )
 
-var errWorkMissing = errors.New("work is not registered")
-
-// WorkRoute binds trusted source routing to a tested Agent/Environment pair.
-// Incoming events cannot select namespaces, runtime images, or Session overrides.
-type WorkRoute struct {
+// profileRoute carries policy resolved from an authoritative Profile CR.
+type profileRoute struct {
 	ID           string                              `json:"id"`
 	Namespace    string                              `json:"namespace"`
 	Source       string                              `json:"source"`
@@ -34,13 +30,10 @@ type WorkRoute struct {
 	SpendControl *agentsv1alpha1.SessionSpendControl `json:"spend_control"`
 }
 
-// WorkInput is the normalized connector/UI event. Route configuration owns policy.
-type WorkInput struct {
-	RouteID string `json:"route_id"`
-	WorkID  string `json:"work_id"`
-	EventID string `json:"event_id"`
-	Kind    string `json:"kind"`
-	Text    string `json:"text,omitempty"`
+// conversationMutation is an internal conversation lifecycle event.
+type conversationMutation struct {
+	WorkID string
+	Kind   string
 }
 
 // WorkEvent retains the canonical delivery identity and exact accepted input.
@@ -56,6 +49,7 @@ type WorkEvent struct {
 
 // WorkAttempt freezes selection and ownership before any Kubernetes create.
 type WorkAttempt struct {
+	Profile         *ProfileProvenance         `json:"profile,omitempty"`
 	Number          int                        `json:"number"`
 	ConversationID  string                     `json:"conversation_id,omitempty"`
 	SessionName     string                     `json:"session_name"`
@@ -77,7 +71,7 @@ type ConversationOrigin struct {
 	Title   string `json:"title,omitempty"`
 }
 
-// Work is application data and a replay tombstone; it is never stored in a CRD.
+// Work is durable conversation lifecycle data and a replay tombstone.
 type Work struct {
 	Conversation *ConversationOrigin `json:"conversation,omitempty"`
 	ID           string              `json:"id"`

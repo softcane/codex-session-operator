@@ -22,6 +22,9 @@ resources:
 # default, aiding admins in cluster management. Those roles are
 # not used by the codex-session-operator itself. You can comment the following lines
 # if you do not want those helpers be installed with your Project.
+- profile_admin_role.yaml
+- profile_editor_role.yaml
+- profile_viewer_role.yaml
 - vaultcredential_admin_role.yaml
 - vaultcredential_editor_role.yaml
 - vaultcredential_viewer_role.yaml
@@ -37,4 +40,3 @@ resources:
 - session_admin_role.yaml
 - session_editor_role.yaml
 - session_viewer_role.yaml
-

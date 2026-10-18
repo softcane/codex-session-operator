@@ -1,4 +1,8 @@
-"""Five current CRD lifecycle scenarios within the runner's already-owned cluster."""
+"""Current CRD lifecycle scenarios within the runner's already-owned cluster.
+
+Profile creation/edit/retirement/recreation and namespace independence are covered
+by run.py; all six shipped schemas are fingerprinted here.
+"""
 
 import hashlib
 import json
@@ -28,7 +32,7 @@ def projection(obj):
 def crd_hashes(checks):
     return {name: hashlib.sha256(checks.kubectl("get", "crd", name + ".agents.softcane.io",
             "-o", "jsonpath={.spec.versions}").encode()).hexdigest()
-            for name in ("agents", "environments", "sessions", "vaults", "vaultcredentials")}
+            for name in ("agents", "environments", "sessions", "vaults", "vaultcredentials", "profiles")}
 
 
 def run(checks, api, base, report, replace_gateway, fixture_counts):
@@ -74,7 +78,7 @@ def run(checks, api, base, report, replace_gateway, fixture_counts):
         print("Scenario passed:", identifier, flush=True)
 
     session_spec = {"agentRef": {"name": "later-agent"}, "environmentRef": {"name": "later-env"},
-                    "spendControl": {"mode": "unlimited"}, "workspaceDirectory": "/workspace"}
+                    "spendControl": {"mode": "unlimited"}}
     apply("Session", "late-session", session_spec)
     held = reason("Session", "late-session", "EnvironmentNotReady")
     ensure(not held.get("status", {}).get("creationAttempted") and counts()["creates"] == 0,

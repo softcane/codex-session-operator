@@ -21,8 +21,8 @@ type SessionGateway interface {
 	Quiesce(context.Context, string, string) error
 }
 
-type investigationPolicy interface {
-	ValidateInvestigation(context.Context, *agentsv1alpha1.Session, *agentsv1alpha1.SessionEnvironmentSnapshot) error
+type sessionPolicy interface {
+	ValidateSessionPolicy(context.Context, *agentsv1alpha1.Session, *agentsv1alpha1.SessionEnvironmentSnapshot) error
 }
 
 // InitialSessionProvider combines none-mode creation and first input in one POST.

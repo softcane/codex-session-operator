@@ -327,7 +327,9 @@ func TestSavedAgentSessionWireContract(t *testing.T) {
 		_ = json.NewEncoder(w).Encode(response)
 	}))
 	defer server.Close()
-	remote, err := clientForServer(server, nil).CreateAgentSession(context.Background(), "uid-test", testWorkspace, agentTestID)
+	spend := &agentsv1alpha1.SessionSpendControl{Mode: sessionSpendModeUnlimited}
+	remote, err := clientForServer(server, nil).CreateConfiguredSession(context.Background(), "uid-test", agentTestScope,
+		agentTestID, map[string]any{typeField: selfHostedType, workspaceDirectoryField: testWorkspace}, nil, nil, nil, spend)
 	if err != nil || remote.AgentID != agentTestID || remote.Model != "gpt-6-astra" {
 		t.Fatalf("Agent Session failed: %v", err)
 	}

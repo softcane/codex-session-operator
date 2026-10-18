@@ -1,13 +1,11 @@
 package gateway
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"io"
 	"os"
 	"reflect"
 	"strconv"
@@ -15,82 +13,10 @@ import (
 	"time"
 
 	agentsv1alpha1 "github.com/softcane/codex-session-operator/api/v1alpha1"
-	"github.com/softcane/codex-session-operator/internal/openaiapi"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/util/validation"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
-
-// ParseWorkRoutes rejects unsupported fields and incomplete trusted policy.
-// Routes contain references rather than credentials or task-provided overrides.
-func ParseWorkRoutes(raw []byte) ([]WorkRoute, error) {
-	if len(raw) > _maxInputBytes {
-		return nil, errors.New("work route configuration exceeds limit")
-	}
-	decoder := json.NewDecoder(bytes.NewReader(raw))
-	decoder.DisallowUnknownFields()
-	var routes []WorkRoute
-	if decoder.Decode(&routes) != nil {
-		return nil, errors.New("invalid work route configuration")
-	}
-	var trailing any
-	if !errors.Is(decoder.Decode(&trailing), io.EOF) {
-		return nil, errors.New("invalid work route configuration")
-	}
-	if _, err := copyWorkRoutes(routes); err != nil {
-		return nil, err
-	}
-	return routes, nil
-}
-
-// EnableWork is startup configuration. It retains an isolated copy of each route.
-func (g *Gateway) EnableWork(writer client.Client, routes []WorkRoute) error {
-	if writer == nil {
-		return errors.New("work Session writer required")
-	}
-	copied, err := copyWorkRoutes(routes)
-	if err != nil {
-		return err
-	}
-	if g.sessionWriter == nil {
-		g.sessionWriter = writer
-	}
-	g.workRoutes = copied
-	return nil
-}
-
-func copyWorkRoutes(routes []WorkRoute) (map[string]WorkRoute, error) {
-	if len(routes) == 0 || len(routes) > _maxWorkRoutes {
-		return nil, errors.New("work configuration requires 1–256 routes")
-	}
-	copied := make(map[string]WorkRoute, len(routes))
-	for _, route := range routes {
-		if !validWorkIdentifier(route.ID) || !validWorkIdentifier(route.Source) ||
-			len(validation.IsDNS1123Label(route.Namespace)) != 0 ||
-			len(validation.IsDNS1123Subdomain(route.Agent)) != 0 ||
-			len(validation.IsDNS1123Subdomain(route.Environment)) != 0 || len(route.Vaults) > 16 {
-			return nil, errors.New("invalid work route configuration")
-		}
-		if _, present, err := openaiapi.SessionSpendControlField(route.SpendControl); err != nil || !present {
-			return nil, errors.New("work route requires a valid explicit spend choice")
-		}
-		if _, exists := copied[route.ID]; exists {
-			return nil, errors.New("duplicate work route")
-		}
-		vaults := make(map[string]bool, len(route.Vaults))
-		for _, name := range route.Vaults {
-			if len(validation.IsDNS1123Subdomain(name)) != 0 || vaults[name] {
-				return nil, errors.New("invalid work Vault reference")
-			}
-			vaults[name] = true
-		}
-		route.Vaults = append([]string(nil), route.Vaults...)
-		route.SpendControl = route.SpendControl.DeepCopy()
-		copied[route.ID] = route
-	}
-	return copied, nil
-}
 
 func validWorkIdentifier(value string) bool {
 	if len(value) == 0 || len(value) > 256 {
@@ -105,27 +31,18 @@ func validWorkIdentifier(value string) bool {
 	return true
 }
 
-func workIdentity(namespace, routeID, source, externalID string) string {
-	// Length-delimited JSON avoids collisions between arbitrary external IDs and
-	// routing components. Only the opaque digest crosses into Kubernetes metadata.
-	raw, _ := json.Marshal([4]string{namespace, routeID, source, externalID})
-	sum := sha256.Sum256(raw)
-	return "work-" + hex.EncodeToString(sum[:])
-}
-
 func workSessionName(id string, attempt int) string {
 	sum := sha256.Sum256([]byte(id))
 	return "work-" + hex.EncodeToString(sum[:20]) + "-a" + strconv.Itoa(attempt)
 }
 
-func workPolicy(route WorkRoute, id string, attempt int) agentsv1alpha1.SessionSpec {
+func workPolicy(route profileRoute, id string, attempt int) agentsv1alpha1.SessionSpec {
 	metadata := map[string]string{"work_id": id, "work_attempt": strconv.Itoa(attempt)}
 	policy := agentsv1alpha1.SessionSpec{
-		AgentRef:           &agentsv1alpha1.AgentReference{Name: route.Agent},
-		EnvironmentRef:     &agentsv1alpha1.AgentReference{Name: route.Environment},
-		WorkspaceDirectory: "/workspace",
-		SpendControl:       route.SpendControl.DeepCopy(),
-		Metadata:           &metadata,
+		AgentRef:       &agentsv1alpha1.AgentReference{Name: route.Agent},
+		EnvironmentRef: &agentsv1alpha1.AgentReference{Name: route.Environment},
+		SpendControl:   route.SpendControl.DeepCopy(),
+		Metadata:       &metadata,
 	}
 	for _, name := range route.Vaults {
 		policy.VaultRefs = append(policy.VaultRefs, agentsv1alpha1.AgentReference{Name: name})
@@ -326,7 +243,7 @@ func (g *Gateway) workRecord(ctx context.Context, session *agentsv1alpha1.Sessio
 		record, err := g.store.Get(ctx, id)
 		return record, true, err
 	}
-	records, err := g.recordSummaries(ctx, session.Namespace, _workSegment)
+	records, err := g.recordSummaries(ctx, session.Namespace, _conversationRecordKind)
 	if err != nil {
 		return Record{}, false, err
 	}
@@ -373,5 +290,8 @@ func (g *Gateway) validateWorkSession(ctx context.Context, session *agentsv1alph
 		environment.Name != attempt.Policy.EnvironmentRef.Name || !session.DeletionTimestamp.IsZero() {
 		return errors.New("work Session requires its selected Environment and bound identity")
 	}
-	return checkWorkOwnership(record, attempt, session)
+	if err := checkWorkOwnership(record, attempt, session); err != nil {
+		return err
+	}
+	return g.validateProfileDependencies(ctx, session, environment, attempt.Profile)
 }

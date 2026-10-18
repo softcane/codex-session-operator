@@ -1,0 +1,12 @@
+apiVersion: agents.softcane.io/v1alpha1
+kind: Profile
+metadata:
+  name: sandbox
+spec:
+  agentRef:
+    name: agent-sample
+  environmentRef:
+    name: environment-sample
+  spendControl:
+    mode: limited
+    limitCents: 500

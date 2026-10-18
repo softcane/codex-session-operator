@@ -61,11 +61,13 @@ func (g *Gateway) startShared(ctx context.Context, store DeliveryStorage) error 
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
 	for ctx.Err() == nil {
+		// Garbage collection remains safe while restore holds prevent delivery.
+		g.maintainStore(ctx)
 		view, release, err := store.ClaimWorker(ctx)
 		if err == nil {
 			worker := &Gateway{store: view, reader: g.reader, provider: g.provider, principals: g.principals,
-				functions: g.functions, issueWriter: g.issueWriter, sessionWriter: g.sessionWriter,
-				issueRoutes: g.issueRoutes, workRoutes: g.workRoutes, gates: g.gates,
+				functions: g.functions, sessionWriter: g.sessionWriter,
+				profiles: g.profiles, gates: g.gates,
 				watches: make(map[string]*watch), metrics: g.metricState()}
 			workerCtx, cancel := context.WithCancel(ctx)
 			joined := make(chan struct{})

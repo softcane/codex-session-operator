@@ -40,7 +40,7 @@ func TestGatewayListenersOnlyNegotiateHTTP1(t *testing.T) {
 	}
 	directory := t.TempDir()
 	certFile, keyFile := filepath.Join(directory, "tls.crt"), filepath.Join(directory, "tls.key")
-	if err := os.WriteFile(certFile, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certificate.Certificate[0]}), 0600); err != nil {
+	if err := os.WriteFile(certFile, pem.EncodeToMemory(&pem.Block{Type: _certificatePEMType, Bytes: certificate.Certificate[0]}), 0600); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(keyFile, pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: key}), 0600); err != nil {
@@ -259,8 +259,8 @@ func TestEventStreamsLeaveMessageCapacity(t *testing.T) {
 		"streams-still-allow-messages", _testFirstMessageBody); response.Code != http.StatusAccepted {
 		t.Fatalf("event streams prevented a normal message: HTTP %d", response.Code)
 	}
-	if response := request(g, http.MethodGet, "/ui/", "", "", ""); response.Code != http.StatusOK {
-		t.Fatalf("event streams prevented opening the UI: HTTP %d", response.Code)
+	if response := request(g, http.MethodGet, "/v1/namespaces/team/catalog", _token, "", ""); response.Code != http.StatusOK {
+		t.Fatalf("event streams prevented reading the catalog: HTTP %d", response.Code)
 	}
 }
 
@@ -291,5 +291,20 @@ func TestEventStreamQuotaSharesRotatedTokensAndReleasesOnCancel(t *testing.T) {
 	stopFirst()
 	if code, _ := openTestEvents(t, g, rotatedToken); code != http.StatusOK {
 		t.Fatalf("canceled stream retained its quota: HTTP %d", code)
+	}
+}
+
+func TestRemovedWorkAndIssueIngressRoutesAreNotServed(t *testing.T) {
+	g, _ := testGateway(t, testStore(t), simulatorForTest(), testSession())
+	for _, path := range []string{
+		"/v1/namespaces/team/work-events",
+		"/v1/namespaces/team/work",
+		"/v1/namespaces/team/work/old-id",
+		"/v1/issue-events/github/old-route",
+	} {
+		response := request(g, http.MethodPost, path, _token, "removed-route", `{}`)
+		if response.Code != http.StatusNotFound {
+			t.Fatalf("removed route %s returned %d", path, response.Code)
+		}
 	}
 }

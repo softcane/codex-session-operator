@@ -157,13 +157,6 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Gateway capacity reached", http.StatusServiceUnavailable)
 		return
 	}
-	if g.serveUI(w, r, parts) {
-		return
-	}
-	if len(parts) == 4 && parts[0] == "v1" && parts[1] == "issue-events" && parts[2] == "github" {
-		g.handleIssueEvent(w, r, parts[3])
-		return
-	}
 	principal, ok := g.authenticate(r)
 	if !ok {
 		http.Error(w, "Authentication required", http.StatusUnauthorized)
@@ -176,34 +169,16 @@ func (g *Gateway) serveAuthenticated(w http.ResponseWriter, r *http.Request, par
 	if g.serveConversations(w, r, parts, principal) {
 		return
 	}
-	if len(parts) == 4 && parts[0] == "v1" && parts[1] == _namespacesSegment && parts[2] == principal.Namespace {
-		switch parts[3] {
-		case "catalog":
-			g.handleCatalog(w, r, principal)
-			return
-		case _sessionsSegment:
-			g.handleSessionCollection(w, r, principal)
-			return
-		case _recordsSegment:
-			g.handleAdminRecords(w, r, parts, principal)
-			return
-		case "work-events":
-			g.handleWorkEvents(w, r, principal)
-			return
-		case _workSegment:
-			g.handleWorkCollection(w, r, principal)
-			return
-		}
+	if g.serveNamespaceCollection(w, r, parts, principal) {
+		return
 	}
-	if g.serveWorkDetail(w, r, parts, principal) {
+	if len(parts) == 5 && parts[0] == "v1" && parts[1] == _namespacesSegment &&
+		parts[2] == principal.Namespace && parts[3] == _profilesSegment {
+		g.handleProfiles(w, r, parts, principal)
 		return
 	}
 	if len(parts) == 5 && parts[0] == "v1" && parts[1] == _namespacesSegment && parts[2] == principal.Namespace && parts[3] == _recordsSegment {
 		g.handleAdminRecords(w, r, parts, principal)
-		return
-	}
-	if len(parts) >= 5 && parts[0] == "v1" && parts[1] == _namespacesSegment && parts[2] == principal.Namespace && parts[3] == "sources" {
-		g.handleSource(w, r, parts, principal)
 		return
 	}
 	if len(parts) < 5 || len(parts) > 7 || parts[0] != "v1" || parts[1] != _namespacesSegment || parts[3] != _sessionsSegment || parts[2] != principal.Namespace {
@@ -213,13 +188,36 @@ func (g *Gateway) serveAuthenticated(w http.ResponseWriter, r *http.Request, par
 	g.serveSession(w, r, parts, principal)
 }
 
-func (g *Gateway) serveWorkDetail(w http.ResponseWriter, r *http.Request, parts []string, principal Principal) bool {
-	if len(parts) != 5 || parts[0] != "v1" || parts[1] != _namespacesSegment ||
-		parts[2] != principal.Namespace || parts[3] != _workSegment {
+func (g *Gateway) serveNamespaceCollection(w http.ResponseWriter, r *http.Request, parts []string, principal Principal) bool {
+	if len(parts) != 4 || parts[0] != "v1" || parts[1] != _namespacesSegment || parts[2] != principal.Namespace {
 		return false
 	}
-	g.handleWork(w, r, parts, principal)
-	return true
+	switch parts[3] {
+	case _identitySegment:
+		g.handleIdentity(w, r, principal)
+		return true
+	case "catalog":
+		g.handleCatalog(w, r, principal)
+		return true
+	case _profilesSegment:
+		g.handleProfiles(w, r, parts, principal)
+		return true
+	case _sessionsSegment:
+		g.handleSessionCollection(w, r, principal)
+		return true
+	case _recordsSegment:
+		g.handleAdminRecords(w, r, parts, principal)
+		return true
+	}
+	return false
+}
+
+func (g *Gateway) handleIdentity(w http.ResponseWriter, r *http.Request, principal Principal) {
+	if r.Method != http.MethodGet {
+		methodError(w)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{_callerSubjectField: principal.Subject, "namespace": principal.Namespace})
 }
 
 func (g *Gateway) serveSession(w http.ResponseWriter, r *http.Request, parts []string, principal Principal) {
@@ -298,7 +296,7 @@ func (g *Gateway) handleMessage(w http.ResponseWriter, r *http.Request, session 
 		return
 	}
 	key := r.Header.Get("Idempotency-Key")
-	if !validKey(key) || key == _issueInitialKey {
+	if !validKey(key) {
 		http.Error(w, "Idempotency-Key required (1–128 ASCII key characters)", http.StatusBadRequest)
 		return
 	}
@@ -466,10 +464,7 @@ func (g *Gateway) currentInputSession(ctx context.Context, session *agentsv1alph
 	return &current, nil
 }
 
-func (g *Gateway) sessionInputOpen(ctx context.Context, session *agentsv1alpha1.Session) error {
-	if err := g.investigationOpen(ctx, session); err != nil {
-		return err
-	}
+func (g *Gateway) sessionInputOpen(_ context.Context, session *agentsv1alpha1.Session) error {
 	condition := meta.FindStatusCondition(session.Status.Conditions, _readyCondition)
 	if condition == nil || condition.Status != metav1.ConditionFalse {
 		return nil
@@ -477,7 +472,7 @@ func (g *Gateway) sessionInputOpen(ctx context.Context, session *agentsv1alpha1.
 	// These observations make delivery unsafe even with unlimited spend. A
 	// connecting runtime or temporary observation outage retains durable queuing.
 	switch condition.Reason {
-	case "RemoteSessionMissing", "OwnershipMismatch", "ConfigurationMismatch",
+	case _remoteSessionMissingReason, "OwnershipMismatch", "ConfigurationMismatch",
 		"InvalidConfiguration", "RemoteSessionFailed",
 		"InvalidRemoteSession", "HostedSetupFailed":
 		return errUnavailable
@@ -489,7 +484,7 @@ func (g *Gateway) sessionInputOpen(ctx context.Context, session *agentsv1alpha1.
 func confirmedMissingRemote(session *agentsv1alpha1.Session) bool {
 	condition := meta.FindStatusCondition(session.Status.Conditions, _readyCondition)
 	return session.Status.OpenAISessionID != "" && condition != nil &&
-		condition.Status == metav1.ConditionFalse && condition.Reason == "RemoteSessionMissing" &&
+		condition.Status == metav1.ConditionFalse && condition.Reason == _remoteSessionMissingReason &&
 		condition.ObservedGeneration == session.Generation
 }
 
@@ -498,6 +493,13 @@ func (g *Gateway) enqueue(ctx context.Context, session *agentsv1alpha1.Session, 
 		// Initial classification is retained when an HTTP retry arrives after creation.
 		for _, submission := range r.Submissions {
 			if submission.Key == key {
+				if r.Archived && submission.ReplayDigest != "" {
+					candidate := Submission{Text: text, TargetTurn: targetTurn, Event: event}
+					if submissionDigest(candidate) != submission.ReplayDigest {
+						return errConflict
+					}
+					return nil
+				}
 				if submission.Text != text || submission.TargetTurn != targetTurn {
 					return errConflict
 				}

@@ -22,7 +22,8 @@ def main():
     directory.mkdir(mode=0o700)
     report = {"container": name, "databaseImage": IMAGE, "checks": {},
               "sourceHashes": {str(p.relative_to(ROOT)): hashlib.sha256(p.read_bytes()).hexdigest()
-                               for p in sorted((ROOT / "internal/gateway").rglob("*.go"))},
+                               for pattern in ("*.go", "*.sql")
+                               for p in sorted((ROOT / "internal/gateway").rglob(pattern))},
               "notTested": ["power loss", "database volume loss", "standby promotion"]}
 
     def run(args, **kwargs):

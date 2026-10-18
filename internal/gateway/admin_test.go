@@ -10,9 +10,6 @@ import (
 	"strings"
 	"sync"
 	"testing"
-	"time"
-
-	agentsv1alpha1 "github.com/softcane/codex-session-operator/api/v1alpha1"
 )
 
 const _recordsPath = "/v1/namespaces/team/records"
@@ -136,38 +133,6 @@ func TestAdminPurgeRejectsActiveAndOtherNamespace(t *testing.T) {
 	}
 }
 
-func TestCleanedIssueSourceCountsAsClosed(t *testing.T) {
-	if !closedForPurge(Record{Issue: &IssueSource{Cleaned: true}}) {
-		t.Fatal("cleaned issue audit could not be selected for admin purge")
-	}
-	if closedForPurge(Record{Issue: &IssueSource{CloseRequested: true}}) {
-		t.Fatal("issue source still awaiting cleanup counted as closed")
-	}
-}
-
-func TestStoreNeverPurgesIssueReplayRecord(t *testing.T) {
-	store := testStore(t)
-	const sourceID = "source-replay-tombstone"
-	if err := store.Update(t.Context(), sourceID, func(r *Record) error {
-		r.Namespace = _testNamespace
-		r.Name = "issue-work"
-		r.Issue = &IssueSource{ID: sourceID, RouteID: "route", Cleaned: true,
-			Deliveries: []IssueDelivery{{ID: "delivery"}}, Policy: agentsv1alpha1.SessionSpec{
-				AgentRef:       &agentsv1alpha1.AgentReference{Name: _auditAgentName},
-				EnvironmentRef: &agentsv1alpha1.AgentReference{Name: "environment"},
-			}}
-		return nil
-	}); err != nil {
-		t.Fatal(err)
-	}
-	if err := store.Purge(t.Context(), sourceID); err == nil {
-		t.Fatal("store erased issue replay deduplication record")
-	}
-	if _, err := store.Get(t.Context(), sourceID); err != nil {
-		t.Fatal(err)
-	}
-}
-
 func TestGatewayGateStateIsBoundedUnderUIDChurn(t *testing.T) {
 	store := testStore(t)
 	g, _ := testGateway(t, store, simulatorForTest())
@@ -178,47 +143,6 @@ func TestGatewayGateStateIsBoundedUnderUIDChurn(t *testing.T) {
 	}
 	if len(seen) > 64 || g.gate(_testUID) != first {
 		t.Fatalf("gate state grew or changed under churn: %d mutexes", len(seen))
-	}
-}
-
-func TestIssueCloseWithCollidingGateShards(t *testing.T) {
-	store := testStore(t)
-	g, _ := testGateway(t, store, simulatorForTest())
-	const sourceID = "source-collision"
-	var sessionUID string
-	for i := range 1_000 {
-		candidate := "session-" + strconv.Itoa(i)
-		if g.gate(sourceID) == g.gate(candidate) {
-			sessionUID = candidate
-			break
-		}
-	}
-	if sessionUID == "" {
-		t.Fatal("could not find deterministic shard collision")
-	}
-	if err := store.Update(t.Context(), sourceID, func(r *Record) error {
-		r.Namespace = _testNamespace
-		r.Name = "colliding-issue"
-		r.Issue = &IssueSource{ID: sourceID, RouteID: "route", SessionUID: sessionUID,
-			Deliveries: []IssueDelivery{{ID: "delivery"}}, Policy: agentsv1alpha1.SessionSpec{
-				AgentRef:       &agentsv1alpha1.AgentReference{Name: _auditAgentName},
-				EnvironmentRef: &agentsv1alpha1.AgentReference{Name: "environment"},
-			}}
-		return nil
-	}); err != nil {
-		t.Fatal(err)
-	}
-	done := make(chan int, 1)
-	go func() {
-		done <- request(g, http.MethodPost, "/v1/namespaces/team/sources/"+sourceID+"/close", _token, "", "").Code
-	}()
-	select {
-	case status := <-done:
-		if status != http.StatusAccepted {
-			t.Fatalf("colliding close returned %d", status)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("colliding source and Session gates deadlocked")
 	}
 }
 

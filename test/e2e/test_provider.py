@@ -23,6 +23,44 @@ TEMPLATES = AGENTS + "/environments/templates"
 
 
 class LifecycleFixtureContractTests(unittest.TestCase):
+    def test_started_command_is_not_replayed_after_executor_instance_loss(self):
+        session=self.post(SESSIONS,{"environment":{"type":"self_hosted","workspace_directory":"/workspace"}})
+        environment=session["environment"]["id"]
+        self.post("/executor/connect",{"environment_id":environment,"instance":"original"})
+        self.assertEqual(self.request("POST",SESSIONS+"/"+session["id"]+"/events",{"events":[
+            {"type":"agent.session.input.message","input":[{"content":[{"type":"input_text","text":"SANDBOX_LONG_COMMAND"}]}]}]})[0],204)
+        job=self.read("/executor/commands?environment_id="+environment)[0]
+        self.post("/executor/started",{"environment_id":environment,"id":job["id"],"instance":"original"})
+        self.post("/executor/connect",{"environment_id":environment,"instance":"original"})
+        self.assertEqual(self.read(SESSIONS+"/"+session["id"]+"/turns")["data"][0]["status"],"in_progress")
+        self.post("/executor/connect",{"environment_id":environment,"instance":"replacement"})
+        turns=self.read(SESSIONS+"/"+session["id"]+"/turns")["data"]
+        self.assertEqual(turns,[{"id":"turn_1","status":"failed"}])
+        self.assertEqual(self.read("/executor/commands?environment_id="+environment),[])
+        command=next(value for value in self.read(SESSIONS+"/"+session["id"]+"/items")["data"] if value["type"]=="command_execution")
+        self.assertEqual(command["status"],"failed")
+        self.assertIn("outcome unknown",command["output"])
+        self.assertNotIn("exit_code",command)
+        self.assertEqual(self.read("/counts")["executorStarts"],1)
+        self.assertEqual(self.request("POST","/executor/result",{"environment_id":environment,"id":job["id"],"exit_code":0})[0],404)
+    def test_self_hosted_input_waits_for_actual_executor_result_and_scope_is_checked(self):
+        session = self.post(SESSIONS, {"environment": {"type": "self_hosted", "workspace_directory": "/workspace"},
+                                      "spend_control": {"limit": 500}})
+        environment = session["environment"]["id"]
+        self.assertEqual(session["spend_control"], {"limit": 500, "consumed": 0})
+        self.post("/executor/connect", {"environment_id": environment, "hostname": "actual-test-pod"})
+        self.assertEqual(self.read(AGENTS+"/environments/"+environment)["status"], "connected")
+        self.assertEqual(self.request("POST", SESSIONS+"/"+session["id"]+"/events", {"events": [
+            {"type": "agent.session.input.message", "input": [{"content": [{"type": "input_text", "text": "Inspect fixture"}]}]}]})[0], 204)
+        self.assertEqual(self.read(SESSIONS+"/"+session["id"]+"/turns")["data"][0]["status"], "in_progress")
+        jobs = self.read("/executor/commands?environment_id="+environment)
+        self.assertEqual(len(jobs), 1)
+        self.assertEqual(self.request("POST", "/executor/result", {"environment_id": "foreign", "id": jobs[0]["id"]})[0], 404)
+        self.post("/executor/result", {"environment_id": environment, "id": jobs[0]["id"],
+                    "exit_code": 0, "output": "actual fixture command output", "cwd": "/workspace"})
+        self.assertEqual(self.read(SESSIONS+"/"+session["id"]+"/turns")["data"][0]["status"], "completed")
+        command = next(value for value in self.read(SESSIONS+"/"+session["id"]+"/items")["data"] if value["type"] == "command_execution")
+        self.assertEqual(command["output"], "actual fixture command output")
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory(prefix="codex-lifecycle-fixture-")
         self.addCleanup(self.directory.cleanup)

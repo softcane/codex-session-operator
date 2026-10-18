@@ -100,9 +100,9 @@ func (g *Gateway) InternalHandler(token string) (http.Handler, error) {
 				return
 			}
 			w.WriteHeader(http.StatusNoContent)
-		case internalPath + "validate-investigation":
-			if request.Session == nil || g.ValidateInvestigation(r.Context(), request.Session, request.Environment) != nil {
-				http.Error(w, "Gateway policy rejected", http.StatusUnprocessableEntity)
+		case internalPath + "validate-session-policy":
+			if request.Session == nil || g.ValidateSessionPolicy(r.Context(), request.Session, request.Environment) != nil {
+				http.Error(w, "Gateway Session policy rejected", http.StatusUnprocessableEntity)
 				return
 			}
 			w.WriteHeader(http.StatusNoContent)
@@ -227,6 +227,6 @@ func (c *RemoteClient) Quiesce(ctx context.Context, uid, remoteID string) error 
 	return c.call(ctx, "quiesce", internalRequest{UID: uid, RemoteID: remoteID}, nil)
 }
 
-func (c *RemoteClient) ValidateInvestigation(ctx context.Context, session *agentsv1alpha1.Session, environment *agentsv1alpha1.SessionEnvironmentSnapshot) error {
-	return c.call(ctx, "validate-investigation", internalRequest{Session: session, Environment: environment}, nil)
+func (c *RemoteClient) ValidateSessionPolicy(ctx context.Context, session *agentsv1alpha1.Session, environment *agentsv1alpha1.SessionEnvironmentSnapshot) error {
+	return c.call(ctx, "validate-session-policy", internalRequest{Session: session, Environment: environment}, nil)
 }

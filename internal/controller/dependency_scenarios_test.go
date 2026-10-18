@@ -551,7 +551,7 @@ var _ = Describe("Dependency scenarios with shipped CRDs", func() {
 		_, _, reason, _, err := f.sessionController.resolveEnvironment(ctx, s)
 		Expect(err).NotTo(HaveOccurred())
 		Expect(reason).To(Equal(environmentNotReadyReason))
-		_, reason, _, err = f.sessionController.resolveAgent(ctx, s, nil)
+		_, reason, _, err = f.sessionController.resolveAgent(ctx, s)
 		Expect(err).NotTo(HaveOccurred())
 		Expect(reason).To(Equal(agentNotReadyReason))
 		s.Spec.VaultRefs = []agentsv1alpha1.AgentReference{{Name: f.vault.Name}}

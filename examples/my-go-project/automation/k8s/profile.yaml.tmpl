@@ -1,0 +1,13 @@
+apiVersion: agents.softcane.io/v1alpha1
+kind: Profile
+metadata:
+  name: my-go-project
+  namespace: ${NAMESPACE}
+spec:
+  agentRef:
+    name: my-go-maintainer
+  environmentRef:
+    name: my-go-development
+  spendControl:
+    mode: unlimited
+  vaultRefs: []

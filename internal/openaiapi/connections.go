@@ -10,7 +10,6 @@ import (
 	"time"
 
 	openai "github.com/openai/openai-go/v3"
-	"github.com/openai/openai-go/v3/option"
 )
 
 // Connection is a live observation, never inferred from Session or Pod status.
@@ -110,11 +109,14 @@ func (c *Connections) run(ctx context.Context, sessionID string, watch *connecti
 	// normal lifecycle client's 20-second request timeout must not end this stream.
 	defer transport.CloseIdleConnections()
 	for ctx.Err() == nil {
-		stream := c.SDK.Beta.Agents.Sessions.Events.StreamStreaming(ctx, sessionID,
-			option.WithMaxRetries(0), option.WithRequestTimeout(0),
-			option.WithHTTPClient(&http.Client{Transport: transport}))
+		stream, cancel, err := openEventStream(
+			ctx,
+			c.SDK,
+			sessionID,
+			eventStreamSettings{transport: transport, setupTimeout: callTimeout},
+		)
 		var state Connection
-		if stream.Err() == nil {
+		if err == nil {
 			var nonce [16]byte
 			if _, err := rand.Read(nonce[:]); err == nil {
 				state = Connection{Subscribed: true, Epoch: hex.EncodeToString(nonce[:])}
@@ -156,8 +158,9 @@ func (c *Connections) run(ctx context.Context, sessionID string, watch *connecti
 					c.set(watch, state)
 				}
 			}
+			cancel()
+			_ = stream.Close()
 		}
-		_ = stream.Close()
 		c.set(watch, Connection{})
 		timer := time.NewTimer(5 * time.Second)
 		select {

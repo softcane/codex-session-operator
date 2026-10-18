@@ -1,0 +1,55 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+- ../../../config/default
+images:
+- name: controller
+  newName: ${CONTROLLER_REPOSITORY}
+  digest: ${CONTROLLER_DIGEST}
+- name: gateway
+  newName: ${GATEWAY_REPOSITORY}
+  digest: ${GATEWAY_DIGEST}
+patches:
+- target:
+    kind: Deployment
+    name: codex-session-operator-controller-manager
+  patch: |-
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata:
+      name: codex-session-operator-controller-manager
+    spec:
+      template:
+        spec:
+          nodeSelector:
+            kubernetes.io/os: linux
+            kubernetes.io/arch: '${ARCH}'
+          containers:
+          - name: manager
+            imagePullPolicy: IfNotPresent
+            env:
+            - {name: OPENAI_AGENT_OWNER_SCOPE, value: '${OWNER_SCOPE}'}
+            - {name: EXECUTOR_IMAGES, value: '${EXECUTOR_IMAGE}'}
+            - {name: CAPABILITY_IMAGES, value: '${SKILLS_IMAGE}'}
+            - {name: WORKSPACE_STORAGE_CLASSES, value: '${STORAGE_CLASS}'}
+            - {name: REPOSITORY_URLS, value: '${REPOSITORY_URL}'}
+            resources:
+              limits:
+                memory: 512Mi
+- target:
+    kind: Deployment
+    name: codex-session-operator-gateway
+  patch: |-
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata:
+      name: codex-session-operator-gateway
+    spec:
+      template:
+        spec:
+          nodeSelector:
+            kubernetes.io/os: linux
+            kubernetes.io/arch: '${ARCH}'
+          containers:
+          - name: gateway
+            imagePullPolicy: IfNotPresent

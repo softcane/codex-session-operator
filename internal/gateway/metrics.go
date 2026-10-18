@@ -23,7 +23,6 @@ const (
 	_metricsMessages    = "session_messages"
 	_metricsUnmatched   = "unmatched"
 	_metricsCatalog     = "catalog"
-	_metricsSources     = "sources"
 	_metricsActions     = "actions"
 	_metricsCancel      = "cancel"
 )
@@ -225,12 +224,6 @@ func metricsRoute(path string) string {
 	if len(parts) == 1 && parts[0] == "readyz" {
 		return "ready"
 	}
-	if len(parts) >= 1 && parts[0] == "ui" {
-		return "ui"
-	}
-	if len(parts) == 4 && parts[0] == "v1" && parts[1] == "issue-events" && parts[2] == "github" {
-		return "issue_events"
-	}
 	if len(parts) < 4 || parts[0] != "v1" || parts[1] != _namespacesSegment {
 		return _metricsUnmatched
 	}
@@ -239,9 +232,6 @@ func metricsRoute(path string) string {
 	}
 	if len(parts) == 5 {
 		return metricsDetailRoute(parts[3])
-	}
-	if len(parts) == 6 && parts[3] == _metricsSources && parts[5] == "close" {
-		return "source_close"
 	}
 	if parts[3] == _sessionsSegment && len(parts) == 7 && parts[5] == _metricsActions {
 		return "session_action"
@@ -269,12 +259,12 @@ func metricsCollectionRoute(kind string) string {
 	switch kind {
 	case _metricsCatalog:
 		return _metricsCatalog
+	case _identitySegment:
+		return _identitySegment
+	case _profilesSegment:
+		return _profilesSegment
 	case _sessionsSegment:
 		return _sessionsSegment
-	case "work-events":
-		return "work_events"
-	case _workSegment:
-		return _workSegment
 	case _recordsSegment:
 		return _recordsSegment
 	default:
@@ -286,12 +276,10 @@ func metricsDetailRoute(kind string) string {
 	switch kind {
 	case _sessionsSegment:
 		return "session"
-	case _workSegment:
-		return "work_detail"
 	case _recordsSegment:
 		return "record"
-	case _metricsSources:
-		return "source"
+	case _profilesSegment:
+		return _profileSourceName
 	default:
 		return _metricsUnmatched
 	}

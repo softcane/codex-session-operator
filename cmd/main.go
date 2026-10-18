@@ -78,9 +78,9 @@ func run() error {
 		secureMetrics                                                       bool
 		enableHTTP2                                                         bool
 		tlsOpts                                                             []func(*tls.Config)
-		executorImage, agentOwnerScope, executorImages, capabilityImages    string
+		agentOwnerScope, executorImages, capabilityImages                   string
 		gatewayInternalURL, gatewayInternalTokenFile, gatewayInternalCAFile string
-		workspaceStorageClasses                                             string
+		workspaceStorageClasses, repositoryURLs                             string
 	)
 	flag.StringVar(&gatewayInternalURL, "gateway-internal-url", os.Getenv("GATEWAY_INTERNAL_URL"),
 		"HTTPS lifecycle endpoint of the separate gateway service; empty disables gateway-dependent features.")
@@ -90,14 +90,14 @@ func run() error {
 		"CA certificate for the gateway internal HTTPS endpoint.")
 	flag.StringVar(&workspaceStorageClasses, "workspace-storage-classes", os.Getenv("WORKSPACE_STORAGE_CLASSES"),
 		"Comma-separated allowlist of StorageClasses for persistent executor workspaces; empty denies all.")
+	flag.StringVar(&repositoryURLs, "repository-urls", os.Getenv("REPOSITORY_URLS"),
+		"Comma-separated exact HTTPS repository URL allowlist; empty denies repository preparation.")
 	flag.StringVar(&executorImages, "executor-images", os.Getenv("EXECUTOR_IMAGES"),
-		"Additional approved executor image digests.")
+		"Comma-separated allowlist of approved executor image digests; empty denies all.")
 	flag.StringVar(&capabilityImages, "capability-images", os.Getenv("CAPABILITY_IMAGES"),
 		"Approved capability image digests.")
 	flag.StringVar(&agentOwnerScope, "agent-owner-scope", os.Getenv("OPENAI_AGENT_OWNER_SCOPE"),
 		"Stable installation/project identity for saved Agent ownership.")
-	flag.StringVar(&executorImage, "executor-image", os.Getenv("EXECUTOR_IMAGE"),
-		"Platform executor image pinned by sha256 digest.")
 	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "The address the metrics endpoint binds to. "+
 		"Use :8443 for HTTPS or :8080 for HTTP, or leave as 0 to disable the metrics service.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
@@ -158,7 +158,7 @@ func run() error {
 
 	webhookServer := webhook.NewServer(webhookServerOptions)
 
-	// Metrics endpoint is enabled in 'config/default/kustomization.yaml'. The Metrics options configure the server.
+	// Metrics endpoint is enabled in 'config/controller/kustomization.yaml'. The Metrics options configure the server.
 	// More info:
 	// - https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.25.0/pkg/metrics/server
 	// - https://book.kubebuilder.io/reference/metrics.html
@@ -181,7 +181,7 @@ func run() error {
 	// this setup is not recommended for production.
 	//
 	// TODO(user): If you enable certManager, uncomment the following lines:
-	// - [METRICS-WITH-CERTS] at config/default/kustomization.yaml to generate and use certificates
+	// - [METRICS-WITH-CERTS] at config/controller/kustomization.yaml to generate and use certificates
 	// managed by cert-manager for the metrics server.
 	// - [PROMETHEUS-WITH-CERTS] at config/prometheus/kustomization.yaml for TLS certification.
 	if len(metricsCertPath) > 0 {
@@ -259,8 +259,8 @@ func run() error {
 		CapabilityImages:        strings.FieldsFunc(capabilityImages, func(r rune) bool { return r == ',' }),
 		AgentOwnerScope:         agentOwnerScope,
 		Connections:             connections,
-		ExecutorImage:           executorImage,
 		WorkspaceStorageClasses: strings.FieldsFunc(workspaceStorageClasses, func(r rune) bool { return r == ',' }),
+		RepositoryURLs:          strings.FieldsFunc(repositoryURLs, func(r rune) bool { return r == ',' }),
 		ApplicationKeyHash:      sha256.Sum256([]byte(os.Getenv("OPENAI_API_KEY"))),
 	}
 	if messageGateway != nil {
@@ -285,9 +285,9 @@ func run() error {
 		OwnerScope:              agentOwnerScope,
 		GatewayEnabled:          messageGateway != nil,
 		WorkspaceStorageClasses: strings.FieldsFunc(workspaceStorageClasses, func(r rune) bool { return r == ',' }),
-		ExecutorImages: append([]string{executorImage},
-			strings.FieldsFunc(executorImages, func(r rune) bool { return r == ',' })...),
-		CapabilityImages: strings.FieldsFunc(capabilityImages, func(r rune) bool { return r == ',' }),
+		RepositoryURLs:          strings.FieldsFunc(repositoryURLs, func(r rune) bool { return r == ',' }),
+		ExecutorImages:          strings.FieldsFunc(executorImages, func(r rune) bool { return r == ',' }),
+		CapabilityImages:        strings.FieldsFunc(capabilityImages, func(r rune) bool { return r == ',' }),
 	}).SetupWithManager(mgr); err != nil {
 		return fmt.Errorf("create Environment controller: %w", err)
 	}
@@ -304,6 +304,11 @@ func run() error {
 		OwnerScope: agentOwnerScope,
 	}).SetupWithManager(mgr); err != nil {
 		return fmt.Errorf("create VaultCredential controller: %w", err)
+	}
+	if err := (&controller.ProfileReconciler{
+		Client: mgr.GetClient(), APIReader: mgr.GetAPIReader(), OwnerScope: agentOwnerScope,
+	}).SetupWithManager(mgr); err != nil {
+		return fmt.Errorf("create Profile controller: %w", err)
 	}
 	// +kubebuilder:scaffold:builder
 

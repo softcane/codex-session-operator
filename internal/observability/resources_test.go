@@ -96,10 +96,15 @@ codex_operator_creation_claims_unresolved{kind="Agent",namespace="team"} 0
 	}
 }
 
-type failingReader struct{ client.Reader }
+type failingReader struct {
+	client.Reader
+	profile bool
+}
 
 func (r failingReader) List(ctx context.Context, objects client.ObjectList, options ...client.ListOption) error {
-	if _, ok := objects.(*agentsv1alpha1.SessionList); ok {
+	_, sessionList := objects.(*agentsv1alpha1.SessionList)
+	_, profileList := objects.(*agentsv1alpha1.ProfileList)
+	if sessionList && !r.profile || profileList && r.profile {
 		return errors.New("private-provider-error")
 	}
 	return r.Reader.List(ctx, objects, options...)
@@ -117,7 +122,7 @@ func TestResourcesListFailureIsNotHealthyZero(t *testing.T) {
 		if family.GetName() != "codex_operator_resource_collection_success" {
 			t.Fatal("failed/empty list emitted fabricated state", family.GetName())
 		}
-		if len(family.Metric) != 5 {
+		if len(family.Metric) != 6 {
 			t.Fatal("missing per-kind collection results")
 		}
 		for _, metric := range family.Metric {
@@ -148,7 +153,9 @@ func TestResourcesAllKindsAndResolvedClaims(t *testing.T) {
 		&agentsv1alpha1.VaultCredential{ObjectMeta: metadata("credential"), Status: agentsv1alpha1.VaultCredentialStatus{
 			CreationAttempted: true, OpenAICredentialID: remoteID, Conditions: readyCondition(metav1.ConditionTrue, 1)}},
 		&agentsv1alpha1.Session{ObjectMeta: metadata("session"), Status: agentsv1alpha1.SessionStatus{
-			CreationAttempted: true, OpenAISessionID: remoteID, Conditions: readyCondition(metav1.ConditionTrue, 1)}})
+			CreationAttempted: true, OpenAISessionID: remoteID, Conditions: readyCondition(metav1.ConditionTrue, 1)}},
+		&agentsv1alpha1.Profile{ObjectMeta: metadata("profile"), Status: agentsv1alpha1.ProfileStatus{
+			Conditions: readyCondition(metav1.ConditionTrue, 1)}})
 	registry := prometheus.NewPedanticRegistry()
 	registry.MustRegister(NewResources(reader))
 	families, err := registry.Gather()
@@ -170,7 +177,82 @@ func TestResourcesAllKindsAndResolvedClaims(t *testing.T) {
 			}
 		}
 	}
-	if ready != 5 {
+	if ready != 6 {
 		t.Fatal("missing ready resource kind", ready)
+	}
+}
+
+func TestResourcesProfileReadinessAndPrivacy(t *testing.T) {
+	t.Parallel()
+	reader := resourceReader(t,
+		&agentsv1alpha1.Profile{ObjectMeta: metav1.ObjectMeta{Name: "private-profile", Namespace: _metricsNamespace, UID: "private-profile-uid", Generation: 2},
+			Status: agentsv1alpha1.ProfileStatus{ObservedGeneration: 2, PolicyDigest: "private-policy-digest",
+				Agent:      &agentsv1alpha1.ProfileDependencyStatus{Name: "private-agent", UID: "private-agent-uid", Generation: 4},
+				Conditions: readyCondition(metav1.ConditionTrue, 2)}},
+		&agentsv1alpha1.Profile{ObjectMeta: metav1.ObjectMeta{Name: "private-profile", Namespace: "other-team", Generation: 2},
+			Status: agentsv1alpha1.ProfileStatus{Conditions: readyCondition(metav1.ConditionTrue, 1)}})
+	collector := NewResources(reader)
+	if err := testutil.CollectAndCompare(collector, strings.NewReader(`
+# HELP codex_operator_resources Current CR counts by readiness for the current generation; duplicated across manager replicas.
+# TYPE codex_operator_resources gauge
+codex_operator_resources{kind="Profile",namespace="team",state="ready"} 1
+codex_operator_resources{kind="Profile",namespace="team",state="not_ready"} 0
+codex_operator_resources{kind="Profile",namespace="team",state="unknown"} 0
+codex_operator_resources{kind="Profile",namespace="team",state="terminating"} 0
+codex_operator_resources{kind="Profile",namespace="other-team",state="ready"} 0
+codex_operator_resources{kind="Profile",namespace="other-team",state="not_ready"} 0
+codex_operator_resources{kind="Profile",namespace="other-team",state="unknown"} 1
+codex_operator_resources{kind="Profile",namespace="other-team",state="terminating"} 0
+# HELP codex_operator_creation_claims_unresolved CRs with a one-time remote creation claim but no recorded remote ID; includes creation in progress.
+# TYPE codex_operator_creation_claims_unresolved gauge
+codex_operator_creation_claims_unresolved{kind="Profile",namespace="team"} 0
+codex_operator_creation_claims_unresolved{kind="Profile",namespace="other-team"} 0
+`), "codex_operator_resources", "codex_operator_creation_claims_unresolved"); err != nil {
+		t.Fatal(err)
+	}
+	registry := prometheus.NewPedanticRegistry()
+	registry.MustRegister(collector)
+	families, err := registry.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, family := range families {
+		for _, metric := range family.Metric {
+			for _, label := range metric.Label {
+				if strings.Contains(label.GetValue(), "private-") ||
+					label.GetName() != "kind" && label.GetName() != "namespace" && label.GetName() != "state" {
+					t.Fatalf("Profile identity or unbounded dimension leaked into metrics: %s", label)
+				}
+			}
+		}
+	}
+}
+
+func TestResourcesProfileListFailureIsNotHealthyZero(t *testing.T) {
+	t.Parallel()
+	reader := resourceReader(t, &agentsv1alpha1.Profile{ObjectMeta: metav1.ObjectMeta{Name: "hidden", Namespace: _metricsNamespace, Generation: 1},
+		Status: agentsv1alpha1.ProfileStatus{Conditions: readyCondition(metav1.ConditionTrue, 1)}})
+	registry := prometheus.NewPedanticRegistry()
+	registry.MustRegister(NewResources(failingReader{Reader: reader, profile: true}))
+	families, err := registry.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, family := range families {
+		if family.GetName() != "codex_operator_resource_collection_success" {
+			t.Fatalf("Profile list failure emitted fabricated state: %s", family.GetName())
+		}
+		for _, metric := range family.Metric {
+			if metric.Label[0].GetValue() == "Profile" {
+				found = true
+				if metric.GetGauge().GetValue() != 0 {
+					t.Fatal("Profile list failure was reported as successful")
+				}
+			}
+		}
+	}
+	if !found {
+		t.Fatal("Profile collection failure was not reported")
 	}
 }

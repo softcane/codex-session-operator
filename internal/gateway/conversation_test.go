@@ -10,7 +10,6 @@ import (
 	"strings"
 	"sync"
 	"testing"
-	"time"
 
 	"github.com/softcane/codex-session-operator/internal/openaiapi"
 )
@@ -40,19 +39,19 @@ func readConversationReceipt(t *testing.T, response *httptest.ResponseRecorder) 
 
 func TestConversationFirstMessageFreezesProfileAndReturnsImmutableReceipt(t *testing.T) {
 	store := testStore(t)
-	g, writer, provider := workHTTPGateway(t, store)
+	g, writer, provider := profileConversationGateway(t, store)
 	body := `{"route_id":"payments","text":"Investigate checkout\r\nUse logs","title":"Checkout"}`
 	first := readConversationReceipt(t, conversationRequest(g, http.MethodPost, _conversationPath, "first", body))
 	id := conversationRecordID(_testNamespace, _testConversationSubject, "first")
 	record := readWorkRecord(t, store, id)
-	if record.Version != 2 || writer.creates != 0 || provider.posts != 0 || len(record.Work.Attempts) != 1 || len(record.Work.Events) != 1 {
+	if record.Version != _recordVersion || writer.creates != 0 || provider.posts != 0 || len(record.Work.Attempts) != 1 || len(record.Work.Events) != 1 {
 		t.Fatalf("HTTP acceptance performed delivery or duplicated work: %+v", record.Work)
 	}
 	attempt := record.Work.Attempts[0]
 	if first.Acceptance != "committed" || first.ConversationID != attempt.ConversationID ||
 		first.ConversationURL != _conversationPath+"/"+attempt.ConversationID || first.Attempt != 1 ||
-		first.ReceivedAt.IsZero() || attempt.Policy.AgentRef.Name != _testWorkAgentV1 ||
-		attempt.Policy.EnvironmentRef.Name != _testWorkEnvironmentV1 || record.Work.Conversation.Title != "Checkout" ||
+		first.ReceivedAt.IsZero() || attempt.Policy.AgentRef.Name != _profileTestAgent ||
+		attempt.Policy.EnvironmentRef.Name != _profileTestEnvironment || record.Work.Conversation.Title != "Checkout" ||
 		strings.Contains(record.Work.Events[0].Text, "\r") {
 		t.Fatalf("missing frozen profile or durable receipt: %+v %+v", first, record.Work)
 	}
@@ -71,7 +70,6 @@ func TestConversationFirstMessageFreezesProfileAndReturnsImmutableReceipt(t *tes
 	}); err != nil {
 		t.Fatal(err)
 	}
-	delete(g.workRoutes, _testWorkRouteID)
 	replay := readConversationReceipt(t, conversationRequest(g, http.MethodPost, _conversationPath, "first", body))
 	if !reflect.DeepEqual(first, replay) {
 		t.Fatalf("closed/held/retired retry changed receipt: %+v %+v", first, replay)
@@ -90,7 +88,7 @@ func TestConversationFirstMessageFreezesProfileAndReturnsImmutableReceipt(t *tes
 
 func TestConversationCollectionPagesAttemptsAndRejectsInvalidCursors(t *testing.T) {
 	store := testStore(t)
-	g, _, _ := workHTTPGateway(t, store)
+	g, writer, _ := profileConversationGateway(t, store)
 	var wantIDs []string
 	first := readConversationReceipt(t, conversationRequest(g, http.MethodPost, _conversationPath, "first",
 		`{"route_id":"payments","text":"Investigate"}`))
@@ -109,11 +107,15 @@ func TestConversationCollectionPagesAttemptsAndRejectsInvalidCursors(t *testing.
 	}
 	restarted := readConversationReceipt(t, conversationRequest(g, http.MethodPost, first.ConversationURL+"/restart", "restart", `{"text":"Again"}`))
 	wantIDs = append(wantIDs, restarted.ConversationID)
-	otherRoute := workHTTPRoute()
-	otherRoute.ID, otherRoute.Namespace = "other-profile", _testOtherConversationNamespace
-	g.workRoutes[otherRoute.ID] = otherRoute
+	_, objects := readyProfileObjects(_testOtherConversationNamespace)
+	for _, object := range objects {
+		object.SetResourceVersion("")
+		if err := writer.Client.Create(t.Context(), object); err != nil {
+			t.Fatal(err)
+		}
+	}
 	if _, _, err := g.createConversation(t.Context(), Principal{Namespace: _testOtherConversationNamespace, Subject: _testConversationSubject}, "first",
-		ConversationInput{RouteID: otherRoute.ID, Text: "Other namespace"}); err != nil {
+		ConversationInput{RouteID: _profileTestName, Text: "Other namespace"}); err != nil {
 		t.Fatal(err)
 	}
 	slices.Sort(wantIDs)
@@ -150,93 +152,9 @@ func TestConversationCollectionPagesAttemptsAndRejectsInvalidCursors(t *testing.
 	}
 }
 
-func TestConversationRecordVersionPreservesLegacyWorkContract(t *testing.T) {
-	store := testStore(t)
-	g, _, _ := workHTTPGateway(t, store)
-	readConversationReceipt(t, conversationRequest(g, http.MethodPost, _conversationPath, "first",
-		`{"route_id":"payments","text":"Investigate"}`))
-	conversation := readWorkRecord(t, store, conversationRecordID(_testNamespace, _testConversationSubject, "first"))
-	legacy := readWorkReceipt(t, postWork(g, workInput("legacy-task", _workTask, "Legacy input")))
-	legacyRecord := readWorkRecord(t, store, legacy.ID)
-	if conversation.Version != 2 || legacyRecord.Version != 1 || legacyRecord.Work.Conversation != nil ||
-		legacyRecord.Work.Attempts[0].ConversationID != "" {
-		t.Fatal("new record version changed legacy Work storage contract")
-	}
-}
-
-func TestConversationMutationSerializesTwoGateOrderingWithSourceClosures(t *testing.T) {
-	store := testStore(t)
-	g, _, _ := workHTTPGateway(t, store)
-	first := readConversationReceipt(t, conversationRequest(g, http.MethodPost, _conversationPath, "first",
-		`{"route_id":"payments","text":"Investigate"}`))
-	id := conversationRecordID(_testNamespace, _testConversationSubject, "first")
-	// Pick a child UID whose shard differs from its source. Source closures can
-	// hold those shards in the reverse order, so both operations need one fence.
-	childUID := "child-session"
-	for g.gate(childUID) == g.gate(id) {
-		childUID += "x"
-	}
-	if err := store.Update(t.Context(), id, func(r *Record) error {
-		r.Work.Attempts[0].SessionUID = childUID
-		return nil
-	}); err != nil {
-		t.Fatal(err)
-	}
-	g.issueCloseMu.Lock()
-	closeFenceHeld := true
-	defer func() {
-		if closeFenceHeld {
-			g.issueCloseMu.Unlock()
-		}
-	}()
-	g.gate(childUID).Lock()
-	childGateHeld := true
-	defer func() {
-		if childGateHeld {
-			g.gate(childUID).Unlock()
-		}
-	}()
-	started := make(chan struct{})
-	finished := make(chan *httptest.ResponseRecorder, 1)
-	go func() {
-		close(started)
-		finished <- conversationRequest(g, http.MethodPost, first.ConversationURL+"/messages", _workEvidence, `{"text":"Evidence"}`)
-	}()
-	<-started
-	// The competing closure already owns the global fence and child shard. Its
-	// source shard must remain obtainable, allowing it to finish and release both.
-	deadline := time.Now().Add(50 * time.Millisecond)
-	for time.Now().Before(deadline) {
-		if !g.workMu.TryLock() {
-			t.Fatal("conversation mutation acquired work lock before the source closure fence")
-		}
-		g.workMu.Unlock()
-		select {
-		case <-finished:
-			t.Fatal("mutation escaped the source closure fence")
-		default:
-		}
-		if !g.gate(id).TryLock() {
-			t.Fatal("conversation mutation blocked the source closure's work shard")
-		}
-		g.gate(id).Unlock()
-		time.Sleep(time.Millisecond)
-	}
-	g.gate(childUID).Unlock()
-	childGateHeld = false
-	g.issueCloseMu.Unlock()
-	closeFenceHeld = false
-	select {
-	case response := <-finished:
-		readConversationReceipt(t, response)
-	case <-time.After(time.Second):
-		t.Fatal("mutation failed to finish after the closure released its fences")
-	}
-}
-
 func TestConversationMutationsBindAttemptAndReplayAfterRestart(t *testing.T) {
 	store := testStore(t)
-	g, _, _ := workHTTPGateway(t, store)
+	g, _, _ := profileConversationGateway(t, store)
 	first := readConversationReceipt(t, conversationRequest(g, http.MethodPost, _conversationPath, "first",
 		`{"route_id":"payments","text":"Investigate"}`))
 	message := readConversationReceipt(t, conversationRequest(g, http.MethodPost, first.ConversationURL+"/messages", _workEvidence, `{"text":"More evidence"}`))
@@ -282,8 +200,8 @@ func TestConversationMutationsBindAttemptAndReplayAfterRestart(t *testing.T) {
 
 func TestConversationConcurrentCreateAcrossGatewaysHasOneAttempt(t *testing.T) {
 	store := testStore(t)
-	first, _, _ := workHTTPGateway(t, store)
-	second, _, _ := workHTTPGateway(t, store)
+	first, _, _ := profileConversationGateway(t, store)
+	second, _, _ := profileConversationGateway(t, store)
 	responses := make(chan *httptest.ResponseRecorder, 16)
 	var group sync.WaitGroup
 	for i := range 16 {
@@ -315,7 +233,7 @@ func TestConversationConcurrentCreateAcrossGatewaysHasOneAttempt(t *testing.T) {
 
 func TestConversationReadsRetainedAttemptAndNamespaceIsolation(t *testing.T) {
 	store := testStore(t)
-	g, _, provider := workHTTPGateway(t, store)
+	g, _, provider := profileConversationGateway(t, store)
 	first := readConversationReceipt(t, conversationRequest(g, http.MethodPost, _conversationPath, "first", `{"route_id":"payments","text":"Investigate"}`))
 	id := conversationRecordID(_testNamespace, _testConversationSubject, "first")
 	if err := store.Update(t.Context(), id, func(r *Record) error {
@@ -361,7 +279,7 @@ func TestConversationReadsRetainedAttemptAndNamespaceIsolation(t *testing.T) {
 
 func TestConversationRejectsInvalidInputAndHeldFreshMutation(t *testing.T) {
 	store := testStore(t)
-	g, _, _ := workHTTPGateway(t, store)
+	g, _, _ := profileConversationGateway(t, store)
 	for _, body := range []string{
 		`null`, `{}`, `{"route_id":"payments","text":" "}`, `{"route_id":"payments","text":"x","agent":"untrusted"}`,
 		`{"route_id":"payments","text":"x"} {}`, `{"route_id":"payments","text":"x","title":"bad\nline"}`,
@@ -401,7 +319,7 @@ func TestConversationRejectsInvalidInputAndHeldFreshMutation(t *testing.T) {
 
 func TestConversationArchiveRemainsVisibleAndRestartHasFreshInputs(t *testing.T) {
 	store := testStore(t)
-	g, _, _ := workHTTPGateway(t, store)
+	g, _, _ := profileConversationGateway(t, store)
 	first := readConversationReceipt(t, conversationRequest(g, http.MethodPost, _conversationPath, "first",
 		`{"route_id":"payments","text":"Investigate","title":"Checkout"}`))
 	id := conversationRecordID(_testNamespace, _testConversationSubject, "first")
@@ -436,31 +354,5 @@ func TestConversationArchiveRemainsVisibleAndRestartHasFreshInputs(t *testing.T)
 	}
 	if detail.Archived || detail.Summary.Archived || len(detail.Inputs) != 1 || detail.Inputs[0].Text != "New investigation" {
 		t.Fatal("new attempt inherited old input archival state")
-	}
-}
-
-func TestConversationCannotBeClosedThroughLegacyWorkIdentity(t *testing.T) {
-	store := testStore(t)
-	g, _, _ := workHTTPGateway(t, store)
-	readConversationReceipt(t, conversationRequest(g, http.MethodPost, _conversationPath, "first",
-		`{"route_id":"payments","text":"Investigate"}`))
-	id := conversationRecordID(_testNamespace, _testConversationSubject, "first")
-	response := postWork(g, WorkInput{RouteID: _testWorkRouteID, WorkID: id, EventID: "legacy-close", Kind: _workClose})
-	if response.Code != http.StatusConflict {
-		t.Fatalf("legacy close accepted a conversational source identity: %d", response.Code)
-	}
-	records, err := store.Records(t.Context())
-	if err != nil || len(records) != 1 || records[0].Work.State != _workOpen {
-		t.Fatal("legacy close created a phantom source or changed the conversation", err)
-	}
-	response = request(g, http.MethodGet, "/v1/namespaces/team/work", _token, "", "")
-	var collection struct {
-		Work []WorkSummary `json:"work"`
-	}
-	if err := json.Unmarshal(response.Body.Bytes(), &collection); err != nil {
-		t.Fatal(err)
-	}
-	if response.Code != http.StatusOK || len(collection.Work) != 0 {
-		t.Fatal("advanced Work list exposed interactive conversation records")
 	}
 }

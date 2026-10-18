@@ -18,7 +18,7 @@ func TestHostedCredentialsRejectSelfHostedAndNetworkMismatches(t *testing.T) {
 		profile   *agentsv1alpha1.SessionEnvironmentSnapshot
 		wantError bool
 	}{
-		{name: "legacy self hosted", wantError: true},
+		{name: "missing environment snapshot", wantError: true},
 		{name: "explicit self hosted", profile: &agentsv1alpha1.SessionEnvironmentSnapshot{Profile: agentsv1alpha1.EnvironmentSpec{Mode: testSelfHostedMode, SelfHosted: &agentsv1alpha1.SelfHostedEnvironment{}}}, wantError: true},
 		{name: "disabled network", profile: &agentsv1alpha1.SessionEnvironmentSnapshot{Profile: agentsv1alpha1.EnvironmentSpec{Mode: openaiHostedMode, OpenAIHosted: &agentsv1alpha1.HostedEnvironment{Network: agentsv1alpha1.HostedNetwork{Access: "disabled"}}}}, wantError: true},
 		{name: "missing allowed host", profile: &agentsv1alpha1.SessionEnvironmentSnapshot{Profile: agentsv1alpha1.EnvironmentSpec{Mode: openaiHostedMode, OpenAIHosted: &agentsv1alpha1.HostedEnvironment{Network: agentsv1alpha1.HostedNetwork{Access: testRestrictedAccess, AllowedDomains: []string{"other.example.com"}}}}}, wantError: true},

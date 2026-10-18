@@ -59,7 +59,7 @@ func TestPersistentWorkspacePolicyRestrictions(t *testing.T) {
 		classes []string
 		valid   bool
 	}{
-		{name: "legacy", valid: true},
+		{name: "omitted ephemeral", valid: true},
 		{name: "explicit ephemeral", storage: &agentsv1alpha1.WorkspaceStorage{Type: WorkspaceStorageEphemeral}, valid: true},
 		{name: "approved persistent", storage: &agentsv1alpha1.WorkspaceStorage{Type: WorkspaceStoragePersistent, StorageClassName: approvedStorageClass, ClaimDeletionPolicy: WorkspaceClaimDelete}, classes: []string{approvedStorageClass}, valid: true},
 		{name: "missing class approval", storage: &agentsv1alpha1.WorkspaceStorage{Type: WorkspaceStoragePersistent, StorageClassName: approvedStorageClass, ClaimDeletionPolicy: WorkspaceClaimDelete}},

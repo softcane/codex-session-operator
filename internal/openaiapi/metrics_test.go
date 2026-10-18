@@ -299,7 +299,7 @@ func TestRequestMetricsRegistrationErrorsAndIsolatedRegistries(t *testing.T) {
 	}
 	t.Setenv("OPENAI_API_KEY", "")
 	if _, err := NewClient(); err == nil {
-		t.Fatal("legacy constructor no longer requires API configuration")
+		t.Fatal("default constructor no longer requires API configuration")
 	}
 	empty := prometheus.NewRegistry()
 	if _, err := NewClientWithMetrics(empty); err == nil {
