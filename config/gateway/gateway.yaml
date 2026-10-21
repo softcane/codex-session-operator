@@ -35,14 +35,6 @@ spec:
           value: :8083
         - name: GATEWAY_DATABASE_FILE
           value: /gateway-database/url
-        - name: GATEWAY_AUTH_FILE
-          value: /auth/principals.json
-        - name: GATEWAY_INTERNAL_TOKEN_FILE
-          value: /gateway-internal/token
-        - name: GATEWAY_CERT
-          value: /gateway-tls/tls.crt
-        - name: GATEWAY_KEY
-          value: /gateway-tls/tls.key
         - name: OPENAI_API_KEY
           valueFrom:
             secretKeyRef:
@@ -63,7 +55,7 @@ spec:
           httpGet:
             path: /readyz
             port: public
-            scheme: HTTPS
+            scheme: HTTP
           periodSeconds: 5
         resources:
           requests:
@@ -76,31 +68,10 @@ spec:
         - name: gateway-database
           mountPath: /gateway-database
           readOnly: true
-        - name: gateway-auth
-          mountPath: /auth
-          readOnly: true
-        - name: gateway-internal
-          mountPath: /gateway-internal
-          readOnly: true
-        - name: gateway-tls
-          mountPath: /gateway-tls
-          readOnly: true
       volumes:
       - name: gateway-database
         secret:
           secretName: gateway-database
-          defaultMode: 0440
-      - name: gateway-auth
-        secret:
-          secretName: gateway-auth
-          defaultMode: 0440
-      - name: gateway-internal
-        secret:
-          secretName: gateway-internal
-          defaultMode: 0440
-      - name: gateway-tls
-        secret:
-          secretName: gateway-tls
           defaultMode: 0440
 ---
 apiVersion: v1

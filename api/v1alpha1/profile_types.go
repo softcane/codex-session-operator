@@ -14,9 +14,12 @@ import (
 // ProfileSpec binds a namespaced recipe for future conversations. It contains
 // references and spending policy, never input, instructions or credentials.
 type ProfileSpec struct {
-	AgentRef       AgentReference      `json:"agentRef"`
-	EnvironmentRef AgentReference      `json:"environmentRef"`
-	SpendControl   SessionSpendControl `json:"spendControl"`
+	// +required
+	AgentRef AgentReference `json:"agentRef"`
+	// +required
+	EnvironmentRef AgentReference `json:"environmentRef"`
+	// +required
+	SpendControl SessionSpendControl `json:"spendControl"`
 	// +optional
 	// +kubebuilder:validation:MaxItems=16
 	// +listType=map
@@ -26,9 +29,12 @@ type ProfileSpec struct {
 
 // ProfileDependencyStatus identifies one observed same-namespace dependency.
 type ProfileDependencyStatus struct {
-	Name       string `json:"name"`
-	UID        string `json:"uid"`
-	Generation int64  `json:"generation"`
+	// +required
+	Name string `json:"name"`
+	// +required
+	UID string `json:"uid"`
+	// +required
+	Generation int64 `json:"generation"`
 }
 
 // ProfileStatus records safe policy provenance and current dependency readiness.
@@ -48,6 +54,7 @@ type ProfileStatus struct {
 	// +optional
 	// +listType=map
 	// +listMapKey=type
+	// +kubebuilder:validation:MaxItems=16
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
 }
 
@@ -61,7 +68,8 @@ type Profile struct {
 
 	// +optional
 	metav1.ObjectMeta `json:"metadata,omitzero"`
-	Spec              ProfileSpec `json:"spec"`
+	// +required
+	Spec ProfileSpec `json:"spec"`
 	// +optional
 	Status ProfileStatus `json:"status,omitzero"`
 }
@@ -84,7 +92,7 @@ func ProfilePolicyDigest(spec ProfileSpec) string {
 		limit = strconv.FormatInt(*spec.SpendControl.LimitCents, 10)
 	}
 	parts := make([]string, 0, 5+len(spec.VaultRefs))
-	parts = append(parts, "profile-policy-v1", spec.AgentRef.Name, spec.EnvironmentRef.Name, spec.SpendControl.Mode, limit)
+	parts = append(parts, "profile-policy-v1", spec.AgentRef.Name, spec.EnvironmentRef.Name, string(spec.SpendControl.Mode), limit)
 	vaults := make([]string, 0, len(spec.VaultRefs))
 	for _, ref := range spec.VaultRefs {
 		vaults = append(vaults, ref.Name)

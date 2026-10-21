@@ -88,20 +88,20 @@ type ConversationDetail struct {
 	HistoryArchived  bool                  `json:"history_archived"`
 }
 
-func (g *Gateway) serveConversations(w http.ResponseWriter, r *http.Request, parts []string, principal Principal) bool {
+func (g *Gateway) serveConversations(w http.ResponseWriter, r *http.Request, parts []string, scope requestScope) bool {
 	if len(parts) < 4 || len(parts) > 6 || parts[0] != "v1" || parts[1] != _namespacesSegment ||
-		parts[2] != principal.Namespace || parts[3] != _conversationsSegment {
+		parts[2] != scope.Namespace || parts[3] != _conversationsSegment {
 		return false
 	}
 	if len(parts) == 4 {
-		g.handleConversationCollection(w, r, principal)
+		g.handleConversationCollection(w, r, scope)
 	} else {
-		g.handleConversation(w, r, parts, principal)
+		g.handleConversation(w, r, parts, scope)
 	}
 	return true
 }
 
-func (g *Gateway) handleConversationCollection(w http.ResponseWriter, r *http.Request, principal Principal) {
+func (g *Gateway) handleConversationCollection(w http.ResponseWriter, r *http.Request, scope requestScope) {
 	switch r.Method {
 	case http.MethodPost:
 		var input ConversationInput
@@ -115,26 +115,26 @@ func (g *Gateway) handleConversationCollection(w http.ResponseWriter, r *http.Re
 			http.Error(w, "Idempotency-Key required (1–128 ASCII key characters)", http.StatusBadRequest)
 			return
 		}
-		record, event, err := g.createConversation(r.Context(), principal, key, input)
+		record, event, err := g.createConversation(r.Context(), scope, key, input)
 		if err != nil {
 			writeConversationError(w, err)
 			return
 		}
 		writeConversationReceipt(w, record, event)
 	case http.MethodGet:
-		g.handleConversationList(w, r, principal)
+		g.handleConversationList(w, r, scope)
 	default:
 		methodError(w)
 	}
 }
 
-func (g *Gateway) handleConversationList(w http.ResponseWriter, r *http.Request, principal Principal) {
+func (g *Gateway) handleConversationList(w http.ResponseWriter, r *http.Request, scope requestScope) {
 	after, limit, err := conversationPageQuery(r)
 	if err != nil {
 		http.Error(w, "Invalid conversation page cursor or limit", http.StatusBadRequest)
 		return
 	}
-	entries, err := g.listConversationAttempts(r.Context(), principal.Namespace, after, limit)
+	entries, err := g.listConversationAttempts(r.Context(), scope.Namespace, after, limit)
 	if err != nil {
 		writeError(w, err)
 		return
@@ -206,23 +206,23 @@ func conversationPageQuery(r *http.Request) (string, int, error) {
 	return after, limit, nil
 }
 
-func (g *Gateway) createConversation(ctx context.Context, principal Principal, key string, input ConversationInput) (Record, WorkEvent, error) {
-	id := conversationRecordID(principal.Namespace, principal.Subject, key)
+func (g *Gateway) createConversation(ctx context.Context, scope requestScope, key string, input ConversationInput) (Record, WorkEvent, error) {
+	id := conversationRecordID(scope.Namespace, scope.Subject, key)
 	digest := conversationDigest(input)
 	g.workMu.Lock()
 	defer g.workMu.Unlock()
 	gate := g.gate(id)
 	gate.Lock()
 	defer gate.Unlock()
-	current, err := g.store.GetInNamespace(ctx, principal.Namespace, id)
+	current, err := g.store.GetInNamespace(ctx, scope.Namespace, id)
 	if err == nil {
-		event, err := creationReplay(current, principal.Subject, key, digest)
+		event, err := creationReplay(current, scope.Subject, key, digest)
 		return current, event, err
 	}
 	if !errors.Is(err, os.ErrNotExist) {
 		return Record{}, WorkEvent{}, err
 	}
-	selection, err := g.selectProfile(ctx, principal.Namespace, input.RouteID)
+	selection, err := g.selectProfile(ctx, scope.Namespace, input.RouteID)
 	if err != nil {
 		return Record{}, WorkEvent{}, err
 	}
@@ -230,12 +230,12 @@ func (g *Gateway) createConversation(ctx context.Context, principal Principal, k
 	if err := g.deliveryEnabled(ctx); err != nil {
 		return Record{}, WorkEvent{}, err
 	}
-	event := WorkEvent{ID: conversationEventID(principal.Namespace, id, principal.Subject, key, "create"),
+	event := WorkEvent{ID: conversationEventID(scope.Namespace, id, scope.Subject, key, "create"),
 		Digest: digest, Kind: _workTask, Text: input.Text, ReceivedAt: time.Now().UTC()}
 	if err := g.store.Update(ctx, id, func(record *Record) error {
 		// Storage serializes competing replicas. Recheck identity inside the commit.
 		if record.Work != nil {
-			previous, err := creationReplay(*record, principal.Subject, key, digest)
+			previous, err := creationReplay(*record, scope.Subject, key, digest)
 			event = previous
 			return err
 		}
@@ -244,7 +244,7 @@ func (g *Gateway) createConversation(ctx context.Context, principal Principal, k
 		}
 		record.Namespace = route.Namespace
 		record.Work = &Work{ID: id, RouteID: route.ID, Source: route.Source, ExternalID: id,
-			Conversation: &ConversationOrigin{Subject: principal.Subject, Key: key, Digest: digest, Title: input.Title}}
+			Conversation: &ConversationOrigin{Subject: scope.Subject, Key: key, Digest: digest, Title: input.Title}}
 		startWorkAttempt(record, route)
 		if err := applyWorkEvent(record, route, conversationMutation{WorkID: id, Kind: _workTask}, &event); err != nil {
 			return err
@@ -254,13 +254,13 @@ func (g *Gateway) createConversation(ctx context.Context, principal Principal, k
 	}); err != nil {
 		return Record{}, WorkEvent{}, err
 	}
-	record, err := g.store.GetInNamespace(ctx, principal.Namespace, id)
+	record, err := g.store.GetInNamespace(ctx, scope.Namespace, id)
 	return record, event, err
 }
 
-func (g *Gateway) handleConversation(w http.ResponseWriter, r *http.Request, parts []string, principal Principal) {
+func (g *Gateway) handleConversation(w http.ResponseWriter, r *http.Request, parts []string, scope requestScope) {
 	if len(parts) == 5 && r.Method == http.MethodGet {
-		g.handleConversationDetail(w, r, principal, parts[4])
+		g.handleConversationDetail(w, r, scope, parts[4])
 		return
 	}
 	if len(parts) != 6 {
@@ -305,7 +305,7 @@ func (g *Gateway) handleConversation(w http.ResponseWriter, r *http.Request, par
 		return
 	}
 	input.Text = strings.ReplaceAll(input.Text, "\r\n", "\n")
-	record, event, err := g.acceptConversationMutation(r.Context(), principal, parts[4], kind, key, input.Text)
+	record, event, err := g.acceptConversationMutation(r.Context(), scope, parts[4], kind, key, input.Text)
 	if err != nil {
 		writeConversationError(w, err)
 		return
@@ -313,8 +313,8 @@ func (g *Gateway) handleConversation(w http.ResponseWriter, r *http.Request, par
 	writeConversationReceipt(w, record, event)
 }
 
-func (g *Gateway) acceptConversationMutation(ctx context.Context, principal Principal, publicID, kind, key, text string) (Record, WorkEvent, error) {
-	initial, _, err := g.lookupConversation(ctx, principal.Namespace, publicID)
+func (g *Gateway) acceptConversationMutation(ctx context.Context, scope requestScope, publicID, kind, key, text string) (Record, WorkEvent, error) {
+	initial, _, err := g.lookupConversation(ctx, scope.Namespace, publicID)
 	if err != nil {
 		return Record{}, WorkEvent{}, err
 	}
@@ -324,11 +324,11 @@ func (g *Gateway) acceptConversationMutation(ctx context.Context, principal Prin
 	gate := g.gate(initial.UID)
 	gate.Lock()
 	defer gate.Unlock()
-	current, err := g.store.GetInNamespace(ctx, principal.Namespace, initial.UID)
+	current, err := g.store.GetInNamespace(ctx, scope.Namespace, initial.UID)
 	if err != nil {
 		return Record{}, WorkEvent{}, err
 	}
-	event := WorkEvent{ID: conversationEventID(principal.Namespace, current.UID, principal.Subject, key, "mutation"),
+	event := WorkEvent{ID: conversationEventID(scope.Namespace, current.UID, scope.Subject, key, "mutation"),
 		Digest: conversationDigest([3]string{publicID, kind, text}), Kind: kind, Text: text, ReceivedAt: time.Now().UTC()}
 	if previous, found, err := conversationReplay(current, event); found || err != nil {
 		return current, previous, err
@@ -344,7 +344,7 @@ func (g *Gateway) acceptConversationMutation(ctx context.Context, principal Prin
 			inputGate.Lock()
 			defer inputGate.Unlock()
 		}
-		if err := g.conversationInputHeld(ctx, principal.Namespace, attempt.SessionUID, kind); err != nil {
+		if err := g.conversationInputHeld(ctx, scope.Namespace, attempt.SessionUID, kind); err != nil {
 			return Record{}, WorkEvent{}, err
 		}
 	}
@@ -391,7 +391,7 @@ func (g *Gateway) acceptConversationMutation(ctx context.Context, principal Prin
 	}); err != nil {
 		return Record{}, WorkEvent{}, err
 	}
-	record, err := g.store.GetInNamespace(ctx, principal.Namespace, current.UID)
+	record, err := g.store.GetInNamespace(ctx, scope.Namespace, current.UID)
 	return record, event, err
 }
 
@@ -434,8 +434,8 @@ func (g *Gateway) lookupConversation(ctx context.Context, namespace, id string) 
 	return Record{}, WorkAttempt{}, os.ErrNotExist
 }
 
-func (g *Gateway) handleConversationDetail(w http.ResponseWriter, r *http.Request, principal Principal, id string) {
-	record, attempt, err := g.lookupConversation(r.Context(), principal.Namespace, id)
+func (g *Gateway) handleConversationDetail(w http.ResponseWriter, r *http.Request, scope requestScope, id string) {
+	record, attempt, err := g.lookupConversation(r.Context(), scope.Namespace, id)
 	if err != nil {
 		writeConversationError(w, err)
 		return
@@ -453,7 +453,7 @@ func (g *Gateway) handleConversationDetail(w http.ResponseWriter, r *http.Reques
 		}
 	}
 	if attempt.SessionUID != "" {
-		conversation, err := g.store.GetInNamespace(r.Context(), principal.Namespace, attempt.SessionUID)
+		conversation, err := g.store.GetInNamespace(r.Context(), scope.Namespace, attempt.SessionUID)
 		if err != nil && !errors.Is(err, os.ErrNotExist) {
 			writeError(w, err)
 			return

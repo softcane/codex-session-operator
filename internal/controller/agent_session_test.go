@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"context"
 	"sync"
 	"time"
 
@@ -8,11 +9,15 @@ import (
 	. "github.com/onsi/gomega"
 	agentsv1alpha1 "github.com/softcane/codex-session-operator/api/v1alpha1"
 	"github.com/softcane/codex-session-operator/internal/openaiapi"
+	corev1 "k8s.io/api/core/v1"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
 
@@ -139,17 +144,17 @@ var _ = Describe("Agent-backed Session creation", func() {
 		Expect(*read(s).Status.AgentSnapshot).To(Equal(frozen))
 		Expect(provider.creates).To(Equal(1))
 	})
-	It("reports reference edits as RequiresNewSession and retains the original remote Session", func() {
+	It("rejects reference edits after claiming and retains the original remote Session", func() {
 		readyAgent()
 		s := newSession(agent.Name)
 		Expect(sessionStep(s)).To(Succeed())
 		Expect(sessionStep(s)).To(Succeed())
 		current := read(s)
 		current.Spec.AgentRef.Name = "another-agent"
-		Expect(k8sClient.Update(ctx, current)).To(Succeed())
+		Expect(apierrors.IsInvalid(k8sClient.Update(ctx, current))).To(BeTrue())
 		Expect(sessionStep(s)).To(Succeed())
 		condition := meta.FindStatusCondition(read(s).Status.Conditions, "ConfigurationCurrent")
-		Expect(condition.Reason).To(Equal("RequiresNewSession"))
+		Expect(condition.Status).To(Equal(metav1.ConditionTrue))
 		Expect(provider.creates).To(Equal(1))
 		Expect(read(s).Status.AgentSnapshot.UID).To(Equal(string(agent.UID)))
 		Expect(k8sClient.Delete(ctx, agent)).To(Succeed())
@@ -211,7 +216,7 @@ func verifyAgentDependencyWatches(namespace string) {
 			return ""
 		}
 		return current.Status.OpenAISessionID
-	}, 10*time.Second, 20*time.Millisecond).Should(Equal(testSessionID))
+	}, 10*time.Second, 20*time.Millisecond).Should(Equal("sess_dependency_" + string(session.UID)))
 	Expect(k8sClient.Delete(ctx, agent)).To(Succeed())
 	Eventually(func() string {
 		var current agentsv1alpha1.Agent
@@ -272,5 +277,31 @@ var _ = Describe("Agent competing creation claims", func() {
 		current.Finalizers = nil
 		Expect(k8sClient.Update(ctx, &current)).To(Succeed())
 		Expect(k8sClient.Delete(ctx, &current)).To(Succeed())
+	})
+})
+
+var _ = Describe("Registered dependency watches", func() {
+	It("reconciles Agent and Environment references and protected source changes", func() {
+		namespace := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{GenerateName: "dependency-watches-"}}
+		Expect(k8sClient.Create(ctx, namespace)).To(Succeed())
+		manager, err := ctrl.NewManager(cfg, ctrl.Options{Scheme: k8sClient.Scheme(), Metrics: metricsserver.Options{BindAddress: "0"}, Cache: cache.Options{DefaultNamespaces: map[string]cache.Config{namespace.Name: {}}}})
+		Expect(err).NotTo(HaveOccurred())
+		agents := &agentProviderStub{}
+		sessions := &sessionProviderStub{}
+		environments := &environmentProviderStub{sessions: sessions, runtimeStatus: testConnectedRuntime}
+		agentController := &AgentReconciler{Client: manager.GetClient(), APIReader: manager.GetAPIReader(), OpenAI: agents, OwnerScope: testAgentScope}
+		environmentController := &EnvironmentReconciler{Client: manager.GetClient(), APIReader: manager.GetAPIReader(), OpenAI: environments, OwnerScope: testAgentScope}
+		configuration := &dependencyScenarioSessionProvider{configuredSessionStub: configuredSessionStub{lifecycle: sessions}, agents: agents}
+		sessionController := &SessionReconciler{Client: manager.GetClient(), APIReader: manager.GetAPIReader(), Scheme: manager.GetScheme(), OpenAI: sessions, Agents: agents, Environments: environments, Configuration: configuration, AgentOwnerScope: testAgentScope}
+		Expect(agentController.SetupWithManager(manager)).To(Succeed())
+		Expect(environmentController.SetupWithManager(manager)).To(Succeed())
+		Expect(sessionController.SetupWithManager(manager)).To(Succeed())
+		managerCtx, cancelManager := context.WithCancel(ctx)
+		done := make(chan error, 1)
+		go func() { done <- manager.Start(managerCtx) }()
+		DeferCleanup(func() { cancelManager(); Eventually(done, 10*time.Second).Should(Receive(BeNil())) })
+		verifyAgentDependencyWatches(namespace.Name)
+		verifyEnvironmentDependencyWatches(namespace.Name)
+		verifyProtectedEnvironmentWatch(namespace.Name)
 	})
 })

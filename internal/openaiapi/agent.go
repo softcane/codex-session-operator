@@ -283,7 +283,7 @@ func validateAgentMetadata(metadata *map[string]string) error {
 		return errors.New("Agent metadata exceeds the ownership budget")
 	}
 	for k, v := range *metadata {
-		if k == ownerKey || k == operatorKey || k == agentScopeKey || utf8.RuneCountInString(k) > 64 || utf8.RuneCountInString(v) > 512 {
+		if k == "" || k == ownerKey || k == operatorKey || k == agentScopeKey || utf8.RuneCountInString(k) > 64 || utf8.RuneCountInString(v) > 512 {
 			return errors.New("Agent metadata exceeds bounds or uses reserved ownership keys")
 		}
 	}
@@ -296,7 +296,7 @@ func agentWireNames(fields map[string]any) map[string]any {
 		"serviceTier": serviceTierField, "multiAgent": multiAgentField, "maxConcurrentSubagents": "max_concurrent_subagents",
 		"deferLoading": "defer_loading", "serverLabel": "server_label", "credentialID": credentialIDField,
 		"allowedTools": allowedToolsField, "connectionOrigin": "connection_origin", "requestMetadata": "request_metadata",
-		"serverURL": serverURLField, "envVars": "env_vars", "allowedDomains": allowedDomainsField, "contextSize": "context_size",
+		"workingDirectory": "cwd", "serverURL": serverURLField, "envVars": "env_vars", "allowedDomains": allowedDomainsField, "contextSize": "context_size",
 		"includeScreenshots": "include_screenshots",
 	}
 	result := make(map[string]any, len(fields))
@@ -702,7 +702,7 @@ func AgentReasoningDigest(fields map[string]any) string {
 	return hex.EncodeToString(digest[:])
 }
 
-// AgentEnvironmentBlock allows local MCP only when a pinned capability owns its path.
+// AgentEnvironmentBlock allows local MCP only within approved template capability directories.
 func AgentEnvironmentBlock(fields map[string]any, profile *agentsv1alpha1.EnvironmentSpec) (string, string) {
 	tools, ok := fields[toolsField].([]any)
 	if !ok && fields[toolsField] != nil {
@@ -725,18 +725,18 @@ func AgentEnvironmentBlock(fields map[string]any, profile *agentsv1alpha1.Enviro
 		}
 		if transport[typeField] == stdioTransportType {
 			if profile == nil || profile.SelfHosted == nil {
-				return environmentCapabilitiesReason, "Direct stdio MCP requires a pinned self-hosted capability path; hosted MCP uses pinned plugins"
+				return environmentCapabilitiesReason, "Direct stdio MCP requires a approved self-hosted capability path; hosted MCP uses pinned plugins"
 			}
 			cwd, _ := transport["cwd"].(string)
 			command, _ := transport["command"].(string)
 			matched := false
-			for _, capability := range profile.SelfHosted.Capabilities {
-				if (cwd == capability.Path || strings.HasPrefix(cwd, capability.Path+"/")) && strings.HasPrefix(command, capability.Path+"/") && path.Clean(command) == command && path.Clean(cwd) == cwd {
+			for _, directory := range profile.SelfHosted.CapabilityDirectories {
+				if (cwd == directory || strings.HasPrefix(cwd, directory+"/")) && strings.HasPrefix(command, directory+"/") && path.Clean(command) == command && path.Clean(cwd) == cwd {
 					matched = true
 				}
 			}
 			if !matched {
-				return environmentCapabilitiesReason, "Stdio MCP executable and cwd must belong to a pinned capability"
+				return environmentCapabilitiesReason, "Stdio MCP executable and cwd must belong to a approved capability directory"
 			}
 		} else if tool["connection_origin"] == "environment" && profile != nil && profile.OpenAIHosted != nil && profile.OpenAIHosted.Network.Access == "disabled" {
 			return "EnvironmentNetworkRequired", "Environment-origin MCP requires permitted hosted network access"

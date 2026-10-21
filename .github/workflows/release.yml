@@ -153,7 +153,7 @@ jobs:
           EXECUTOR_IMAGE: ${{ steps.images.outputs.executor }}@${{ steps.executor.outputs.digest }}
           SOURCE_REVISION: ${{ github.sha }}
         run: |
-          make build-installer CONTROLLER_IMG="$CONTROLLER_IMAGE" GATEWAY_IMG="$GATEWAY_IMAGE" EXECUTOR_IMG="$EXECUTOR_IMAGE"
+          make build-installer CONTROLLER_IMG="$CONTROLLER_IMAGE" GATEWAY_IMG="$GATEWAY_IMAGE"
           python3 - <<'PY'
           import json, os, re
           from pathlib import Path
@@ -177,8 +177,14 @@ jobs:
               containers = deployments[name]['spec']['template']['spec']['containers']
               if len(containers) != 1 or containers[0]['name'] != container_name or containers[0]['image'] != image:
                   raise SystemExit(f'install.yaml: unexpected {name} container image')
-              if container_name == 'manager' and not any(item.get('name') == 'EXECUTOR_IMAGES' and item.get('value') == executor for item in containers[0].get('env', [])):
-                  raise SystemExit('install.yaml: executor digest was not configured')
+              if container_name == 'manager':
+                  environment = {item['name']: item.get('value') for item in containers[0].get('env', [])}
+                  if environment.get('SANDBOX_POOLS') != '':
+                      raise SystemExit('install.yaml: Sandbox pool approval must be configured by the administrator')
+                  if any(name in environment for name in ('EXECUTOR_IMAGES', 'CAPABILITY_IMAGES', 'WORKSPACE_STORAGE_CLASSES', 'REPOSITORY_URLS')):
+                      raise SystemExit('install.yaml: obsolete direct-Pod configuration remains')
+          if any(resource.get('kind') in ('SandboxTemplate', 'SandboxWarmPool', 'SandboxClaim', 'Sandbox') for resource in resources):
+              raise SystemExit('install.yaml: administrator Sandbox setups must be provisioned separately')
           if jobs:
               raise SystemExit('install.yaml: unexpected Job in runtime-initialized deployment')
           Path('dist/images.json').write_text(json.dumps({'version': os.environ['VERSION'], 'revision': os.environ['SOURCE_REVISION'], 'platforms': ['linux/amd64', 'linux/arm64'], 'controller': controller, 'gateway': gateway, 'executor': executor}, indent=2) + '\n')

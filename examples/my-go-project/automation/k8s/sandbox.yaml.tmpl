@@ -1,0 +1,164 @@
+# Administrator-owned immutable recipe. Session variables are injected by claims.
+apiVersion: extensions.agents.x-k8s.io/v1beta1
+kind: SandboxTemplate
+metadata:
+  name: my-go-project-v1
+  namespace: ${NAMESPACE}
+  labels:
+    agents.softcane.io/managed: 'true'
+spec:
+  envVarsInjectionPolicy: Allowed
+  service: false
+  podTemplate:
+    spec:
+      automountServiceAccountToken: false
+      restartPolicy: Always
+      terminationGracePeriodSeconds: 10
+      nodeSelector:
+        kubernetes.io/arch: ${ARCH}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      initContainers:
+      - name: capability-my-go-project
+        image: ${SKILLS_IMAGE}
+        command:
+        - sh
+        - -c
+        - cp -R /bundle/. /capabilities/
+        securityContext: &id001
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop:
+            - ALL
+        volumeMounts:
+        - name: capabilities-my-go-project
+          mountPath: /capabilities
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+          limits:
+            cpu: '1'
+            memory: 512Mi
+      - name: repository-prepare
+        image: ${EXECUTOR_IMAGE}
+        imagePullPolicy: IfNotPresent
+        command:
+        - /workspace-bootstrap
+        args:
+        - --storage-root
+        - /workspace-storage
+        - --session-uid
+        - $(SESSION_UID)
+        - --url
+        - ${REPOSITORY_URL}
+        - --commit
+        - ${REPOSITORY_COMMIT}
+        - --credential-directory
+        - /repository-credentials
+        env:
+        - name: TMPDIR
+          value: /tmp
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop:
+            - ALL
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+          limits:
+            cpu: '1'
+            memory: 512Mi
+        volumeMounts:
+        - name: workspace
+          mountPath: /workspace-storage
+        - name: repository-credentials
+          mountPath: /repository-credentials
+          readOnly: true
+        - name: tmp
+          mountPath: /tmp
+      containers:
+      - name: executor
+        image: ${EXECUTOR_IMAGE}
+        imagePullPolicy: IfNotPresent
+        workingDir: /workspace
+        command:
+        - codex
+        - exec-server
+        args:
+        - --remote
+        - $(CODEX_REMOTE_URL)
+        - --environment-id
+        - $(CODEX_ENVIRONMENT_ID)
+        env:
+        - name: CODEX_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: codex-executor
+              key: CODEX_API_KEY
+        securityContext: *id001
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+          limits:
+            cpu: '1'
+            memory: 512Mi
+        volumeMounts:
+        - name: workspace
+          mountPath: /workspace
+          subPath: project
+        - name: home
+          mountPath: /home/node
+        - name: tmp
+          mountPath: /tmp
+        - name: capabilities-my-go-project
+          mountPath: /capabilities/my-go-project
+          readOnly: true
+      volumes:
+      - name: repository-credentials
+        secret:
+          secretName: codex-repository
+          defaultMode: 0440
+          items:
+          - key: token
+            path: token
+      - name: home
+        emptyDir:
+          sizeLimit: 128Mi
+      - name: tmp
+        emptyDir:
+          sizeLimit: 1Gi
+      - name: capabilities-my-go-project
+        emptyDir: {}
+  volumeClaimTemplates:
+  - metadata:
+      name: workspace
+    spec:
+      accessModes:
+      - ReadWriteOnce
+      storageClassName: ${STORAGE_CLASS}
+      resources:
+        requests:
+          storage: 4Gi
+---
+apiVersion: extensions.agents.x-k8s.io/v1beta1
+kind: SandboxWarmPool
+metadata:
+  name: my-go-project-v1
+  namespace: ${NAMESPACE}
+  labels:
+    agents.softcane.io/managed: 'true'
+spec:
+  replicas: 0
+  sandboxTemplateRef:
+    name: my-go-project-v1

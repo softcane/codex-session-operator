@@ -11,9 +11,22 @@ spec:
         env:
         - name: GATEWAY_METRICS_ADDRESS
           value: :8443
+        - name: GATEWAY_METRICS_CERT
+          value: /gateway-tls/tls.crt
+        - name: GATEWAY_METRICS_KEY
+          value: /gateway-tls/tls.key
+        volumeMounts:
+        - name: gateway-tls
+          mountPath: /gateway-tls
+          readOnly: true
         ports:
         - name: metrics
           containerPort: 8443
+      volumes:
+      - name: gateway-tls
+        secret:
+          secretName: gateway-tls
+          defaultMode: 0440
 ---
 apiVersion: v1
 kind: Service

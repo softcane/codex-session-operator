@@ -1,0 +1,34 @@
+# Agent Sandbox resolves templates asynchronously. Freeze administrator recipes so
+# an approved reference cannot change between our validation and upstream creation.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: codex-sandbox-template-immutable
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+    - apiGroups: [extensions.agents.x-k8s.io]
+      apiVersions: [v1beta1]
+      operations: [UPDATE]
+      resources: [sandboxtemplates, sandboxwarmpools]
+  matchConditions:
+  - name: managed-setup
+    expression: >-
+      (has(object.metadata.labels) && 'agents.softcane.io/managed' in object.metadata.labels && object.metadata.labels['agents.softcane.io/managed'] == 'true') ||
+      (has(oldObject.metadata.labels) && 'agents.softcane.io/managed' in oldObject.metadata.labels && oldObject.metadata.labels['agents.softcane.io/managed'] == 'true')
+  validations:
+  - expression: >-
+      has(object.metadata.labels) && 'agents.softcane.io/managed' in object.metadata.labels && object.metadata.labels['agents.softcane.io/managed'] == 'true'
+    message: The managed setup label cannot be removed.
+  - expression: >-
+      object.spec == oldObject.spec
+    message: Managed Sandbox template and pool specifications are immutable; create a versioned setup instead.
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: codex-sandbox-template-immutable
+spec:
+  policyName: codex-sandbox-template-immutable
+  validationActions: [Deny]

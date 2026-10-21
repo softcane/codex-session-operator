@@ -133,7 +133,7 @@ func (j *journal) save(op operation) (operation, error) {
 			return operation{}, loadErr
 		}
 		if !sameRequest(existing, op) {
-			return operation{}, errors.New("saved operation conflicts with body, target, namespace or authenticated subject")
+			return operation{}, errors.New("saved operation conflicts with body, target, namespace or service replay subject")
 		}
 		return existing, nil
 	}
@@ -289,25 +289,4 @@ func rejectPathSymlinks(path string) error {
 			return nil
 		}
 	}
-}
-
-func readPrivateFile(path string, limit int64) ([]byte, error) {
-	absolute, err := filepath.Abs(path)
-	if err != nil || rejectPathSymlinks(absolute) != nil {
-		return nil, errors.New("invalid private file path")
-	}
-	file, err := os.OpenFile(absolute, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
-	if err != nil {
-		return nil, errors.New("open private file")
-	}
-	defer func() { _ = file.Close() }()
-	info, err := file.Stat()
-	if err != nil || !info.Mode().IsRegular() || !privateOwned(info) {
-		return nil, errors.New("file must be restricted and owned by the caller")
-	}
-	raw, err := io.ReadAll(io.LimitReader(file, limit+1))
-	if err != nil || int64(len(raw)) > limit {
-		return nil, errors.New("read bounded private file")
-	}
-	return raw, nil
 }

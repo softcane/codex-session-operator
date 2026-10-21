@@ -12,7 +12,6 @@ import (
 )
 
 const (
-	_noneMode          = "none"
 	_gatewayNoneStatus = "gateway.none"
 	_echoFunction      = "gateway_echo"
 	_noteFunction      = "gateway_record_note"

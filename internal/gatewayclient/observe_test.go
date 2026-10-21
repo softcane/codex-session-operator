@@ -42,9 +42,9 @@ func TestNewRootOutcomesExcludeEveryBaselineIdentity(t *testing.T) {
 	}
 }
 
-func TestObservationStateUsesStructuredLifecycleAndSupportsOlderServer(t *testing.T) {
+func TestObservationStateUsesStructuredLifecycleAndIgnoresDisplayPhase(t *testing.T) {
 	tests := []struct{ name, lifecycle, want string }{
-		{name: "older server", want: _stateAccepted},
+		{name: "no lifecycle or phase required", want: _stateAccepted},
 		{name: "preparing despite stale Ready phase", lifecycle: `{"execution_ready":false,"reason":"WorkspacePreparing"}`, want: _statePreparing},
 		{name: "connecting", lifecycle: `{"execution_ready":false,"reason":"EnvironmentConnecting"}`, want: "connecting"},
 		{name: "runtime unavailable", lifecycle: `{"execution_ready":false,"reason":"ExecutorObservationUnavailable"}`, want: _observationUnavailable},
@@ -52,7 +52,7 @@ func TestObservationStateUsesStructuredLifecycleAndSupportsOlderServer(t *testin
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			body := `{"summary":{"state":"open","phase":"Ready"},"history":{"id":"remote"}`
+			body := `{"summary":{"state":"open","phase":"FutureDisplayValue"},"history":{"id":"remote"}`
 			if tt.lifecycle != "" {
 				body += `,"lifecycle":` + tt.lifecycle
 			}

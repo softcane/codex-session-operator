@@ -38,7 +38,7 @@ func readyProfileObjects(namespace string) (*agentsv1alpha1.Profile, []client.Ob
 	agent := &agentsv1alpha1.Agent{ObjectMeta: metav1.ObjectMeta{Name: _profileTestAgent, Namespace: namespace, UID: "agent-profile-uid", Generation: 1},
 		Status: agentsv1alpha1.AgentStatus{Conditions: profileReadyConditions(1)}}
 	environment := &agentsv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{Name: _profileTestEnvironment, Namespace: namespace, UID: _profileTestEnvironmentUID, Generation: 1},
-		Spec: agentsv1alpha1.EnvironmentSpec{Mode: _noneMode}, Status: agentsv1alpha1.EnvironmentStatus{Conditions: profileReadyConditions(1)}}
+		Spec: agentsv1alpha1.EnvironmentSpec{Mode: agentsv1alpha1.EnvironmentModeNone}, Status: agentsv1alpha1.EnvironmentStatus{Conditions: profileReadyConditions(1)}}
 	vault := &agentsv1alpha1.Vault{ObjectMeta: metav1.ObjectMeta{Name: _profileTestVault, Namespace: namespace, UID: _profileTestVaultUID, Generation: 1},
 		Status: agentsv1alpha1.VaultStatus{Conditions: profileReadyConditions(1)}}
 	profile := &agentsv1alpha1.Profile{ObjectMeta: metav1.ObjectMeta{Name: _profileTestName, Namespace: namespace, UID: types.UID("profile-" + namespace), Generation: 1, ResourceVersion: "1"},
@@ -80,7 +80,7 @@ func TestProfileAdmissionLiveEditNamespaceAndRetirement(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	other, _, err := g.createConversation(t.Context(), Principal{Namespace: _testWorkOther, Subject: _testConversationSubject}, "profile-first",
+	other, _, err := g.createConversation(t.Context(), requestScope{Namespace: _testWorkOther, Subject: _testConversationSubject}, "profile-first",
 		ConversationInput{RouteID: _profileTestName, Text: "Inspect the repository"})
 	if err != nil || other.Work.Attempts[0].Profile.UID != string(otherProfile.UID) || other.UID == original.UID {
 		t.Fatal("same-named Profile crossed namespaces", err)
@@ -194,7 +194,7 @@ func TestProfileSelectionIsCopiedAndResolvedUIDsArePinned(t *testing.T) {
 	}
 	record := readWorkRecord(t, store, id)
 	session := workerWorkSession(t, writer, record)
-	environment := &agentsv1alpha1.SessionEnvironmentSnapshot{Name: _profileTestEnvironment, UID: _profileTestEnvironmentUID, Profile: agentsv1alpha1.EnvironmentSpec{Mode: _noneMode}}
+	environment := &agentsv1alpha1.SessionEnvironmentSnapshot{Name: _profileTestEnvironment, UID: _profileTestEnvironmentUID, Profile: agentsv1alpha1.EnvironmentSpec{Mode: agentsv1alpha1.EnvironmentModeNone}}
 	if err := g.validateProfileDependencies(t.Context(), session, environment, record.Work.Attempts[0].Profile); err != nil {
 		t.Fatal(err)
 	}
@@ -291,7 +291,7 @@ func TestProfileDiscoveryPagesAuthoritativeCRDSource(t *testing.T) {
 		}
 	}
 	if response := conversationRequest(g, http.MethodGet, "/v1/namespaces/other/profiles/sandbox", "", ""); response.Code != http.StatusNotFound {
-		t.Fatal("Profile discovery crossed principal namespace")
+		t.Fatal("Profile discovery crossed scope namespace")
 	}
 	for _, query := range []string{"limit=0", "limit=101", "limit=1&limit=2", "after="} {
 		if response := conversationRequest(g, http.MethodGet, "/v1/namespaces/team/profiles?"+query, "", ""); response.Code != http.StatusBadRequest {
@@ -356,7 +356,7 @@ func TestProfileCatalogReflectsLivePolicyAndReadiness(t *testing.T) {
 func TestProfileConcurrentAcceptanceAcrossRevisionsKeepsOneSnapshot(t *testing.T) {
 	store := testStore(t)
 	first, writer, _ := profileGateway(t, store)
-	second, err := New(store, writer, simulatorForTest(), []Principal{{Token: _token, Namespace: _testNamespace, Subject: _testConversationSubject}}, nil)
+	second, err := New(store, writer, simulatorForTest(), "writer", nil)
 	if err != nil || second.EnableProfiles(writer) != nil {
 		t.Fatal(err)
 	}
@@ -388,6 +388,6 @@ func TestProfileConcurrentAcceptanceAcrossRevisionsKeepsOneSnapshot(t *testing.T
 }
 
 func gCreateCanceled(g *Gateway, ctx context.Context) (Record, WorkEvent, error) {
-	return g.createConversation(ctx, Principal{Namespace: _testNamespace, Subject: _testConversationSubject}, "canceled-profile",
+	return g.createConversation(ctx, requestScope{Namespace: _testNamespace, Subject: _testConversationSubject}, "canceled-profile",
 		ConversationInput{RouteID: _profileTestName, Text: "Canceled"})
 }

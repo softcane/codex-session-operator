@@ -18,7 +18,7 @@ import (
 )
 
 const (
-	// SessionModel is fixed for the first remote-only slice.
+	// SessionModel is the default when creation has no saved Agent or model override.
 	SessionModel      = "gpt-6-luna"
 	selfHostedType    = "self_hosted"
 	ownerKey          = "kubernetes_uid"
@@ -31,17 +31,15 @@ const (
 // ErrNotFound indicates an absent remote resource, not a missing Kubernetes CR.
 var ErrNotFound = errors.New("OpenAI resource not found")
 
-// ErrSpendControlUnavailable is the known project capability rejection. The
+// ErrSpendControlUnavailable indicates a known API or project capability rejection. The
 // provider does not expose the raw API error body or request through this error.
-var ErrSpendControlUnavailable = errors.New("OpenAI Session spending limits are not enabled for this project")
+var ErrSpendControlUnavailable = errors.New("OpenAI Session spending limits are unavailable for this API or project")
 
 // Session contains only the fields needed for lifecycle reconciliation.
 // No provider error text or credentials are copied into this value.
 type Session struct {
 	ID, EnvironmentID, RemoteURL, WorkspaceDirectory, Model, OwnerUID, Status string
 	AgentID                                                                   string
-	AgentConfigurationDigest                                                  string
-	AgentBlockReason, AgentBlockMessage                                       string
 	SelfHosted                                                                bool
 	EnvironmentType                                                           string
 	EnvironmentConfigurationDigest                                            string
@@ -168,8 +166,7 @@ func summarize(remote *openai.AgentSession) Session {
 		spendLimit = spending.Limit
 		spendConsumed = spending.Consumed
 	}
-	reason, message := AgentSessionBlock(configuration)
-	return Session{AgentConfigurationDigest: AgentConfigurationDigest(configuration), AgentBlockReason: reason, AgentBlockMessage: message, ID: remote.ID, EnvironmentID: remote.Environment.ID,
+	return Session{ID: remote.ID, EnvironmentID: remote.Environment.ID,
 		RemoteURL: remote.Environment.RemoteURL, WorkspaceDirectory: remote.Environment.WorkspaceDirectory,
 		Model: remote.Agent.Model, AgentID: remote.Agent.ID, OwnerUID: owner, Status: string(remote.Status),
 		SelfHosted: remote.Environment.Type == selfHostedType, EnvironmentType: remote.Environment.Type,
@@ -192,9 +189,12 @@ func safeError(operation string, err error) error {
 		if apiErr.StatusCode == http.StatusNotFound && !strings.HasPrefix(operation, createOperation) {
 			return ErrNotFound
 		}
-		if apiErr.StatusCode == http.StatusBadRequest && apiErr.Param == spendControlField &&
-			apiErr.Message == "Session budget configuration is not enabled" {
-			return ErrSpendControlUnavailable
+		if apiErr.StatusCode == http.StatusBadRequest && apiErr.Param == spendControlField {
+			if apiErr.Message == "Session budget configuration is not enabled" ||
+				(apiErr.Type == "invalid_request_error" && apiErr.Code == "unknown_parameter" &&
+					apiErr.Message == "Unknown parameter: 'spend_control'.") {
+				return ErrSpendControlUnavailable
+			}
 		}
 		return fmt.Errorf("OpenAI Session %s failed (HTTP %d)", operation, apiErr.StatusCode)
 	}

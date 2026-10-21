@@ -29,6 +29,7 @@ import (
 type AgentSpec struct {
 	// +kubebuilder:validation:MinLength=1
 	// +kubebuilder:validation:MaxLength=128
+	// +required
 	Model string `json:"model"`
 	// +optional
 	// +kubebuilder:validation:MaxLength=128
@@ -41,7 +42,7 @@ type AgentSpec struct {
 	// Metadata permits 13 user entries, reserving three ownership entries.
 	// +optional
 	// +kubebuilder:validation:MaxProperties=13
-	// +kubebuilder:validation:XValidation:rule="self.all(k, size(k) <= 64 && size(self[k]) <= 512 && !(k in ['kubernetes_uid', 'operator', 'owner_scope']))",message="metadata exceeds limits or uses reserved ownership keys"
+	// +kubebuilder:validation:XValidation:rule="self.all(k, size(k) >= 1 && size(k) <= 64 && size(self[k]) <= 512 && !(k in ['kubernetes_uid', 'operator', 'owner_scope']))",message="metadata exceeds limits or uses reserved ownership keys"
 	Metadata *map[string]string `json:"metadata,omitempty"`
 	// +optional
 	Reasoning *AgentReasoning `json:"reasoning,omitempty"`
@@ -60,7 +61,8 @@ type AgentSpec struct {
 	// +listType=atomic
 	Tools *[]AgentTool `json:"tools,omitempty"`
 	// +kubebuilder:validation:Enum=Delete;Retain
-	DeletionPolicy string `json:"deletionPolicy"`
+	// +required
+	DeletionPolicy DeletionPolicy `json:"deletionPolicy"`
 }
 
 // AgentReasoning replaces the complete remote reasoning object.
@@ -86,6 +88,7 @@ type AgentText struct {
 // +kubebuilder:validation:XValidation:rule="(self.type == 'json_schema') == has(self.schema)",message="json_schema requires schema; text forbids schema"
 type AgentTextFormat struct {
 	// +kubebuilder:validation:Enum=text;json_schema
+	// +required
 	Type string `json:"type"`
 	// Schema is an object containing a JSON Schema, not arbitrary Agent configuration.
 	// +optional
@@ -96,6 +99,7 @@ type AgentTextFormat struct {
 
 // AgentMultiAgent controls subagent concurrency. Function tools cannot be used by subagents.
 type AgentMultiAgent struct {
+	// +required
 	Enabled bool `json:"enabled"`
 	// +optional
 	// +kubebuilder:validation:Minimum=1
@@ -111,6 +115,7 @@ type AgentMultiAgent struct {
 // +kubebuilder:validation:XValidation:rule="(self.type == 'computer_use') == has(self.computerUse)",message="computerUse branch must match type"
 type AgentTool struct {
 	// +kubebuilder:validation:Enum=function;tool_search;programmatic_tool_calling;mcp;web_search;computer_use
+	// +required
 	Type string `json:"type"`
 	// +optional
 	Function *AgentFunction `json:"function,omitempty"`
@@ -127,11 +132,14 @@ type AgentTool struct {
 // AgentFunction declares an application tool; execution belongs to the gateway.
 type AgentFunction struct {
 	// +kubebuilder:validation:Pattern="^[A-Za-z0-9_-]{1,64}$"
+	// +required
 	Name string `json:"name"`
 	// +kubebuilder:validation:MaxLength=8192
+	// +required
 	Description string `json:"description"`
 	// +kubebuilder:validation:Type=object
 	// +kubebuilder:pruning:PreserveUnknownFields
+	// +required
 	Parameters apiextensionsv1.JSON `json:"parameters"`
 	// +optional
 	DeferLoading *bool `json:"deferLoading,omitempty"`
@@ -155,8 +163,10 @@ type AgentComputerUse struct {
 type AgentMCP struct {
 	// +kubebuilder:validation:MinLength=1
 	// +kubebuilder:validation:MaxLength=64
-	ServerLabel string            `json:"serverLabel"`
-	Transport   AgentMCPTransport `json:"transport"`
+	// +required
+	ServerLabel string `json:"serverLabel"`
+	// +required
+	Transport AgentMCPTransport `json:"transport"`
 	// CredentialID references a Vault credential; it never contains a token.
 	// +optional
 	// +kubebuilder:validation:Pattern="^[A-Za-z0-9_-]{1,128}$"
@@ -165,6 +175,9 @@ type AgentMCP struct {
 	Required *bool `json:"required,omitempty"`
 	// +optional
 	// +kubebuilder:validation:MaxItems=128
+	// +listType=atomic
+	// +kubebuilder:validation:items:MinLength=1
+	// +kubebuilder:validation:items:MaxLength=256
 	AllowedTools *[]string `json:"allowedTools,omitempty"`
 	// +optional
 	// +kubebuilder:validation:Enum=service;environment
@@ -181,6 +194,7 @@ type AgentMCP struct {
 // +kubebuilder:validation:XValidation:rule="(self.type == 'stdio') == has(self.stdio)",message="stdio branch must match type"
 type AgentMCPTransport struct {
 	// +kubebuilder:validation:Enum=http;stdio
+	// +required
 	Type string `json:"type"`
 	// +optional
 	HTTP *AgentMCPHTTP `json:"http,omitempty"`
@@ -192,6 +206,7 @@ type AgentMCPTransport struct {
 type AgentMCPHTTP struct {
 	// +kubebuilder:validation:MaxLength=2048
 	// +kubebuilder:validation:Pattern="^https://[^/@?#]+(/[^?#]*)?$"
+	// +required
 	ServerURL string `json:"serverURL"`
 	// +optional
 	// +kubebuilder:validation:MaxProperties=2
@@ -203,16 +218,24 @@ type AgentMCPHTTP struct {
 type AgentMCPStdio struct {
 	// +kubebuilder:validation:MinLength=1
 	// +kubebuilder:validation:MaxLength=256
+	// +required
 	Command string `json:"command"`
 	// +kubebuilder:validation:Pattern="^/"
 	// +kubebuilder:validation:MaxLength=4096
-	Cwd string `json:"cwd"`
+	// +required
+	WorkingDirectory string `json:"workingDirectory"`
 	// Args must contain non-secret arguments only.
 	// +optional
 	// +kubebuilder:validation:MaxItems=64
+	// +listType=atomic
+	// +kubebuilder:validation:items:MaxLength=4096
 	Args *[]string `json:"args,omitempty"`
 	// +optional
 	// +kubebuilder:validation:MaxItems=64
+	// +listType=atomic
+	// +kubebuilder:validation:items:MinLength=1
+	// +kubebuilder:validation:items:MaxLength=256
+	// +kubebuilder:validation:items:Pattern="^[A-Za-z_][A-Za-z0-9_]{0,127}$"
 	EnvVars *[]string `json:"envVars,omitempty"`
 }
 
@@ -220,6 +243,9 @@ type AgentMCPStdio struct {
 type AgentWebSearch struct {
 	// +optional
 	// +kubebuilder:validation:MaxItems=128
+	// +listType=atomic
+	// +kubebuilder:validation:items:MinLength=1
+	// +kubebuilder:validation:items:MaxLength=256
 	AllowedDomains *[]string `json:"allowedDomains,omitempty"`
 	// +optional
 	// +kubebuilder:validation:Enum=low;medium;high
@@ -255,6 +281,8 @@ type AgentStatus struct {
 	// +optional
 	// +kubebuilder:validation:MaxItems=26
 	// +listType=set
+	// +kubebuilder:validation:items:MinLength=1
+	// +kubebuilder:validation:items:MaxLength=256
 	ManagedMetadataKeys []string `json:"managedMetadataKeys,omitempty"`
 	CreationAttempted   bool     `json:"creationAttempted,omitempty"`
 	// OwnerScope freezes the operator installation/project identity before creation.
@@ -264,6 +292,7 @@ type AgentStatus struct {
 	// +listType=map
 	// +listMapKey=type
 	// +optional
+	// +kubebuilder:validation:MaxItems=16
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
 }
 

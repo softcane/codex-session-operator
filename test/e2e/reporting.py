@@ -22,7 +22,8 @@ def public_report(directory, report):
     """CI receives a deliberate allowlist, never private journals or provider bodies."""
     allowed = ("run", "cluster", "result", "exitCode", "provider", "layer", "checks", "sourceHashes",
                "manifestSHA256", "crdSchemaHashes", "images", "clusterKept", "notTested", "stage",
-               "spendingMode", "aggregateLimitCents", "allocationCents", "spendingLimitQualified")
+               "spendingMode", "aggregateLimitCents", "allocationCents", "spendingLimitQualified",
+               "model", "singleSession", "retentionRequested", "cleanupPerformed", "access")
     value = {key: report[key] for key in allowed if key in report}
     value["scenarios"] = [{key: item[key] for key in ("id", "name", "status", "result") if key in item}
                           for item in report.get("scenarios", [])]

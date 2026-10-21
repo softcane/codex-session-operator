@@ -10,172 +10,203 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	sandboxv1beta1 "sigs.k8s.io/agent-sandbox/api/v1beta1"
+	extensionsv1beta1 "sigs.k8s.io/agent-sandbox/extensions/api/v1beta1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 )
 
-// reconcileWorkspaceClaim observes a UID-frozen claim before mounting it. The
-// second return reports an internal status commit; callers must not patch again
-// using their older optimistic-lock base.
-func (r *SessionReconciler) reconcileWorkspaceClaim(ctx context.Context, session *agentsv1alpha1.Session) (bool, bool, error) {
-	storage := sandbox.PersistentWorkspace(session)
-	if storage == nil {
-		return true, false, nil
-	}
-	if err := sandbox.ValidateWorkspaceStorage(storage, r.WorkspaceStorageClasses); err != nil {
-		executorState(session, "Failed", "WorkspaceStorageInvalid", "Frozen workspace storage class or policy is not approved")
-		return false, false, nil
-	}
-	desired, err := sandbox.WorkspaceClaim(session)
+func (r *SessionReconciler) observeWorkspace(ctx context.Context, session *agentsv1alpha1.Session, runtime *sandboxv1beta1.Sandbox, pod *corev1.Pod) error {
+	name, err := sandbox.WorkspaceMount(pod, session.Status.EnvironmentSnapshot.Profile.SelfHosted)
 	if err != nil {
-		executorState(session, "Failed", "WorkspaceStorageInvalid", "Frozen workspace claim configuration is invalid")
-		return false, false, nil
+		return err
 	}
-	if storage.ClaimDeletionPolicy == deletePolicy {
-		if err := controllerutil.SetControllerReference(session, desired, r.Scheme); err != nil {
-			return false, false, err
-		}
+	if name != sandbox.WorkspaceClaimName(runtime) {
+		return errors.New("workspace does not belong to the allocated sandbox")
 	}
-	current := &corev1.PersistentVolumeClaim{}
-	reader := r.APIReader
-	if reader == nil {
-		reader = r.Client
+	var claim corev1.PersistentVolumeClaim
+	if err := r.reader().Get(ctx, client.ObjectKey{Namespace: session.Namespace, Name: name}, &claim); err != nil {
+		return err
 	}
-	err = reader.Get(ctx, client.ObjectKeyFromObject(desired), current)
-	if apierrors.IsNotFound(err) {
-		return r.createMissingWorkspaceClaim(ctx, session, desired, storage)
-	}
-	if err != nil {
-		return false, false, err
-	}
-	if storage.ClaimDeletionPolicy == retainPolicy && session.Status.WorkspaceClaimUID == "" &&
-		current.Labels[sandbox.WorkspaceSessionUIDLabel] == string(session.UID) && session.Status.WorkspaceClaimCreationAttempted {
-		executorState(session, "Failed", "WorkspaceClaimOutcomeUnknown", "Retained claim exists but its UID was not durably recorded; audit is required")
-		return false, false, nil
-	}
-	if current.Labels[sandbox.WorkspaceSessionUIDLabel] != string(session.UID) ||
-		(storage.ClaimDeletionPolicy == deletePolicy && !metav1.IsControlledBy(current, session)) ||
-		(storage.ClaimDeletionPolicy == retainPolicy && (!session.Status.WorkspaceClaimCreationAttempted ||
-			len(current.OwnerReferences) != 0 || session.Status.WorkspaceClaimUID == "")) {
-		executorState(session, "Failed", "WorkspaceOwnershipMismatch", "Workspace claim belongs to another owner; adoption is blocked")
-		return false, false, nil
-	}
-	if !current.DeletionTimestamp.IsZero() || !workspaceClaimMatches(current, desired) {
-		executorState(session, "Failed", "WorkspaceClaimChanged", "Frozen workspace claim was changed or is deleting")
-		return false, false, nil
-	}
-	if session.Status.WorkspaceClaimUID != "" && session.Status.WorkspaceClaimUID != string(current.UID) {
-		executorState(session, "Failed", "WorkspaceClaimReplaced", "Workspace claim UID changed; automatic adoption is blocked")
-		return false, false, nil
-	}
-	if session.Status.WorkspaceClaimUID == "" {
-		session.Status.WorkspaceClaimUID = string(current.UID)
-		executorState(session, "Provisioning", "WorkspaceClaimObserved", "Workspace claim identity is frozen before executor start")
-		return false, false, nil
-	}
-	return true, false, nil
-}
-
-func (r *SessionReconciler) createMissingWorkspaceClaim(ctx context.Context, session *agentsv1alpha1.Session,
-	desired *corev1.PersistentVolumeClaim, storage *agentsv1alpha1.WorkspaceStorage) (bool, bool, error) {
-	if session.Status.WorkspaceClaimUID != "" {
-		executorState(session, "Failed", "WorkspaceClaimMissing", "Frozen workspace claim disappeared; automatic replacement would lose files")
-		return false, false, nil
-	}
-	if storage.ClaimDeletionPolicy != retainPolicy {
-		if err := r.Create(ctx, desired); err != nil && !apierrors.IsAlreadyExists(err) {
-			return false, false, err
-		}
-		executorState(session, "Provisioning", "WorkspaceClaimProvisioning", "Workspace claim creation requested")
-		return false, false, nil
-	}
-	if session.Status.WorkspaceClaimCreationAttempted {
-		executorState(session, "Failed", "WorkspaceClaimOutcomeUnknown", "Retained claim create outcome is unknown; audit is required")
-		return false, false, nil
-	}
-	base := session.DeepCopy()
-	session.Status.WorkspaceClaimCreationAttempted = true
-	executorState(session, "Provisioning", "WorkspaceClaimCreating", "Retained workspace claim creation has been claimed")
-	if err := r.patchStatus(ctx, session, base); err != nil {
-		return false, false, err
-	}
-	claimed := session.DeepCopy()
-	if err := r.Create(ctx, desired); err != nil {
-		return false, true, err
-	}
-	if desired.UID == "" {
-		return false, true, errors.New("created retained workspace claim has no UID")
-	}
-	session.Status.WorkspaceClaimUID = string(desired.UID)
-	executorState(session, "Provisioning", "WorkspaceClaimObserved", "Retained workspace claim identity is frozen")
-	return false, true, r.patchStatus(ctx, session, claimed)
-}
-
-func workspaceClaimMatches(current, desired *corev1.PersistentVolumeClaim) bool {
-	actual := current.Spec.DeepCopy()
-	actual.VolumeName = "" // Binding assigns a volume after claim creation.
-	if actual.VolumeMode != nil && *actual.VolumeMode == corev1.PersistentVolumeFilesystem {
-		actual.VolumeMode = nil // API default.
-	}
-	return reflect.DeepEqual(actual, &desired.Spec)
-}
-
-// finalizeWorkspaceClaim runs only after the executor Pod has disappeared and the
-// remote Session has been observed absent. Retain claims never have a Session
-func (r *SessionReconciler) finalizeWorkspaceClaim(ctx context.Context, session *agentsv1alpha1.Session) (bool, error) {
-	storage := sandbox.PersistentWorkspace(session)
-	if storage == nil {
-		return false, nil
-	}
-	claim := &corev1.PersistentVolumeClaim{}
-	reader := r.APIReader
-	if reader == nil {
-		reader = r.Client
-	}
-	err := reader.Get(ctx, client.ObjectKey{Namespace: session.Namespace, Name: sandbox.WorkspaceClaimNameForUID(string(session.UID))}, claim)
-	if apierrors.IsNotFound(err) {
-		if storage.ClaimDeletionPolicy == retainPolicy && session.Status.WorkspaceClaimCreationAttempted {
-			return true, errors.New("retained workspace claim is missing; audit the creation outcome or data loss")
-		}
-		return false, nil
-	}
-	if err != nil {
-		return true, err
+	if !claim.DeletionTimestamp.IsZero() || !metav1.IsControlledBy(&claim, runtime) || string(claim.UID) == "" {
+		return errors.New("sandbox workspace identity is unavailable")
 	}
 	if session.Status.WorkspaceClaimUID != "" && session.Status.WorkspaceClaimUID != string(claim.UID) {
-		return true, errors.New("workspace claim UID differs from the frozen Session identity")
+		return errors.New("sandbox workspace was replaced; automatic adoption is blocked")
 	}
-	if claim.Labels[sandbox.WorkspaceSessionUIDLabel] != string(session.UID) ||
-		(storage.ClaimDeletionPolicy == deletePolicy && !metav1.IsControlledBy(claim, session)) ||
-		(storage.ClaimDeletionPolicy == retainPolicy && (!session.Status.WorkspaceClaimCreationAttempted ||
-			len(claim.OwnerReferences) != 0 || session.Status.WorkspaceClaimUID == "")) {
-		return true, errors.New("workspace claim ownership could not be verified")
+	if len(runtime.Spec.VolumeClaimTemplates) != 1 || !workspaceClaimMatches(&claim, runtime.Spec.VolumeClaimTemplates[0].Spec) {
+		return errors.New("sandbox workspace differs from its frozen template")
 	}
-	if storage.ClaimDeletionPolicy == deletePolicy && session.Status.WorkspaceClaimUID == "" {
-		session.Status.WorkspaceClaimUID = string(claim.UID)
-		return true, nil
+	session.Status.WorkspaceClaimUID = string(claim.UID)
+	return nil
+}
+
+func workspaceClaimMatches(current *corev1.PersistentVolumeClaim, expected corev1.PersistentVolumeClaimSpec) bool {
+	actual := current.Spec.DeepCopy()
+	desired := expected.DeepCopy()
+	actual.VolumeName = ""
+	if actual.VolumeMode != nil && *actual.VolumeMode == corev1.PersistentVolumeFilesystem {
+		actual.VolumeMode = nil
 	}
-	if storage.ClaimDeletionPolicy == deletePolicy {
-		if claim.DeletionTimestamp.IsZero() {
-			if err := r.Delete(ctx, claim, client.Preconditions{UID: &claim.UID}); err != nil && !apierrors.IsNotFound(err) {
-				return true, err
-			}
-		}
-		return true, nil
+	if desired.VolumeMode != nil && *desired.VolumeMode == corev1.PersistentVolumeFilesystem {
+		desired.VolumeMode = nil
 	}
-	if storage.ClaimDeletionPolicy != retainPolicy || session.Status.WorkspaceClaimUID != string(claim.UID) {
-		return true, errors.New("workspace retention requires a frozen claim UID")
+	return reflect.DeepEqual(actual, desired)
+}
+
+func (r *SessionReconciler) revalidatePreparedClaim(ctx context.Context, s *agentsv1alpha1.Session, proof *agentsv1alpha1.SessionWorkspacePreparationStatus) bool {
+	var runtime sandboxv1beta1.Sandbox
+	if r.reader().Get(ctx, client.ObjectKey{Namespace: s.Namespace, Name: s.Status.SandboxName}, &runtime) != nil || string(runtime.UID) != proof.SandboxUID || proof.ClaimUID != s.Status.WorkspaceClaimUID {
+		return false
 	}
-	if claim.Annotations[sandbox.WorkspaceRetainedAnnotation] == string(session.UID) {
+	var claim corev1.PersistentVolumeClaim
+	return r.reader().Get(ctx, client.ObjectKey{Namespace: s.Namespace, Name: sandbox.WorkspaceClaimName(&runtime)}, &claim) == nil &&
+		string(claim.UID) == proof.ClaimUID && claim.DeletionTimestamp.IsZero() && metav1.IsControlledBy(&claim, &runtime) &&
+		len(runtime.Spec.VolumeClaimTemplates) == 1 && workspaceClaimMatches(&claim, runtime.Spec.VolumeClaimTemplates[0].Spec)
+}
+
+func (r *SessionReconciler) preparedRuntimeMatches(ctx context.Context, s *agentsv1alpha1.Session, proof *agentsv1alpha1.SessionWorkspacePreparationStatus) bool {
+	var runtime sandboxv1beta1.Sandbox
+	return r.reader().Get(ctx, client.ObjectKey{Namespace: s.Namespace, Name: s.Status.SandboxName}, &runtime) == nil &&
+		runtime.DeletionTimestamp.IsZero() && string(runtime.UID) == proof.SandboxUID && sandbox.ConfigDigest(&runtime) == proof.ConfigDigest &&
+		runtime.Spec.PodTemplate.ObjectMeta.Annotations[sandbox.ConfigAnnotation] == s.Status.ExecutorConfigDigest
+}
+
+// finalizeWorkspaceClaim runs only after input is quiesced, compute is absent,
+// and the remote Session is observed absent. Retention preserves a suspended
+// Sandbox/PVC without a live Claim that could recreate Running compute.
+func (r *SessionReconciler) finalizeWorkspaceClaim(ctx context.Context, s *agentsv1alpha1.Session) (bool, error) {
+	if s.Status.EnvironmentSnapshot == nil || s.Status.EnvironmentSnapshot.Profile.SelfHosted == nil {
 		return false, nil
 	}
-	base := claim.DeepCopy()
-	if claim.Annotations == nil {
-		claim.Annotations = make(map[string]string, 1)
-	}
-	claim.Annotations[sandbox.WorkspaceRetainedAnnotation] = string(session.UID)
-	if err := r.Patch(ctx, claim, client.MergeFromWithOptions(base, client.MergeFromWithOptimisticLock{})); err != nil {
+	claim, err := r.workspaceCleanupClaim(ctx, s)
+	if err != nil {
 		return true, err
 	}
+	if sandbox.WorkspacePolicy(s) == sandbox.WorkspaceClaimRetain {
+		pending, err := r.retainWorkspace(ctx, s, claim)
+		if err != nil || pending {
+			return pending, err
+		}
+	}
+	if claim == nil {
+		return r.executorStillPresent(ctx, s)
+	}
+	if claim.DeletionTimestamp.IsZero() {
+		if err := r.Delete(ctx, claim, client.Preconditions{UID: &claim.UID}, client.PropagationPolicy(metav1.DeletePropagationForeground)); err != nil {
+			return true, client.IgnoreNotFound(err)
+		}
+	}
 	return true, nil
+}
+
+func (r *SessionReconciler) workspaceCleanupClaim(ctx context.Context, s *agentsv1alpha1.Session) (*extensionsv1beta1.SandboxClaim, error) {
+	var claim extensionsv1beta1.SandboxClaim
+	key := client.ObjectKey{Namespace: s.Namespace, Name: sandbox.ClaimName(s)}
+	if err := r.reader().Get(ctx, key, &claim); err != nil {
+		return nil, client.IgnoreNotFound(err)
+	}
+	if !metav1.IsControlledBy(&claim, s) || s.Status.SandboxClaimUID != "" && string(claim.UID) != s.Status.SandboxClaimUID {
+		return nil, errors.New("sandbox claim ownership changed during cleanup")
+	}
+	return &claim, nil
+}
+
+func (r *SessionReconciler) retainWorkspace(ctx context.Context, s *agentsv1alpha1.Session, claim *extensionsv1beta1.SandboxClaim) (bool, error) {
+	runtime, retained, err := r.retentionSandbox(ctx, s, claim)
+	if err != nil {
+		return true, err
+	}
+	if runtime == nil {
+		return false, nil
+	}
+	if s.Status.SandboxUID == "" {
+		s.Status.SandboxName, s.Status.SandboxUID, s.Status.PodName = runtime.Name, string(runtime.UID), runtime.Name
+		return true, nil // Persist identity before detaching the retained allocation.
+	}
+	if runtime.Spec.OperatingMode != sandboxv1beta1.SandboxOperatingModeSuspended {
+		return true, r.suspendSandbox(ctx, runtime)
+	}
+	var pod corev1.Pod
+	if err := r.reader().Get(ctx, client.ObjectKey{Namespace: s.Namespace, Name: runtime.Name}, &pod); err == nil {
+		return true, nil
+	} else if !apierrors.IsNotFound(err) {
+		return true, err
+	}
+	observed, err := r.observeRetainedWorkspace(ctx, s, runtime)
+	if err != nil || observed {
+		return true, err
+	}
+	if retained {
+		return false, nil
+	}
+	return true, r.orphanRetainedSandbox(ctx, s, runtime)
+}
+
+func (r *SessionReconciler) retentionSandbox(ctx context.Context, s *agentsv1alpha1.Session, claim *extensionsv1beta1.SandboxClaim) (*sandboxv1beta1.Sandbox, bool, error) {
+	name := s.Status.SandboxName
+	if name == "" && claim != nil {
+		name = claim.Status.SandboxStatus.Name
+	}
+	if name == "" && claim != nil {
+		name = claim.Name
+	}
+	if name == "" {
+		return nil, false, nil
+	}
+	var runtime sandboxv1beta1.Sandbox
+	if err := r.reader().Get(ctx, client.ObjectKey{Namespace: s.Namespace, Name: name}, &runtime); err != nil {
+		if apierrors.IsNotFound(err) && s.Status.SandboxUID == "" {
+			return nil, false, nil
+		}
+		return nil, false, err
+	}
+	if string(runtime.UID) != s.Status.SandboxUID && s.Status.SandboxUID != "" {
+		return nil, false, errors.New("retained sandbox identity changed")
+	}
+	if !runtime.DeletionTimestamp.IsZero() {
+		return nil, false, errors.New("retained sandbox is deleting")
+	}
+	retained := runtime.Annotations[sandbox.WorkspaceRetainedAnnotation] == string(s.UID) && len(runtime.OwnerReferences) == 0
+	if !retained && (claim == nil || !metav1.IsControlledBy(&runtime, claim)) {
+		return nil, false, errors.New("retained sandbox ownership is unverified")
+	}
+	return &runtime, retained, nil
+}
+
+// observeRetainedWorkspace pins an existing native claim before ownership changes.
+// True requests status persistence on a separate reconciliation before orphaning.
+func (r *SessionReconciler) observeRetainedWorkspace(ctx context.Context, s *agentsv1alpha1.Session, runtime *sandboxv1beta1.Sandbox) (bool, error) {
+	var pvc corev1.PersistentVolumeClaim
+	if err := r.reader().Get(ctx, client.ObjectKey{Namespace: s.Namespace, Name: sandbox.WorkspaceClaimName(runtime)}, &pvc); err != nil {
+		if apierrors.IsNotFound(err) && s.Status.WorkspaceClaimUID == "" {
+			return false, nil
+		}
+		return false, err
+	}
+	if pvc.UID == "" || !metav1.IsControlledBy(&pvc, runtime) || !pvc.DeletionTimestamp.IsZero() ||
+		s.Status.WorkspaceClaimUID != "" && string(pvc.UID) != s.Status.WorkspaceClaimUID {
+		return false, errors.New("retained workspace identity changed")
+	}
+	if len(runtime.Spec.VolumeClaimTemplates) != 1 || !workspaceClaimMatches(&pvc, runtime.Spec.VolumeClaimTemplates[0].Spec) {
+		return false, errors.New("retained workspace configuration changed")
+	}
+	if s.Status.WorkspaceClaimUID == "" {
+		s.Status.WorkspaceClaimUID = string(pvc.UID)
+		return true, nil
+	}
+	return false, nil
+}
+
+func (r *SessionReconciler) orphanRetainedSandbox(ctx context.Context, s *agentsv1alpha1.Session, runtime *sandboxv1beta1.Sandbox) error {
+	base := runtime.DeepCopy()
+	runtime.OwnerReferences = nil
+	if runtime.Annotations == nil {
+		runtime.Annotations = make(map[string]string)
+	}
+	if runtime.Labels == nil {
+		runtime.Labels = make(map[string]string)
+	}
+	runtime.Annotations[sandbox.WorkspaceRetainedAnnotation] = string(s.UID)
+	runtime.Labels[sandbox.WorkspaceSessionUIDLabel] = string(s.UID)
+	return r.Patch(ctx, runtime, client.MergeFromWithOptions(base, client.MergeFromWithOptimisticLock{}))
 }

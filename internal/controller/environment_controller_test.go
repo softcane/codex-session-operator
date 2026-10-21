@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"strings"
 	"sync"
 	"time"
 
@@ -12,8 +11,8 @@ import (
 	. "github.com/onsi/gomega"
 	agentsv1alpha1 "github.com/softcane/codex-session-operator/api/v1alpha1"
 	"github.com/softcane/codex-session-operator/internal/openaiapi"
-	"github.com/softcane/codex-session-operator/internal/sandbox"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -31,6 +30,7 @@ const (
 	testDisabledNetwork = "disabled"
 	testProtectedKey    = "value"
 	testNoneMode        = "none"
+	testHostedBranch    = "openaiHosted"
 	testModeField       = "mode"
 	testAccessField     = "access"
 	testNameField       = "name"
@@ -158,7 +158,7 @@ var _ = Describe("Environment recipes and frozen Sessions", func() {
 		environment = &agentsv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{GenerateName: "profile-", Namespace: namespace}, Spec: agentsv1alpha1.EnvironmentSpec{Mode: openaiHostedMode, DeletionPolicy: deletePolicy, OpenAIHosted: &agentsv1alpha1.HostedEnvironment{Network: agentsv1alpha1.HostedNetwork{Access: testDisabledNetwork}}}}
 		Expect(k8sClient.Create(ctx, environment)).To(Succeed())
 		provider = &environmentProviderStub{sessions: &sessionProviderStub{}, runtimeStatus: testConnectedRuntime}
-		controller = &EnvironmentReconciler{Client: k8sClient, APIReader: k8sClient, OpenAI: provider, OwnerScope: environmentTestScope, ExecutorImages: []string{testExecutorImage}}
+		controller = &EnvironmentReconciler{Client: k8sClient, APIReader: k8sClient, OpenAI: provider, OwnerScope: environmentTestScope}
 		sessions = nil
 	})
 	AfterEach(func() {
@@ -185,7 +185,7 @@ var _ = Describe("Environment recipes and frozen Sessions", func() {
 	})
 	It("keeps explicit policy, redacted observation, quiet reconciliation and status isolation", func() {
 		Expect(environment.Spec.OpenAIHosted.ContainerSize).To(Equal("medium"))
-		Expect(environment.Spec.DeletionPolicy).To(Equal(deletePolicy))
+		Expect(environment.Spec.DeletionPolicy).To(Equal(agentsv1alpha1.DeletionPolicyDelete))
 		ready()
 		version := read().ResourceVersion
 		Expect(step()).To(Succeed())
@@ -289,7 +289,7 @@ var _ = Describe("Environment recipes and frozen Sessions", func() {
 		Expect(step()).To(Succeed())
 		Expect(step()).To(Succeed())
 		// The finalizer is removed only after a separate absence observation.
-		environment = &agentsv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{GenerateName: "cleanup-placeholder-", Namespace: namespace}, Spec: agentsv1alpha1.EnvironmentSpec{Mode: testNoneMode, DeletionPolicy: deletePolicy}}
+		environment = &agentsv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{GenerateName: "cleanup-placeholder-", Namespace: namespace}, Spec: agentsv1alpha1.EnvironmentSpec{Mode: agentsv1alpha1.EnvironmentModeNone, DeletionPolicy: deletePolicy}}
 		Expect(k8sClient.Create(ctx, environment)).To(Succeed())
 	})
 	It("freezes hosted settings and waits for runtime connected without creating a Pod", func() {
@@ -307,12 +307,12 @@ var _ = Describe("Environment recipes and frozen Sessions", func() {
 		sessionStep()
 		var first agentsv1alpha1.Session
 		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(s), &first)).To(Succeed())
-		Expect(first.Status.Phase).To(Equal("Connecting"))
+		Expect(meta.IsStatusConditionTrue(first.Status.Conditions, readyCondition)).To(BeFalse())
 		snapshot := first.Status.EnvironmentSnapshot.DeepCopy()
 		provider.runtimeStatus = testConnectedRuntime
 		sessionStep()
 		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(s), &first)).To(Succeed())
-		Expect(first.Status.Phase).To(Equal("Ready"))
+		Expect(meta.IsStatusConditionTrue(first.Status.Conditions, readyCondition)).To(BeTrue())
 		Expect(first.Status.PodName).To(BeEmpty())
 		current := read()
 		current.Spec.OpenAIHosted.ContainerSize = testSmallHostedSize
@@ -348,81 +348,6 @@ var _ = Describe("Environment recipes and frozen Sessions", func() {
 		Expect(current.Status.CreationAttempted).To(BeFalse())
 		Expect(provider.sessions.creates).To(BeZero())
 	})
-	It("freezes self-hosted profile resources and creates only an owned local Pod", func() {
-		// Mode is immutable, so use a fresh object for the other branch.
-		Expect(k8sClient.Delete(ctx, environment)).To(Succeed())
-		environment = &agentsv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{GenerateName: "local-profile-", Namespace: namespace}, Spec: agentsv1alpha1.EnvironmentSpec{Mode: testSelfHostedMode, DeletionPolicy: deletePolicy, SelfHosted: &agentsv1alpha1.SelfHostedEnvironment{Image: testExecutorImage, Architecture: workspaceTestArch, WorkspaceStorage: &agentsv1alpha1.WorkspaceStorage{Type: sandbox.WorkspaceStorageEphemeral}}}}
-		Expect(k8sClient.Create(ctx, environment)).To(Succeed())
-		ready()
-		Expect(provider.creates).To(BeZero())
-		secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: sandbox.ExecutorSecretName, Namespace: namespace}, Type: corev1.SecretTypeOpaque, Data: map[string][]byte{sandbox.ExecutorSecretKey: []byte("connection-placeholder")}}
-		Expect(k8sClient.Create(ctx, secret)).To(Succeed())
-		s := newSession()
-		observer := &connectionStub{state: openaiapi.Connection{Subscribed: true, Epoch: "stream"}}
-		configuration := &dependencyScenarioSessionProvider{configuredSessionStub: configuredSessionStub{lifecycle: provider.sessions}, agents: agents}
-		r := &SessionReconciler{Client: k8sClient, APIReader: k8sClient, Scheme: k8sClient.Scheme(), OpenAI: provider.sessions,
-			Agents: agents, Environments: provider, Configuration: configuration, AgentOwnerScope: environmentTestScope,
-			Connections: observer, ExecutorImages: []string{testExecutorImage}}
-		for range 2 {
-			_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(s)})
-			Expect(err).NotTo(HaveOccurred())
-		}
-		var frozen agentsv1alpha1.Session
-		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(s), &frozen)).To(Succeed())
-		var pod corev1.Pod
-		Expect(k8sClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: sandbox.PodName(s)}, &pod)).To(Succeed())
-		Expect(metav1.IsControlledBy(&pod, &frozen)).To(BeTrue())
-		current := read()
-		current.Spec.SelfHosted.WorkspaceSize = workspaceTestSize
-		Expect(k8sClient.Update(ctx, current)).To(Succeed())
-		Expect(step()).To(Succeed())
-		_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(s)})
-		Expect(err).NotTo(HaveOccurred())
-		var after agentsv1alpha1.Session
-		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(s), &after)).To(Succeed())
-		Expect(after.Status.EnvironmentSnapshot).To(Equal(frozen.Status.EnvironmentSnapshot))
-		Expect(provider.sessions.creates).To(Equal(1))
-	})
-	It("commits a Retain claim identity before starting the executor Pod", func() {
-		Expect(k8sClient.Delete(ctx, environment)).To(Succeed())
-		environment = &agentsv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{GenerateName: "persistent-profile-", Namespace: namespace},
-			Spec: agentsv1alpha1.EnvironmentSpec{Mode: testSelfHostedMode, DeletionPolicy: deletePolicy, SelfHosted: &agentsv1alpha1.SelfHostedEnvironment{
-				Image: testExecutorImage, Architecture: workspaceTestArch, WorkspaceDirectory: defaultWorkspace, WorkspaceSize: workspaceTestSize,
-				WorkspaceStorage: &agentsv1alpha1.WorkspaceStorage{Type: sandbox.WorkspaceStoragePersistent, StorageClassName: workspaceTestClass, ClaimDeletionPolicy: retainPolicy}}}}
-		Expect(k8sClient.Create(ctx, environment)).To(Succeed())
-		controller.WorkspaceStorageClasses = []string{workspaceTestClass}
-		ready()
-		secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: sandbox.ExecutorSecretName, Namespace: namespace}, Type: corev1.SecretTypeOpaque,
-			Data: map[string][]byte{sandbox.ExecutorSecretKey: []byte("connection-placeholder")}}
-		Expect(k8sClient.Create(ctx, secret)).To(Succeed())
-		s := newSession()
-		observer := &connectionStub{state: openaiapi.Connection{Subscribed: true, Epoch: "stream"}}
-		configuration := &dependencyScenarioSessionProvider{configuredSessionStub: configuredSessionStub{lifecycle: provider.sessions}, agents: agents}
-		r := &SessionReconciler{Client: k8sClient, APIReader: k8sClient, Scheme: k8sClient.Scheme(), OpenAI: provider.sessions,
-			Agents: agents, Environments: provider, Configuration: configuration, AgentOwnerScope: environmentTestScope,
-			Connections: observer, ExecutorImages: []string{testExecutorImage},
-			WorkspaceStorageClasses: []string{workspaceTestClass}}
-		for range 4 {
-			_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(s)})
-			Expect(err).NotTo(HaveOccurred())
-		}
-		var frozen agentsv1alpha1.Session
-		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(s), &frozen)).To(Succeed())
-		Expect(frozen.Status.WorkspaceClaimCreationAttempted).To(BeTrue())
-		Expect(frozen.Status.WorkspaceClaimUID).NotTo(BeEmpty())
-		claim := &corev1.PersistentVolumeClaim{}
-		Expect(k8sClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: sandbox.WorkspaceClaimNameForUID(string(s.UID))}, claim)).To(Succeed())
-		Expect(claim.OwnerReferences).To(BeEmpty())
-		Expect(frozen.Status.WorkspaceClaimUID).To(Equal(string(claim.UID)))
-		pod := &corev1.Pod{}
-		Expect(k8sClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: sandbox.PodName(s)}, pod)).To(Succeed())
-		Expect(pod.Spec.Volumes[0].PersistentVolumeClaim.ClaimName).To(Equal(claim.Name))
-		Expect(provider.sessions.creates).To(Equal(1))
-		Expect(k8sClient.Delete(ctx, pod, client.GracePeriodSeconds(0))).To(Succeed())
-		claim.Finalizers = nil // envtest does not run the PVC protection controller.
-		Expect(k8sClient.Update(ctx, claim)).To(Succeed())
-		Expect(k8sClient.Delete(ctx, claim)).To(Succeed())
-	})
 	It("persists a frozen Environment through ambiguous Session creation and reference mutation", func() {
 		ready()
 		s := newSession()
@@ -447,13 +372,13 @@ var _ = Describe("Environment recipes and frozen Sessions", func() {
 		Expect(sessionStep()).To(Succeed())
 		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(s), &first)).To(Succeed())
 		Expect(first.Status.EnvironmentSnapshot).To(Equal(snapshot))
-		Expect(first.Status.Phase).To(Equal("Ready"))
+		Expect(meta.IsStatusConditionTrue(first.Status.Conditions, readyCondition)).To(BeTrue())
 		Expect(provider.sessions.creates).To(Equal(1))
 		first.Spec.EnvironmentRef.Name = "another-environment"
-		Expect(k8sClient.Update(ctx, &first)).To(Succeed())
+		Expect(apierrors.IsInvalid(k8sClient.Update(ctx, &first))).To(BeTrue())
 		Expect(sessionStep()).To(Succeed())
 		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(s), &first)).To(Succeed())
-		Expect(meta.FindStatusCondition(first.Status.Conditions, "ConfigurationCurrent").Reason).To(Equal("RequiresNewSession"))
+		Expect(meta.IsStatusConditionTrue(first.Status.Conditions, "ConfigurationCurrent")).To(BeTrue())
 		Expect(first.Status.EnvironmentSnapshot).To(Equal(snapshot))
 	})
 	It("allows only the winning optimistic creation claim to POST", func() {
@@ -494,53 +419,52 @@ var _ = Describe("Environment recipes and frozen Sessions", func() {
 		Expect(read().Status.OpenAITemplateID).To(BeEmpty())
 		Expect(read().Status.AuditCandidateIDs).To(Equal([]string{testTemplateID}))
 	})
-	It("blocks none and disallowed images explicitly", func() {
+	It("blocks none without the durable gateway", func() {
 		Expect(k8sClient.Delete(ctx, environment)).To(Succeed())
-		environment = &agentsv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{GenerateName: "none-profile-", Namespace: namespace}, Spec: agentsv1alpha1.EnvironmentSpec{Mode: testNoneMode, DeletionPolicy: deletePolicy}}
+		environment = &agentsv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{GenerateName: "none-profile-", Namespace: namespace}, Spec: agentsv1alpha1.EnvironmentSpec{Mode: agentsv1alpha1.EnvironmentModeNone, DeletionPolicy: deletePolicy}}
 		Expect(k8sClient.Create(ctx, environment)).To(Succeed())
 		Expect(step()).To(Succeed())
 		Expect(meta.FindStatusCondition(read().Status.Conditions, readyCondition).Reason).To(Equal("GatewayRequired"))
 		Expect(provider.creates).To(BeZero())
-		Expect(sandbox.ValidateProfile(&agentsv1alpha1.SelfHostedEnvironment{Image: "other@sha256:" + strings.Repeat("b", 64)}, []string{testExecutorImage}, nil, nil)).NotTo(Succeed())
 	})
 })
 
 var _ = Describe("Environment admission", func() {
-	It("requires explicit deletion policy and admits omitted ephemeral workspace storage", func() {
+	It("requires explicit deletion policy and sandbox pool configuration", func() {
 		missingPolicy := &agentsv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{GenerateName: "missing-policy-", Namespace: testNamespace},
-			Spec: agentsv1alpha1.EnvironmentSpec{Mode: testNoneMode}}
+			Spec: agentsv1alpha1.EnvironmentSpec{Mode: agentsv1alpha1.EnvironmentModeNone}}
 		Expect(k8sClient.Create(ctx, missingPolicy)).NotTo(Succeed())
 		valid := &agentsv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{GenerateName: "explicit-policy-", Namespace: testNamespace},
-			Spec: agentsv1alpha1.EnvironmentSpec{Mode: testNoneMode, DeletionPolicy: retainPolicy}}
+			Spec: agentsv1alpha1.EnvironmentSpec{Mode: agentsv1alpha1.EnvironmentModeNone, DeletionPolicy: retainPolicy}}
 		Expect(k8sClient.Create(ctx, valid)).To(Succeed())
 		valid.Spec.DeletionPolicy = ""
 		Expect(k8sClient.Update(ctx, valid)).NotTo(Succeed())
 		Expect(k8sClient.Delete(ctx, valid)).To(Succeed())
 		omittedStorage := &agentsv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{GenerateName: "omitted-storage-", Namespace: testNamespace},
 			Spec: agentsv1alpha1.EnvironmentSpec{Mode: testSelfHostedMode, DeletionPolicy: deletePolicy, SelfHosted: &agentsv1alpha1.SelfHostedEnvironment{
-				Image: testExecutorImage, Architecture: workspaceTestArch}}}
+				SandboxPoolRef: agentsv1alpha1.AgentReference{Name: "codex-go-v1"}, Workspace: agentsv1alpha1.SelfHostedWorkspace{DeletionPolicy: deletePolicy}}}}
 		Expect(k8sClient.Create(ctx, omittedStorage)).To(Succeed())
 		Expect(k8sClient.Delete(ctx, omittedStorage)).To(Succeed())
 	})
 	It("rejects branch conflicts, floating versions, credential values and illegal defaults", func() {
 		invalid := []map[string]any{
 			{testModeField: testSelfHostedMode},
-			{testModeField: testNoneMode, openaiHostedMode: map[string]any{testNetworkField: map[string]any{testAccessField: testDisabledNetwork}}},
-			{testModeField: openaiHostedMode, openaiHostedMode: map[string]any{testNetworkField: map[string]any{testAccessField: "restricted"}}},
-			{testModeField: openaiHostedMode, openaiHostedMode: map[string]any{"containerSize": "huge", testNetworkField: map[string]any{testAccessField: testDisabledNetwork}}},
-			{testModeField: openaiHostedMode, openaiHostedMode: map[string]any{testNetworkField: map[string]any{testAccessField: testDisabledNetwork}, "env": []any{map[string]any{testNameField: "OPENAI_API_KEY", "secretKey": "key"}}}},
-			{testModeField: openaiHostedMode, openaiHostedMode: map[string]any{testNetworkField: map[string]any{testAccessField: testDisabledNetwork}, "skills": []any{map[string]any{_wireType: "skillReference", "skillID": "skill", "version": "latest"}}}},
-			{testModeField: openaiHostedMode, openaiHostedMode: map[string]any{testNetworkField: map[string]any{testAccessField: testDisabledNetwork}, "files": []any{map[string]any{"type": "inline", "path": "/workspace/file", "fileID": "file"}}}},
+			{testModeField: testNoneMode, testHostedBranch: map[string]any{testNetworkField: map[string]any{testAccessField: testDisabledNetwork}}},
+			{testModeField: openaiHostedMode, testHostedBranch: map[string]any{testNetworkField: map[string]any{testAccessField: "restricted"}}},
+			{testModeField: openaiHostedMode, testHostedBranch: map[string]any{"containerSize": "huge", testNetworkField: map[string]any{testAccessField: testDisabledNetwork}}},
+			{testModeField: openaiHostedMode, testHostedBranch: map[string]any{testNetworkField: map[string]any{testAccessField: testDisabledNetwork}, "env": []any{map[string]any{testNameField: "OPENAI_API_KEY", "secretKey": "key"}}}},
+			{testModeField: openaiHostedMode, testHostedBranch: map[string]any{testNetworkField: map[string]any{testAccessField: testDisabledNetwork}, "skills": []any{map[string]any{_wireType: string(agentsv1alpha1.HostedSkillTypeSkillReference), "skillID": "skill", "version": "latest"}}}},
+			{testModeField: openaiHostedMode, testHostedBranch: map[string]any{testNetworkField: map[string]any{testAccessField: testDisabledNetwork}, "files": []any{map[string]any{"type": string(agentsv1alpha1.HostedFileTypeInline), "path": "/workspace/file", "fileID": "file"}}}},
 		}
 		for _, spec := range invalid {
 			obj := &unstructured.Unstructured{Object: map[string]any{"apiVersion": "agents.softcane.io/v1alpha1", "kind": "Environment", "metadata": map[string]any{"generateName": "invalid-profile-", "namespace": testNamespace}, "spec": spec}}
 			Expect(k8sClient.Create(ctx, obj)).NotTo(Succeed())
 		}
-		obj := &unstructured.Unstructured{Object: map[string]any{"apiVersion": "agents.softcane.io/v1alpha1", "kind": "Environment", "metadata": map[string]any{"generateName": "secret-profile-", "namespace": testNamespace}, "spec": map[string]any{testModeField: openaiHostedMode, openaiHostedMode: map[string]any{testNetworkField: map[string]any{testAccessField: testDisabledNetwork}, "env": map[string]any{"TOKEN": testForbiddenValue}}}}}
+		obj := &unstructured.Unstructured{Object: map[string]any{"apiVersion": "agents.softcane.io/v1alpha1", "kind": "Environment", "metadata": map[string]any{"generateName": "secret-profile-", "namespace": testNamespace}, "spec": map[string]any{testModeField: openaiHostedMode, testHostedBranch: map[string]any{testNetworkField: map[string]any{testAccessField: testDisabledNetwork}, "env": map[string]any{"TOKEN": testForbiddenValue}}}}}
 		Expect(k8sClient.Create(ctx, obj, &client.CreateOptions{FieldValidation: metav1.FieldValidationStrict})).NotTo(Succeed())
 	})
 	It("keeps mode immutable", func() {
-		environment := &agentsv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{GenerateName: "immutable-profile-", Namespace: testNamespace}, Spec: agentsv1alpha1.EnvironmentSpec{Mode: testNoneMode, DeletionPolicy: deletePolicy}}
+		environment := &agentsv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{GenerateName: "immutable-profile-", Namespace: testNamespace}, Spec: agentsv1alpha1.EnvironmentSpec{Mode: agentsv1alpha1.EnvironmentModeNone, DeletionPolicy: deletePolicy}}
 		Expect(k8sClient.Create(ctx, environment)).To(Succeed())
 		environment.Spec.Mode = openaiHostedMode
 		environment.Spec.OpenAIHosted = &agentsv1alpha1.HostedEnvironment{Network: agentsv1alpha1.HostedNetwork{Access: testDisabledNetwork}}
@@ -549,25 +473,11 @@ var _ = Describe("Environment admission", func() {
 		environment.Spec.OpenAIHosted = nil
 		Expect(k8sClient.Delete(ctx, environment)).To(Succeed())
 	})
-	It("requires a protected credential reference for executor repository access", func() {
-		environment := &agentsv1alpha1.Environment{
-			ObjectMeta: metav1.ObjectMeta{GenerateName: "runtime-repository-", Namespace: testNamespace},
-			Spec: agentsv1alpha1.EnvironmentSpec{Mode: testSelfHostedMode, DeletionPolicy: deletePolicy, SelfHosted: &agentsv1alpha1.SelfHostedEnvironment{
-				Image: testExecutorImage, Architecture: workspaceTestArch,
-				WorkspaceStorage: &agentsv1alpha1.WorkspaceStorage{Type: sandbox.WorkspaceStorageEphemeral},
-				Repository: &agentsv1alpha1.RepositorySpec{
-					URL: _preparationURL, Commit: strings.Repeat("a", 40), MountCredentialsInExecutor: true,
-				},
-			}},
-		}
-		err := k8sClient.Create(ctx, environment)
-		Expect(err).To(HaveOccurred())
-		Expect(err.Error()).To(ContainSubstring("executor credential mounting requires credentialSecretRef"))
-		environment.Spec.SelfHosted.Repository.CredentialSecretRef = &agentsv1alpha1.RepositoryCredentialSecretReference{
-			Name: sandbox.RepositorySecretName, Key: testVaultTokenKey,
-		}
-		Expect(k8sClient.Create(ctx, environment)).To(Succeed())
-		Expect(k8sClient.Delete(ctx, environment)).To(Succeed())
+	It("rejects self-hosted settings without an explicit workspace policy", func() {
+		environment := &agentsv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{GenerateName: "missing-workspace-policy-", Namespace: testNamespace},
+			Spec: agentsv1alpha1.EnvironmentSpec{Mode: testSelfHostedMode, DeletionPolicy: deletePolicy,
+				SelfHosted: &agentsv1alpha1.SelfHostedEnvironment{SandboxPoolRef: agentsv1alpha1.AgentReference{Name: "codex-go-v1"}}}}
+		Expect(k8sClient.Create(ctx, environment)).NotTo(Succeed())
 	})
 })
 

@@ -8,10 +8,15 @@ rules:
   - ""
   resources:
   - persistentvolumeclaims
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - ""
+  resources:
   - pods
   verbs:
-  - create
-  - delete
   - get
   - list
   - patch
@@ -117,3 +122,39 @@ rules:
   - sessions/finalizers
   verbs:
   - update
+- apiGroups:
+  - agents.x-k8s.io
+  resources:
+  - sandboxes
+  verbs:
+  - delete
+  - get
+  - list
+  - patch
+  - watch
+- apiGroups:
+  - extensions.agents.x-k8s.io
+  resources:
+  - sandboxclaims
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - watch
+- apiGroups:
+  - extensions.agents.x-k8s.io
+  resources:
+  - sandboxclaims/finalizers
+  verbs:
+  - update
+- apiGroups:
+  - extensions.agents.x-k8s.io
+  resources:
+  - sandboxtemplates
+  - sandboxwarmpools
+  verbs:
+  - get
+  - list
+  - watch

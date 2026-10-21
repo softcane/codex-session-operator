@@ -40,15 +40,19 @@ spec:
             description: spec defines the desired state of Environment
             properties:
               deletionPolicy:
+                description: DeletionPolicy selects deletion or administrative retention
+                  of owned resources.
                 enum:
                 - Delete
                 - Retain
                 type: string
               mode:
+                description: EnvironmentMode selects a runtime; provider wire literals
+                  are translated by the adapter.
                 enum:
-                - selfHosted
-                - openaiHosted
-                - none
+                - SelfHosted
+                - OpenAIHosted
+                - None
                 type: string
               openaiHosted:
                 description: HostedEnvironment owns the full remote template configuration.
@@ -56,11 +60,14 @@ spec:
                   capabilityDirectories:
                     items:
                       maxLength: 4096
-                      pattern: ^/workspace/
+                      pattern: ^/workspace/[^/]+(/[^/]+)*$
                       type: string
                     maxItems: 32
                     type: array
                     x-kubernetes-list-type: set
+                    x-kubernetes-validations:
+                    - message: capability paths must stay inside workspace
+                      rule: self.all(d, d.split('/').all(p, p != '.' && p != '..'))
                   containerSize:
                     default: medium
                     enum:
@@ -104,15 +111,20 @@ spec:
                           type: string
                         path:
                           maxLength: 4096
-                          pattern: ^/workspace/
+                          pattern: ^/workspace/[^/]+(/[^/]+)*$
                           type: string
+                          x-kubernetes-validations:
+                          - message: path must be clean
+                            rule: self.split('/').all(p, p != '.' && p != '..')
                         secretKey:
                           pattern: ^[a-zA-Z0-9._-]{1,253}$
                           type: string
                         type:
+                          description: HostedFileType selects a protected source and
+                            is translated to the provider file type.
                           enum:
-                          - fileID
-                          - inline
+                          - FileID
+                          - Inline
                           type: string
                       required:
                       - path
@@ -120,9 +132,9 @@ spec:
                       type: object
                       x-kubernetes-validations:
                       - message: fileID branch must match type
-                        rule: (self.type == 'fileID') == has(self.fileID)
+                        rule: (self.type == 'FileID') == has(self.fileID)
                       - message: inline branch must match type
-                        rule: (self.type == 'inline') == has(self.secretKey)
+                        rule: (self.type == 'Inline') == has(self.secretKey)
                     maxItems: 64
                     type: array
                     x-kubernetes-list-map-keys:
@@ -146,21 +158,28 @@ spec:
                       allowedDomains:
                         default: []
                         items:
-                          maxLength: 253
-                          pattern: ^[a-zA-Z0-9]([a-zA-Z0-9.-]*[a-zA-Z0-9])?$
+                          maxLength: 256
+                          minLength: 1
+                          pattern: ^[a-zA-Z0-9]([-a-zA-Z0-9]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([-a-zA-Z0-9]*[a-zA-Z0-9])?)*$
                           type: string
                         maxItems: 100
                         type: array
                         x-kubernetes-list-type: set
+                        x-kubernetes-validations:
+                        - message: domains must be exact host names
+                          rule: self.all(h, !h.contains('..'))
                       blockedDomains:
                         default: []
                         items:
                           maxLength: 253
-                          pattern: ^[a-zA-Z0-9]([a-zA-Z0-9.-]*[a-zA-Z0-9])?$
+                          pattern: ^[a-zA-Z0-9]([-a-zA-Z0-9]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([-a-zA-Z0-9]*[a-zA-Z0-9])?)*$
                           type: string
                         maxItems: 100
                         type: array
                         x-kubernetes-list-type: set
+                        x-kubernetes-validations:
+                        - message: domains must be exact host names
+                          rule: self.all(h, !h.contains('..'))
                     required:
                     - access
                     type: object
@@ -180,21 +199,27 @@ spec:
                       npm:
                         items:
                           maxLength: 256
+                          minLength: 1
                           type: string
                         maxItems: 64
                         type: array
+                        x-kubernetes-list-type: atomic
                       python:
                         items:
                           maxLength: 256
+                          minLength: 1
                           type: string
                         maxItems: 64
                         type: array
+                        x-kubernetes-list-type: atomic
                       system:
                         items:
                           maxLength: 256
+                          minLength: 1
                           type: string
                         maxItems: 64
                         type: array
+                        x-kubernetes-list-type: atomic
                     type: object
                   plugins:
                     items:
@@ -243,14 +268,17 @@ spec:
                       description: HostedSetupCommand reads its command from the protected
                         platform Secret.
                       properties:
-                        cwd:
-                          default: /workspace
-                          maxLength: 4096
-                          pattern: ^/workspace($|/)
-                          type: string
                         secretKey:
                           pattern: ^[a-zA-Z0-9._-]{1,253}$
                           type: string
+                        workingDirectory:
+                          default: /workspace
+                          maxLength: 4096
+                          pattern: ^/workspace(/[^/]+)*$
+                          type: string
+                          x-kubernetes-validations:
+                          - message: working directory must be clean
+                            rule: self.split('/').all(p, p != '.' && p != '..')
                       required:
                       - secretKey
                       type: object
@@ -303,9 +331,11 @@ spec:
                           minLength: 1
                           type: string
                         type:
+                          description: HostedSkillType selects a pinned provider reference
+                            or a protected archive.
                           enum:
-                          - skillReference
-                          - inline
+                          - SkillReference
+                          - Inline
                           type: string
                         version:
                           maxLength: 20
@@ -316,12 +346,12 @@ spec:
                       type: object
                       x-kubernetes-validations:
                       - message: skillReference requires ID and concrete version
-                        rule: (self.type == 'skillReference') == (has(self.skillID)
+                        rule: (self.type == 'SkillReference') == (has(self.skillID)
                           && has(self.version))
                       - message: inline branch must match type
-                        rule: (self.type == 'inline') == has(self.inline)
+                        rule: (self.type == 'Inline') == has(self.inline)
                       - message: inline skill cannot carry reference fields
-                        rule: self.type == 'skillReference' || (!has(self.skillID)
+                        rule: self.type == 'SkillReference' || (!has(self.skillID)
                           && !has(self.version))
                     maxItems: 16
                     type: array
@@ -330,174 +360,66 @@ spec:
                 - network
                 type: object
               selfHosted:
-                description: SelfHostedEnvironment describes platform-approved local
-                  compute.
+                description: |-
+                  SelfHostedEnvironment selects an administrator-approved Agent Sandbox pool.
+                  Compute, repository preparation and storage configuration belong to its template.
                 properties:
-                  architecture:
-                    enum:
-                    - amd64
-                    - arm64
-                    type: string
-                  capabilities:
+                  capabilityDirectories:
+                    description: CapabilityDirectories names prepared installation
+                      paths in the template.
                     items:
-                      description: LocalCapability is a versioned /bundle image copied
-                        before the executor starts.
-                      properties:
-                        image:
-                          maxLength: 512
-                          pattern: ^[^\s@]+@sha256:[a-f0-9]{64}$
-                          type: string
-                        name:
-                          pattern: ^[a-z]([a-z0-9-]{0,30}[a-z0-9])?$
-                          type: string
-                        path:
-                          description: Path selects the actual plugin root, or a directory
-                            containing skills.
-                          pattern: ^/capabilities/[a-z]([a-z0-9-]{0,30}[a-z0-9])?$
-                          type: string
-                        type:
-                          enum:
-                          - plugin
-                          - skills
-                          type: string
-                      required:
-                      - image
-                      - name
-                      - path
-                      - type
-                      type: object
-                    maxItems: 16
+                      maxLength: 4096
+                      pattern: ^/[^/]+(/[^/]+)*$
+                      type: string
+                    maxItems: 32
                     type: array
-                    x-kubernetes-list-map-keys:
-                    - name
-                    x-kubernetes-list-type: map
-                  image:
-                    maxLength: 512
-                    pattern: ^[^\s@]+@sha256:[a-f0-9]{64}$
-                    type: string
-                  repository:
-                    description: |-
-                      Repository prepares a trusted checkout before the executor starts.
-                      Changes apply only to future Sessions; replacement Pods preserve existing files.
+                    x-kubernetes-list-type: set
+                    x-kubernetes-validations:
+                    - message: capability paths must be clean absolute directories
+                      rule: self.all(d, d.split('/').all(p, p != '.' && p != '..'))
+                  sandboxPoolRef:
+                    description: SandboxPoolRef selects a same-namespace SandboxWarmPool.
                     properties:
-                      commit:
-                        description: Commit is a complete immutable SHA-1 object identity,
-                          never a branch or tag.
-                        pattern: ^[a-f0-9]{40}$
-                        type: string
-                      credentialSecretRef:
-                        description: CredentialSecretRef selects protected material
-                          mounted into preparation by default.
-                        properties:
-                          key:
-                            description: Key selects the access token; its value is
-                              never placed in public configuration.
-                            pattern: ^[a-zA-Z0-9._-]{1,253}$
-                            type: string
-                          name:
-                            enum:
-                            - codex-repository
-                            type: string
-                          usernameKey:
-                            description: UsernameKey selects an optional username;
-                              omission uses x-access-token.
-                            pattern: ^[a-zA-Z0-9._-]{1,253}$
-                            type: string
-                        required:
-                        - key
-                        - name
-                        type: object
-                        x-kubernetes-validations:
-                        - message: repository token and username keys must be distinct
-                          rule: '!has(self.usernameKey) || self.usernameKey != self.key'
-                      mountCredentialsInExecutor:
-                        description: |-
-                          MountCredentialsInExecutor explicitly exposes the selected repository credential
-                          files to task commands. Omission keeps credentials in preparation only.
-                          Credential permissions must be restricted by the Git hosting provider.
-                        type: boolean
-                      url:
-                        description: URL must also be approved by the operator's exact
-                          repository URL allowlist.
-                        maxLength: 2048
-                        pattern: ^https://[^/@?#]+/[^?#]+$
+                      name:
+                        maxLength: 253
+                        minLength: 1
+                        pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
                         type: string
                     required:
-                    - commit
-                    - url
+                    - name
                     type: object
-                    x-kubernetes-validations:
-                    - message: executor credential mounting requires credentialSecretRef
-                      rule: '!has(self.mountCredentialsInExecutor) || !self.mountCredentialsInExecutor
-                        || has(self.credentialSecretRef)'
-                  resources:
-                    description: ExecutorResources permits CPU and memory only; controller
-                      enforces platform bounds.
+                  workspace:
+                    description: Workspace configures the workspace location and cleanup
+                      policy.
                     properties:
-                      cpuLimit:
-                        default: "1"
-                        maxLength: 32
-                        type: string
-                      cpuRequest:
-                        default: 100m
-                        maxLength: 32
-                        type: string
-                      memoryLimit:
-                        default: 512Mi
-                        maxLength: 32
-                        type: string
-                      memoryRequest:
-                        default: 128Mi
-                        maxLength: 32
-                        type: string
-                    type: object
-                  workspaceDirectory:
-                    default: /workspace
-                    maxLength: 4096
-                    pattern: ^/
-                    type: string
-                  workspaceSize:
-                    default: 1Gi
-                    description: WorkspaceSize bounds an ephemeral volume or requests
-                      a persistent claim.
-                    maxLength: 32
-                    type: string
-                  workspaceStorage:
-                    description: |-
-                      WorkspaceStorage selects whether files survive executor Pod replacement.
-                      Omission selects an ephemeral workspace with the configured size.
-                    properties:
-                      claimDeletionPolicy:
-                        description: |-
-                          ClaimDeletionPolicy deletes or retains the PVC when its Session is deleted.
-                          A StorageClass separately controls whether its backing volume is reclaimed.
+                      deletionPolicy:
+                        description: DeletionPolicy deletes the Sandbox and files,
+                          or retains a suspended workspace.
                         enum:
                         - Delete
                         - Retain
                         type: string
-                      storageClassName:
-                        description: StorageClassName must also be approved by the
-                          operator allowlist.
-                        maxLength: 253
-                        pattern: ^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$
+                      directory:
+                        default: /workspace
+                        description: Directory must be a clean absolute directory
+                          other than root.
+                        maxLength: 4096
+                        pattern: ^/[^/]+(/[^/]+)*$
                         type: string
-                      type:
-                        enum:
-                        - Ephemeral
-                        - Persistent
-                        type: string
+                        x-kubernetes-validations:
+                        - message: directory must be a clean absolute path
+                          rule: self.split('/').all(p, p != '.' && p != '..')
                     required:
-                    - type
+                    - deletionPolicy
                     type: object
                     x-kubernetes-validations:
-                    - message: Persistent storage requires a class and claim deletion
-                        policy; Ephemeral permits neither
-                      rule: 'self.type == ''Persistent'' ? has(self.storageClassName)
-                        && has(self.claimDeletionPolicy) : !has(self.storageClassName)
-                        && !has(self.claimDeletionPolicy)'
+                    - message: workspace directory overlaps a reserved runtime directory
+                      rule: '![''/home'', ''/tmp'', ''/usr'', ''/bin'', ''/sbin'',
+                        ''/etc'', ''/dev'', ''/proc'', ''/sys'', ''/run'', ''/capabilities''].exists(p,
+                        self.directory == p || self.directory.startsWith(p + ''/''))'
                 required:
-                - architecture
-                - image
+                - sandboxPoolRef
+                - workspace
                 type: object
             required:
             - deletionPolicy
@@ -507,18 +429,21 @@ spec:
             - message: Environment mode is immutable
               rule: self.mode == oldSelf.mode
             - message: selfHosted branch must match mode
-              rule: (self.mode == 'selfHosted') == has(self.selfHosted)
+              rule: (self.mode == 'SelfHosted') == has(self.selfHosted)
             - message: openaiHosted branch must match mode
-              rule: (self.mode == 'openaiHosted') == has(self.openaiHosted)
+              rule: (self.mode == 'OpenAIHosted') == has(self.openaiHosted)
           status:
             description: status defines the observed state of Environment
             properties:
               auditCandidateIDs:
                 description: Audit candidates are never adopted automatically.
                 items:
+                  maxLength: 256
+                  minLength: 1
                   type: string
                 maxItems: 1000
                 type: array
+                x-kubernetes-list-type: set
               conditions:
                 items:
                   description: Condition contains details for one aspect of the current
@@ -574,6 +499,7 @@ spec:
                   - status
                   - type
                   type: object
+                maxItems: 16
                 type: array
                 x-kubernetes-list-map-keys:
                 - type
@@ -588,6 +514,36 @@ spec:
                 type: string
               ownerScope:
                 type: string
+              sandboxPool:
+                description: |-
+                  SandboxPoolSnapshot freezes public identities and configuration of approved infrastructure.
+                  Template configuration remains in native Agent Sandbox resources.
+                properties:
+                  configurationDigest:
+                    type: string
+                  generation:
+                    format: int64
+                    type: integer
+                  name:
+                    type: string
+                  templateGeneration:
+                    format: int64
+                    type: integer
+                  templateName:
+                    type: string
+                  templateUID:
+                    type: string
+                  uid:
+                    type: string
+                required:
+                - configurationDigest
+                - generation
+                - name
+                - templateGeneration
+                - templateName
+                - templateUID
+                - uid
+                type: object
               sourceVersion:
                 description: EnvironmentSourceVersion identifies protected material
                   without hashing values.

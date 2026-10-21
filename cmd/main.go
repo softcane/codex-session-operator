@@ -19,7 +19,6 @@ package main
 import (
 	"crypto/sha256"
 	"crypto/tls"
-	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -43,7 +42,6 @@ import (
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 	"sigs.k8s.io/controller-runtime/pkg/metrics/filters"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
-	"sigs.k8s.io/controller-runtime/pkg/webhook"
 
 	agentsv1alpha1 "github.com/softcane/codex-session-operator/api/v1alpha1"
 	"github.com/softcane/codex-session-operator/internal/controller"
@@ -51,6 +49,8 @@ import (
 	"github.com/softcane/codex-session-operator/internal/observability"
 	"github.com/softcane/codex-session-operator/internal/openaiapi"
 	"github.com/softcane/codex-session-operator/internal/sandbox"
+	sandboxv1beta1 "sigs.k8s.io/agent-sandbox/api/v1beta1"
+	extensionsv1beta1 "sigs.k8s.io/agent-sandbox/extensions/api/v1beta1"
 	// +kubebuilder:scaffold:imports
 )
 
@@ -66,36 +66,27 @@ func run() error {
 	scheme := runtime.NewScheme()
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
 	utilruntime.Must(agentsv1alpha1.AddToScheme(scheme))
+	utilruntime.Must(sandboxv1beta1.AddToScheme(scheme))
+	utilruntime.Must(extensionsv1beta1.AddToScheme(scheme))
 	// +kubebuilder:scaffold:scheme
 	setupLog := ctrl.Log.WithName("setup")
 	var (
-		metricsAddr                                                         string
-		metricsCertPath, metricsCertName, metricsCertKey                    string
-		webhookCertPath, webhookCertName, webhookCertKey                    string
-		webhookPort                                                         int
-		enableLeaderElection                                                bool
-		probeAddr                                                           string
-		secureMetrics                                                       bool
-		enableHTTP2                                                         bool
-		tlsOpts                                                             []func(*tls.Config)
-		agentOwnerScope, executorImages, capabilityImages                   string
-		gatewayInternalURL, gatewayInternalTokenFile, gatewayInternalCAFile string
-		workspaceStorageClasses, repositoryURLs                             string
+		metricsAddr                                      string
+		metricsCertPath, metricsCertName, metricsCertKey string
+		enableLeaderElection                             bool
+		probeAddr                                        string
+		secureMetrics                                    bool
+		enableHTTP2                                      bool
+		tlsOpts                                          []func(*tls.Config)
+		agentOwnerScope, sandboxPools                    string
+		gatewayInternalURL, gatewayInternalCAFile        string
 	)
 	flag.StringVar(&gatewayInternalURL, "gateway-internal-url", os.Getenv("GATEWAY_INTERNAL_URL"),
-		"HTTPS lifecycle endpoint of the separate gateway service; empty disables gateway-dependent features.")
-	flag.StringVar(&gatewayInternalTokenFile, "gateway-internal-token-file", os.Getenv("GATEWAY_INTERNAL_TOKEN_FILE"),
-		"Secret-mounted controller-to-gateway token file.")
+		"HTTP or HTTPS lifecycle endpoint of the separate gateway service; empty disables gateway-dependent features.")
 	flag.StringVar(&gatewayInternalCAFile, "gateway-internal-ca-file", os.Getenv("GATEWAY_INTERNAL_CA_FILE"),
 		"CA certificate for the gateway internal HTTPS endpoint.")
-	flag.StringVar(&workspaceStorageClasses, "workspace-storage-classes", os.Getenv("WORKSPACE_STORAGE_CLASSES"),
-		"Comma-separated allowlist of StorageClasses for persistent executor workspaces; empty denies all.")
-	flag.StringVar(&repositoryURLs, "repository-urls", os.Getenv("REPOSITORY_URLS"),
-		"Comma-separated exact HTTPS repository URL allowlist; empty denies repository preparation.")
-	flag.StringVar(&executorImages, "executor-images", os.Getenv("EXECUTOR_IMAGES"),
-		"Comma-separated allowlist of approved executor image digests; empty denies all.")
-	flag.StringVar(&capabilityImages, "capability-images", os.Getenv("CAPABILITY_IMAGES"),
-		"Approved capability image digests.")
+	flag.StringVar(&sandboxPools, "sandbox-pools", os.Getenv("SANDBOX_POOLS"),
+		"Comma-separated allowlist of administrator-managed SandboxWarmPool names; empty denies self-hosted execution.")
 	flag.StringVar(&agentOwnerScope, "agent-owner-scope", os.Getenv("OPENAI_AGENT_OWNER_SCOPE"),
 		"Stable installation/project identity for saved Agent ownership.")
 	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "The address the metrics endpoint binds to. "+
@@ -106,17 +97,12 @@ func run() error {
 			"Enabling this will ensure there is only one active controller manager.")
 	flag.BoolVar(&secureMetrics, "metrics-secure", true,
 		"If set, the metrics endpoint is served securely via HTTPS. Use --metrics-secure=false to use HTTP instead.")
-	flag.StringVar(&webhookCertPath, "webhook-cert-path", "", "The directory that contains the webhook certificate.")
-	flag.StringVar(&webhookCertName, "webhook-cert-name", "tls.crt", "The name of the webhook certificate file.")
-	flag.StringVar(&webhookCertKey, "webhook-cert-key", "tls.key", "The name of the webhook key file.")
-	flag.IntVar(&webhookPort, "webhook-port", 9443, "Port the webhook server listens on. "+
-		"Defaults to 9443. Set -1 to disable the webhook server.")
 	flag.StringVar(&metricsCertPath, "metrics-cert-path", "",
 		"The directory that contains the metrics server certificate.")
 	flag.StringVar(&metricsCertName, "metrics-cert-name", "tls.crt", "The name of the metrics server certificate file.")
 	flag.StringVar(&metricsCertKey, "metrics-cert-key", "tls.key", "The name of the metrics server key file.")
 	flag.BoolVar(&enableHTTP2, "enable-http2", false,
-		"If set, HTTP/2 will be enabled for the metrics and webhook servers")
+		"If set, HTTP/2 will be enabled for the metrics server")
 	opts := zap.Options{
 		Development: true,
 	}
@@ -140,24 +126,6 @@ func run() error {
 		tlsOpts = append(tlsOpts, disableHTTP2)
 	}
 
-	// Initial webhook TLS options
-	webhookTLSOpts := tlsOpts
-	webhookServerOptions := webhook.Options{
-		TLSOpts: webhookTLSOpts,
-		Port:    webhookPort,
-	}
-
-	if len(webhookCertPath) > 0 {
-		setupLog.Info("Initializing webhook certificate watcher using provided certificates",
-			"webhook-cert-path", webhookCertPath, "webhook-cert-name", webhookCertName, "webhook-cert-key", webhookCertKey)
-
-		webhookServerOptions.CertDir = webhookCertPath
-		webhookServerOptions.CertName = webhookCertName
-		webhookServerOptions.KeyName = webhookCertKey
-	}
-
-	webhookServer := webhook.NewServer(webhookServerOptions)
-
 	// Metrics endpoint is enabled in 'config/controller/kustomization.yaml'. The Metrics options configure the server.
 	// More info:
 	// - https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.25.0/pkg/metrics/server
@@ -180,10 +148,7 @@ func run() error {
 	// generate self-signed certificates for the metrics server. While convenient for development and testing,
 	// this setup is not recommended for production.
 	//
-	// TODO(user): If you enable certManager, uncomment the following lines:
-	// - [METRICS-WITH-CERTS] at config/controller/kustomization.yaml to generate and use certificates
-	// managed by cert-manager for the metrics server.
-	// - [PROMETHEUS-WITH-CERTS] at config/prometheus/kustomization.yaml for TLS certification.
+	// The monitoring overlay mounts administrator-provisioned metrics certificates.
 	if len(metricsCertPath) > 0 {
 		setupLog.Info("Initializing metrics certificate watcher using provided certificates",
 			"metrics-cert-path", metricsCertPath, "metrics-cert-name", metricsCertName, "metrics-cert-key", metricsCertKey)
@@ -203,7 +168,6 @@ func run() error {
 		}},
 		Scheme:                 scheme,
 		Metrics:                metricsServerOptions,
-		WebhookServer:          webhookServer,
 		HealthProbeBindAddress: probeAddr,
 		LeaderElection:         enableLeaderElection,
 		LeaderElectionID:       "00d2ad21.softcane.io",
@@ -232,12 +196,15 @@ func run() error {
 	}
 	var messageGateway *gateway.RemoteClient
 	if gatewayInternalURL != "" {
-		token, tokenErr := os.ReadFile(gatewayInternalTokenFile)
-		ca, caErr := os.ReadFile(gatewayInternalCAFile)
-		if tokenErr != nil || caErr != nil {
-			return fmt.Errorf("read gateway internal credentials: %w", errors.Join(tokenErr, caErr))
+		var ca []byte
+		var caErr error
+		if gatewayInternalCAFile != "" {
+			ca, caErr = os.ReadFile(gatewayInternalCAFile)
 		}
-		messageGateway, err = gateway.NewRemoteClient(gatewayInternalURL, strings.TrimSpace(string(token)), ca)
+		if caErr != nil {
+			return fmt.Errorf("read gateway internal CA: %w", caErr)
+		}
+		messageGateway, err = gateway.NewRemoteClient(gatewayInternalURL, ca)
 		if err != nil {
 			return fmt.Errorf("configure gateway client: %w", err)
 		}
@@ -247,21 +214,18 @@ func run() error {
 		return fmt.Errorf("add environment observer: %w", err)
 	}
 	sessionReconciler := &controller.SessionReconciler{
-		Client:                  mgr.GetClient(),
-		Scheme:                  mgr.GetScheme(),
-		APIReader:               mgr.GetAPIReader(),
-		OpenAI:                  openAIClient,
-		Agents:                  openAIClient,
-		Environments:            openAIClient,
-		Configuration:           openAIClient,
-		Vaults:                  openAIClient,
-		ExecutorImages:          strings.FieldsFunc(executorImages, func(r rune) bool { return r == ',' }),
-		CapabilityImages:        strings.FieldsFunc(capabilityImages, func(r rune) bool { return r == ',' }),
-		AgentOwnerScope:         agentOwnerScope,
-		Connections:             connections,
-		WorkspaceStorageClasses: strings.FieldsFunc(workspaceStorageClasses, func(r rune) bool { return r == ',' }),
-		RepositoryURLs:          strings.FieldsFunc(repositoryURLs, func(r rune) bool { return r == ',' }),
-		ApplicationKeyHash:      sha256.Sum256([]byte(os.Getenv("OPENAI_API_KEY"))),
+		Client:             mgr.GetClient(),
+		Scheme:             mgr.GetScheme(),
+		APIReader:          mgr.GetAPIReader(),
+		OpenAI:             openAIClient,
+		Agents:             openAIClient,
+		Environments:       openAIClient,
+		Configuration:      openAIClient,
+		Vaults:             openAIClient,
+		SandboxPools:       strings.FieldsFunc(sandboxPools, func(r rune) bool { return r == ',' }),
+		AgentOwnerScope:    agentOwnerScope,
+		Connections:        connections,
+		ApplicationKeyHash: sha256.Sum256([]byte(os.Getenv("OPENAI_API_KEY"))),
 	}
 	if messageGateway != nil {
 		sessionReconciler.Gateway = messageGateway
@@ -279,15 +243,12 @@ func run() error {
 		return fmt.Errorf("create Agent controller: %w", err)
 	}
 	if err := (&controller.EnvironmentReconciler{
-		Client:                  mgr.GetClient(),
-		APIReader:               mgr.GetAPIReader(),
-		OpenAI:                  openAIClient,
-		OwnerScope:              agentOwnerScope,
-		GatewayEnabled:          messageGateway != nil,
-		WorkspaceStorageClasses: strings.FieldsFunc(workspaceStorageClasses, func(r rune) bool { return r == ',' }),
-		RepositoryURLs:          strings.FieldsFunc(repositoryURLs, func(r rune) bool { return r == ',' }),
-		ExecutorImages:          strings.FieldsFunc(executorImages, func(r rune) bool { return r == ',' }),
-		CapabilityImages:        strings.FieldsFunc(capabilityImages, func(r rune) bool { return r == ',' }),
+		Client:         mgr.GetClient(),
+		APIReader:      mgr.GetAPIReader(),
+		OpenAI:         openAIClient,
+		OwnerScope:     agentOwnerScope,
+		GatewayEnabled: messageGateway != nil,
+		SandboxPools:   strings.FieldsFunc(sandboxPools, func(r rune) bool { return r == ',' }),
 	}).SetupWithManager(mgr); err != nil {
 		return fmt.Errorf("create Environment controller: %w", err)
 	}

@@ -39,7 +39,8 @@ type VaultSpec struct {
 	// +kubebuilder:validation:XValidation:rule="self.all(k, size(k) >= 1 && size(k) <= 64 && size(self[k]) <= 512 && !(k in ['kubernetes_uid', 'operator', 'owner_scope']))",message="metadata exceeds limits or uses ownership keys"
 	Metadata *map[string]string `json:"metadata,omitempty"`
 	// +kubebuilder:validation:Enum=Delete;Retain
-	DeletionPolicy string `json:"deletionPolicy"`
+	// +required
+	DeletionPolicy DeletionPolicy `json:"deletionPolicy"`
 }
 
 // VaultStatus records only remote identity and public observations.
@@ -53,10 +54,13 @@ type VaultStatus struct {
 	// +optional
 	// +kubebuilder:validation:MaxItems=26
 	// +listType=set
+	// +kubebuilder:validation:items:MinLength=1
+	// +kubebuilder:validation:items:MaxLength=256
 	ManagedMetadataKeys []string `json:"managedMetadataKeys,omitempty"`
 	// +listType=map
 	// +listMapKey=type
 	// +optional
+	// +kubebuilder:validation:MaxItems=16
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
 }
 

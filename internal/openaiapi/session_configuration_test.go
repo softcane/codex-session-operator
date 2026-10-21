@@ -3,9 +3,11 @@ package openaiapi
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"strings"
 	"testing"
 
 	agentsv1alpha1 "github.com/softcane/codex-session-operator/api/v1alpha1"
@@ -14,6 +16,67 @@ import (
 const testSessionFormatField = "format"
 const testSessionMediumSetting = "medium"
 const testConfiguredModel = "gpt-6-astra"
+
+func TestConfiguredSessionUnsupportedSpendingWireErrors(t *testing.T) {
+	tests := []struct {
+		name            string
+		parameter       string
+		wantUnavailable bool
+	}{
+		{name: "spending unavailable", parameter: spendControlField, wantUnavailable: true},
+		{name: "unrelated unknown parameter", parameter: testPrivateParameter},
+	}
+	for _, tt := range tests {
+		for _, operation := range []string{createOperation, updateOperation} {
+			t.Run(tt.name+"/"+operation, func(t *testing.T) {
+				requests := 0
+				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					requests++
+					var body map[string]any
+					if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+						t.Error(err)
+					}
+					wantPath := testSessionsPath
+					if operation == updateOperation {
+						wantPath += "/" + testSessionID
+					}
+					if r.Method != http.MethodPost || r.URL.Path != wantPath ||
+						!reflect.DeepEqual(body[spendControlField], map[string]any{spendLimitField: float64(500)}) {
+						t.Error("limited Session request differs from the provider contract")
+					}
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(http.StatusBadRequest)
+					_ = json.NewEncoder(w).Encode(map[string]any{"error": map[string]any{
+						"type": testInvalidRequestType, "code": testUnknownParameterCode, "param": tt.parameter,
+						"message": "Unknown parameter: '" + tt.parameter + "'.", "private_detail": "test-placeholder"}})
+				}))
+				defer server.Close()
+				client := clientForServer(server, nil)
+				var err error
+				if operation == createOperation {
+					limit := int64(500)
+					_, err = client.CreateConfiguredSession(t.Context(), "uid-spend", agentTestScope, agentTestID,
+						map[string]any{typeField: selfHostedType, workspaceDirectoryField: testWorkspace}, nil, nil, nil,
+						&agentsv1alpha1.SessionSpendControl{Mode: sessionSpendModeLimited, LimitCents: &limit})
+				} else {
+					_, err = client.UpdateSession(t.Context(), testSessionID,
+						map[string]any{spendControlField: map[string]any{spendLimitField: int64(500)}})
+				}
+				if err == nil || errors.Is(err, ErrSpendControlUnavailable) != tt.wantUnavailable {
+					t.Fatalf("unavailable classification = %v, want %v", err, tt.wantUnavailable)
+				}
+				for _, private := range []string{"Unknown parameter:", "test-placeholder", testPrivateParameter} {
+					if strings.Contains(err.Error(), private) {
+						t.Fatal("provider response or credential leaked")
+					}
+				}
+				if requests != 1 {
+					t.Fatalf("requests = %d, want one without fallback or retries", requests)
+				}
+			})
+		}
+	}
+}
 
 func TestConfiguredSessionWireAndPartialUpdates(t *testing.T) {
 	model, effort, tier, instructions := SessionModel, lowSetting, "priority", "Session creation instructions"

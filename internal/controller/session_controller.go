@@ -24,12 +24,13 @@ import (
 
 	agentsv1alpha1 "github.com/softcane/codex-session-operator/api/v1alpha1"
 	"github.com/softcane/codex-session-operator/internal/openaiapi"
-	"github.com/softcane/codex-session-operator/internal/sandbox"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/runtime"
+	sandboxv1beta1 "sigs.k8s.io/agent-sandbox/api/v1beta1"
+	extensionsv1beta1 "sigs.k8s.io/agent-sandbox/extensions/api/v1beta1"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -79,19 +80,17 @@ type SessionReconciler struct {
 
 	Scheme *runtime.Scheme
 	// APIReader bypasses stale cache reads for the one-time creation claim.
-	APIReader                        client.Reader
-	OpenAI                           SessionProvider
-	Agents                           SavedAgentReader
-	Environments                     EnvironmentSessionProvider
-	Configuration                    SessionConfigurationProvider
-	Gateway                          SessionGateway
-	InitialSessions                  InitialSessionProvider
-	Vaults                           CredentialProvider
-	ExecutorImages, CapabilityImages []string
-	WorkspaceStorageClasses          []string
-	RepositoryURLs                   []string
-	AgentOwnerScope                  string
-	Connections                      EnvironmentObserver
+	APIReader       client.Reader
+	OpenAI          SessionProvider
+	Agents          SavedAgentReader
+	Environments    EnvironmentSessionProvider
+	Configuration   SessionConfigurationProvider
+	Gateway         SessionGateway
+	InitialSessions InitialSessionProvider
+	Vaults          CredentialProvider
+	SandboxPools    []string
+	AgentOwnerScope string
+	Connections     EnvironmentObserver
 	// ApplicationKeyHash prevents accidental reuse of the manager credential.
 	ApplicationKeyHash [32]byte
 }
@@ -101,8 +100,12 @@ type SessionReconciler struct {
 // +kubebuilder:rbac:groups=agents.softcane.io,resources=sessions/finalizers,verbs=update
 // +kubebuilder:rbac:groups=agents.softcane.io,resources=agents,verbs=get;list;watch
 // +kubebuilder:rbac:groups=agents.softcane.io,resources=environments,verbs=get;list;watch
-// +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;create;patch;delete
-// +kubebuilder:rbac:groups="",resources=persistentvolumeclaims,verbs=get;list;watch;create;patch;delete
+// +kubebuilder:rbac:groups=agents.x-k8s.io,resources=sandboxes,verbs=get;list;watch;patch;delete
+// +kubebuilder:rbac:groups=extensions.agents.x-k8s.io,resources=sandboxclaims,verbs=get;list;watch;create;patch;delete
+// +kubebuilder:rbac:groups=extensions.agents.x-k8s.io,resources=sandboxclaims/finalizers,verbs=update
+// +kubebuilder:rbac:groups=extensions.agents.x-k8s.io,resources=sandboxwarmpools;sandboxtemplates,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;patch
+// +kubebuilder:rbac:groups="",resources=persistentvolumeclaims,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=secrets,resourceNames=codex-executor,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=secrets,resourceNames=codex-repository,verbs=get;list;watch
 
@@ -132,29 +135,40 @@ func (r *SessionReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	}
 	if session.Status.OpenAISessionID != "" {
 		// Credential removal must stop compute even during a provider outage.
-		if session.Status.ExecutorImage != "" {
+		if session.Status.EnvironmentSnapshot != nil && session.Status.EnvironmentSnapshot.Profile.SelfHosted != nil {
 			base := session.DeepCopy()
 			secret, err := r.executorCredential(ctx, &session)
 			if secret == nil || err != nil {
 				return ctrl.Result{RequeueAfter: observationInterval}, errors.Join(err, r.patchStatus(ctx, &session, base))
 			}
-			_, available, err := r.executorRepositoryCredential(ctx, &session)
-			if !available || err != nil {
+			if err := r.preflightSandboxCredentials(ctx, &session); err != nil {
 				return ctrl.Result{RequeueAfter: observationInterval}, errors.Join(err, r.patchStatus(ctx, &session, base))
 			}
+			if !reflect.DeepEqual(base.Status, session.Status) {
+				return ctrl.Result{RequeueAfter: time.Second}, r.patchStatus(ctx, &session, base)
+			}
+
 		}
 		remote, err := r.OpenAI.GetSession(ctx, session.Status.OpenAISessionID)
 		if err != nil {
 			reason := "ObservationFailed"
 			if errors.Is(err, openaiapi.ErrNotFound) {
-				reason = "RemoteSessionMissing"
+				reason = remoteSessionMissingReason
 			}
 			return r.problem(ctx, &session, reason, "Could not observe the remote Session; no replacement will be created", err)
 		}
-		// Validate immutable creation inputs before a supported settings update
-		// can publish UpdatingSession or mutate a definitively unsafe Session.
+		// Unsafe observations must stop compute even if persisting their status fails.
 		if reason, message := r.sessionInvariantProblem(ctx, &session, remote); reason != "" {
-			return r.rejectRemoteSession(ctx, &session, session.DeepCopy(), reason, message)
+			base := session.DeepCopy()
+			if ownedSession(&session, remote) {
+				setRemoteSessionCondition(&session, metav1.ConditionTrue, "RemoteSessionCreated", remoteSessionExistsMessage)
+			}
+			return r.rejectRemoteSession(ctx, &session, base, reason, message)
+		}
+		observedBase := session.DeepCopy()
+		setRemoteSessionCondition(&session, metav1.ConditionTrue, "RemoteSessionCreated", remoteSessionExistsMessage)
+		if err := r.patchStatus(ctx, &session, observedBase); err != nil {
+			return ctrl.Result{}, err
 		}
 		if result, handled, err := r.syncSessionSettings(ctx, &session, remote); handled {
 			return result, err
@@ -219,7 +233,7 @@ func (r *SessionReconciler) createSession(ctx context.Context, session *agentsv1
 			return r.problem(ctx, session, "SessionPolicyBlocked", "Resolved dependencies do not match the accepted Session policy", err)
 		}
 	}
-	none := environmentSnapshot != nil && environmentSnapshot.Profile.Mode == _noneMode
+	none := environmentSnapshot != nil && environmentSnapshot.Profile.Mode == agentsv1alpha1.EnvironmentModeNone
 	initialText, initialKey, inputErr := r.initialGatewayInput(ctx, session, environmentSnapshot)
 	if inputErr != nil {
 		return r.problem(ctx, session, "GatewayInputUnavailable", "Could not read durable initial gateway input", inputErr)
@@ -266,10 +280,8 @@ func (r *SessionReconciler) claimSession(ctx context.Context, session *agentsv1a
 	session.Status.CreationOnlyDigest = openaiapi.SessionCreationOnlyDigest(session.Spec.Agent)
 	session.Status.ManagedMetadataKeys = metadataKeys(session.Spec.Metadata)
 	session.Status.AppliedMutableDigest = openaiapi.SessionMutableDigest(session.Spec.Agent)
-	if creation.environmentSnapshot != nil && creation.environmentSnapshot.Profile.SelfHosted != nil {
-		session.Status.ExecutorImage = creation.environmentSnapshot.Profile.SelfHosted.Image
-	}
-	setState(session, "CreatingSession", metav1.ConditionUnknown, "CreatingSession", "Remote creation has been claimed")
+
+	setState(session, metav1.ConditionUnknown, "CreatingSession", "Remote creation has been claimed")
 	if err := r.patchStatus(ctx, session, base); err != nil {
 		return ctrl.Result{}, err
 	}
@@ -315,7 +327,8 @@ func (r *SessionReconciler) recoverCreation(ctx context.Context, session *agents
 		}
 		base := session.DeepCopy()
 		session.Status.OpenAISessionID = remote.ID
-		setState(session, "Terminating", metav1.ConditionUnknown, "CleanupPending", "Discovered Session is pending cleanup")
+		setRemoteSessionCondition(session, metav1.ConditionTrue, "RemoteSessionCreated", remoteSessionExistsMessage)
+		setState(session, metav1.ConditionUnknown, "CleanupPending", "Discovered Session is pending cleanup")
 		return ctrl.Result{RequeueAfter: time.Second}, r.patchStatus(ctx, session, base)
 	}
 	return r.track(ctx, session, remote)
@@ -330,8 +343,9 @@ func (r *SessionReconciler) track(ctx context.Context, session *agentsv1alpha1.S
 	base := session.DeepCopy()
 	setSessionConfigurationCondition(session)
 	session.Status.OpenAISessionID = remote.ID
+	setRemoteSessionCondition(session, metav1.ConditionTrue, "RemoteSessionCreated", remoteSessionExistsMessage)
 	if !session.DeletionTimestamp.IsZero() {
-		setState(session, "Terminating", metav1.ConditionUnknown, "CleanupPending", "Created Session is pending cleanup")
+		setState(session, metav1.ConditionUnknown, "CleanupPending", "Created Session is pending cleanup")
 		return ctrl.Result{RequeueAfter: time.Second}, r.patchStatus(ctx, session, base)
 	}
 	if reason, message := r.sessionInvariantProblem(ctx, session, remote); reason != "" {
@@ -341,8 +355,8 @@ func (r *SessionReconciler) track(ctx context.Context, session *agentsv1alpha1.S
 		return r.rejectRemoteSession(ctx, session, base, "SpendControlUnverified", "OpenAI did not confirm the requested Session spend limit")
 	}
 	session.Status.SpendControlAttemptedDigest = ""
-	if session.Status.EnvironmentSnapshot != nil && session.Status.EnvironmentSnapshot.Profile.Mode == _noneMode {
-		setState(session, "Ready", metav1.ConditionTrue, "RemoteSessionCreated", "Remote Session exists without an executor")
+	if session.Status.EnvironmentSnapshot != nil && session.Status.EnvironmentSnapshot.Profile.Mode == agentsv1alpha1.EnvironmentModeNone {
+		setState(session, metav1.ConditionTrue, "RemoteSessionCreated", "Remote Session exists without an executor")
 		meta.SetStatusCondition(&session.Status.Conditions, metav1.Condition{Type: readyCondition, Status: metav1.ConditionTrue, Reason: "NoEnvironmentRequired", Message: "Gateway owns messages and required actions", ObservedGeneration: session.Generation})
 		meta.SetStatusCondition(&session.Status.Conditions, metav1.Condition{Type: connectedCondition, Status: metav1.ConditionUnknown, Reason: "NoEnvironmentRequired", Message: "None mode has no environment connection", ObservedGeneration: session.Generation})
 		return ctrl.Result{RequeueAfter: observationInterval}, r.patchStatus(ctx, session, base)
@@ -352,9 +366,8 @@ func (r *SessionReconciler) track(ctx context.Context, session *agentsv1alpha1.S
 	}
 	session.Status.EnvironmentID = remote.EnvironmentID
 	session.Status.RemoteURL = remote.RemoteURL
-	setState(session, "Connecting", metav1.ConditionTrue, "RemoteSessionCreated", "Remote Session exists; executor connection is pending")
-	// Workspace creation may commit status with its own optimistic-lock base.
-	// Freeze the learned remote identity before that base can omit these changes.
+	setState(session, metav1.ConditionTrue, "RemoteSessionCreated", "Remote Session exists; executor connection is pending")
+	// Persist the learned remote identity before requesting a Sandbox claim.
 	if base.Status.OpenAISessionID != session.Status.OpenAISessionID ||
 		base.Status.EnvironmentID != session.Status.EnvironmentID || base.Status.RemoteURL != session.Status.RemoteURL {
 		if err := r.patchStatus(ctx, session, base); err != nil {
@@ -362,10 +375,7 @@ func (r *SessionReconciler) track(ctx context.Context, session *agentsv1alpha1.S
 		}
 		base = session.DeepCopy()
 	}
-	result, committed, err := r.reconcileExecutor(ctx, session)
-	if committed {
-		return result, err
-	}
+	result, err := r.reconcileExecutor(ctx, session)
 	return result, errors.Join(err, r.patchStatus(ctx, session, base))
 }
 
@@ -382,12 +392,12 @@ func (r *SessionReconciler) sessionInvariantProblem(ctx context.Context, session
 	if !ownedSession(session, remote) {
 		return ownershipMismatchReason, "Remote Session ownership or identity does not match"
 	}
-	if profile := session.Status.EnvironmentSnapshot; profile != nil && profile.Profile.Mode == _noneMode {
+	if profile := session.Status.EnvironmentSnapshot; profile != nil && profile.Profile.Mode == agentsv1alpha1.EnvironmentModeNone {
 		if remote.EnvironmentType != _noneMode || !phase4AgentMatches(session, remote) || !phase4VaultsMatch(session, remote) {
 			return configurationMismatchReason, "Remote none-mode configuration differs from frozen creation inputs"
 		}
 		if remote.Status == remoteFailedStatus {
-			return "RemoteSessionFailed", "OpenAI reports a failed Session"
+			return remoteSessionFailedReason, "OpenAI reports a failed Session"
 		}
 		return "", ""
 	}
@@ -419,13 +429,13 @@ func (r *SessionReconciler) sessionInvariantProblem(ctx context.Context, session
 		return configurationMismatchReason, "Remote capability paths differ from the frozen profile"
 	}
 	if remote.Status == remoteFailedStatus {
-		return "RemoteSessionFailed", "OpenAI reports a failed Session"
+		return remoteSessionFailedReason, "OpenAI reports a failed Session"
 	}
 	return "", ""
 }
 
 func (r *SessionReconciler) rejectRemoteSession(ctx context.Context, session, base *agentsv1alpha1.Session, reason, message string) (ctrl.Result, error) {
-	setState(session, "Failed", metav1.ConditionFalse, reason, message)
+	setState(session, metav1.ConditionFalse, reason, message)
 	return ctrl.Result{RequeueAfter: observationInterval}, errors.Join(r.stopSessionExecutor(ctx, session), r.patchStatus(ctx, session, base))
 }
 
@@ -475,9 +485,16 @@ func (r *SessionReconciler) finalize(ctx context.Context, session *agentsv1alpha
 			}
 		}
 	}
+	baseObserved := session.DeepCopy()
+	setRemoteSessionCondition(session, metav1.ConditionFalse, "RemoteSessionDeleted", "Remote Session absence was confirmed during cleanup")
+	if !reflect.DeepEqual(baseObserved.Status, session.Status) {
+		if err := r.patchStatus(ctx, session, baseObserved); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
 	if pending {
 		base := session.DeepCopy()
-		setState(session, "Terminating", metav1.ConditionTrue, "ExecutorTerminating", "Waiting for executor Pod removal")
+		setState(session, metav1.ConditionTrue, "ExecutorTerminating", "Waiting for executor Pod removal")
 		return ctrl.Result{RequeueAfter: time.Second}, r.patchStatus(ctx, session, base)
 	}
 	base := session.DeepCopy()
@@ -486,7 +503,7 @@ func (r *SessionReconciler) finalize(ctx context.Context, session *agentsv1alpha
 		return r.problem(ctx, session, "WorkspaceCleanupFailed", "Could not finish workspace claim cleanup", claimErr)
 	}
 	if claimPending {
-		setState(session, "Terminating", metav1.ConditionTrue, "WorkspaceCleanupPending", "Waiting for workspace claim deletion or retention")
+		setState(session, metav1.ConditionTrue, "WorkspaceCleanupPending", "Waiting for workspace claim deletion or retention")
 		return ctrl.Result{RequeueAfter: time.Second}, r.patchStatus(ctx, session, base)
 	}
 	base = session.DeepCopy()
@@ -495,19 +512,15 @@ func (r *SessionReconciler) finalize(ctx context.Context, session *agentsv1alpha
 }
 
 func (r *SessionReconciler) problem(ctx context.Context, session *agentsv1alpha1.Session, reason, message string, cause error) (ctrl.Result, error) {
-	if reason == "RemoteSessionMissing" || reason == ownershipMismatchReason {
+	if reason == remoteSessionMissingReason || reason == ownershipMismatchReason {
 		cause = errors.Join(cause, r.stopSessionExecutor(ctx, session))
 	}
 	base := session.DeepCopy()
-	phase := "Failed"
 	status := metav1.ConditionFalse
 	if reason == creationOutcomeUnknownReason {
-		phase, status = "CreatingSession", metav1.ConditionUnknown
+		status = metav1.ConditionUnknown
 	}
-	if !session.DeletionTimestamp.IsZero() {
-		phase = "Terminating"
-	}
-	setState(session, phase, status, reason, message)
+	setState(session, status, reason, message)
 	err := r.patchStatus(ctx, session, base)
 	return ctrl.Result{RequeueAfter: observationInterval}, errors.Join(cause, err)
 }
@@ -531,33 +544,63 @@ func optimisticPatch(base *agentsv1alpha1.Session) client.Patch {
 
 func effectiveWorkspace(session *agentsv1alpha1.Session) string {
 	if snapshot := session.Status.EnvironmentSnapshot; snapshot != nil && snapshot.Profile.SelfHosted != nil {
-		return snapshot.Profile.SelfHosted.WorkspaceDirectory
+		return snapshot.Profile.SelfHosted.Workspace.Directory
 	}
 	return defaultWorkspace
 }
 
-func setState(session *agentsv1alpha1.Session, phase string, status metav1.ConditionStatus, reason, message string) {
-	session.Status.Phase = phase
-	// Ordinary executor reconciliation compares the prior instance before clearing
-	// and re-observing its proof. Failed and terminating states revoke it here.
-	if phase != "Connecting" || status != metav1.ConditionTrue {
+// setState updates presentation/readiness without conflating independent facts.
+// Existing remote identity and compute evidence survive mutable setting updates.
+func setState(session *agentsv1alpha1.Session, status metav1.ConditionStatus, reason, message string) {
+
+	// Only remote observations can establish existence. A retained ID survives
+	// absence/uncertainty and is never itself evidence of a current remote object.
+	switch reason {
+	case remoteSessionMissingReason:
+		setRemoteSessionCondition(session, metav1.ConditionFalse, reason, message)
+	case ownershipMismatchReason, "ObservationFailed":
+		setRemoteSessionCondition(session, metav1.ConditionUnknown, reason, message)
+	default:
+		if session.Status.OpenAISessionID == "" || meta.FindStatusCondition(session.Status.Conditions, "RemoteSessionCreated") == nil {
+			if session.Status.OpenAISessionID != "" {
+				status = metav1.ConditionUnknown
+			}
+			setRemoteSessionCondition(session, status, reason, message)
+		}
+	}
+	revoke := !session.DeletionTimestamp.IsZero() || session.Status.OpenAISessionID == ""
+	switch reason {
+	case remoteSessionMissingReason, ownershipMismatchReason, configurationMismatchReason,
+		remoteSessionFailedReason, "InvalidRemoteSession", "HostedSetupFailed", "SpendControlUnverified":
+		revoke = true
+	}
+	if revoke {
 		session.Status.WorkspacePreparation = nil
 		meta.SetStatusCondition(&session.Status.Conditions, metav1.Condition{
 			Type: workspacePreparedCondition, Status: metav1.ConditionFalse, Reason: reason,
 			Message: "Current workspace preparation has not been confirmed", ObservedGeneration: session.Generation,
 		})
+		meta.SetStatusCondition(&session.Status.Conditions, metav1.Condition{
+			Type: connectedCondition, Status: metav1.ConditionUnknown, Reason: reason,
+			Message: "A live OpenAI environment connection has not been confirmed", ObservedGeneration: session.Generation,
+		})
 	}
-	meta.SetStatusCondition(&session.Status.Conditions, metav1.Condition{
-		Type: "RemoteSessionCreated", Status: status, Reason: reason,
-		Message: message, ObservedGeneration: session.Generation,
-	})
 	meta.SetStatusCondition(&session.Status.Conditions, metav1.Condition{
 		Type: readyCondition, Status: metav1.ConditionFalse, Reason: reason,
 		Message: message, ObservedGeneration: session.Generation,
 	})
+}
+
+const (
+	remoteSessionMissingReason = "RemoteSessionMissing"
+	remoteSessionFailedReason  = "RemoteSessionFailed"
+	remoteSessionExistsMessage = "The owned remote Session exists"
+)
+
+func setRemoteSessionCondition(session *agentsv1alpha1.Session, status metav1.ConditionStatus, reason, message string) {
 	meta.SetStatusCondition(&session.Status.Conditions, metav1.Condition{
-		Type: connectedCondition, Status: metav1.ConditionUnknown, Reason: reason,
-		Message: "A live OpenAI environment connection has not been confirmed", ObservedGeneration: session.Generation,
+		Type: "RemoteSessionCreated", Status: status, Reason: reason, Message: message,
+		ObservedGeneration: session.Generation,
 	})
 }
 
@@ -581,10 +624,7 @@ func (r *SessionReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	}); err != nil {
 		return err
 	}
-	repositoryCache, err := cache.New(mgr.GetConfig(), cache.Options{Scheme: mgr.GetScheme(), ReaderFailOnMissingInformer: true,
-		ByObject: map[client.Object]cache.ByObject{&corev1.Secret{}: {
-			Field: fields.OneTermEqualSelector("metadata.name", sandbox.RepositorySecretName),
-		}}})
+	repositoryCache, err := cache.New(mgr.GetConfig(), cache.Options{Scheme: mgr.GetScheme(), ReaderFailOnMissingInformer: true, ByObject: map[client.Object]cache.ByObject{&corev1.Secret{}: {Field: fields.OneTermEqualSelector("metadata.name", "codex-repository")}}})
 	if err != nil {
 		return err
 	}
@@ -593,14 +633,18 @@ func (r *SessionReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	}
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&agentsv1alpha1.Session{}).
-		Owns(&corev1.Pod{}).
-		Owns(&corev1.PersistentVolumeClaim{}).
+		Owns(&extensionsv1beta1.SandboxClaim{}).
+		Watches(&sandboxv1beta1.Sandbox{}, handler.EnqueueRequestsFromMapFunc(r.sandboxSessionRequests)).
+		Watches(&corev1.Pod{}, handler.EnqueueRequestsFromMapFunc(r.executorPodRequests)).
+		Watches(&corev1.PersistentVolumeClaim{}, handler.EnqueueRequestsFromMapFunc(r.executorPodRequests)).
 		Watches(&agentsv1alpha1.Agent{}, handler.EnqueueRequestsFromMapFunc(r.agentSessionRequests)).
 		Watches(&agentsv1alpha1.Environment{}, handler.EnqueueRequestsFromMapFunc(r.environmentSessionRequests)).
 		Watches(&agentsv1alpha1.Vault{}, handler.EnqueueRequestsFromMapFunc(r.vaultSessionRequests)).
 		Watches(&agentsv1alpha1.VaultCredential{}, handler.EnqueueRequestsFromMapFunc(r.vaultSessionRequests)).
 		Watches(&corev1.Secret{}, r.executorSecretHandler()).
-		WatchesRawSource(source.Kind(repositoryCache, &corev1.Secret{}, handler.TypedEnqueueRequestsFromMapFunc(r.repositorySecretRequests))).
+		WatchesRawSource(source.Kind(repositoryCache, &corev1.Secret{}, handler.TypedEnqueueRequestsFromMapFunc(func(ctx context.Context, secret *corev1.Secret) []reconcile.Request {
+			return r.executorSecretRequests(ctx, secret)
+		}))).
 		Named("session").
 		Complete(r)
 }

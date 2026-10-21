@@ -5,57 +5,45 @@ import (
 
 	agentsv1alpha1 "github.com/softcane/codex-session-operator/api/v1alpha1"
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/resource"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/util/validation"
+	sandboxv1beta1 "sigs.k8s.io/agent-sandbox/api/v1beta1"
 )
 
 const (
 	WorkspaceSessionUIDLabel    = "agents.softcane.io/session-uid"
 	WorkspaceRetainedAnnotation = "agents.softcane.io/workspace-retained"
-	WorkspaceStorageEphemeral   = "Ephemeral"
-	WorkspaceStoragePersistent  = "Persistent"
 	WorkspaceClaimDelete        = "Delete"
 	WorkspaceClaimRetain        = "Retain"
 )
 
-// WorkspaceClaimNameForUID never reuses a previous Session's claim.
-func WorkspaceClaimNameForUID(uid string) string { return "workspace-" + uid }
-
-// PersistentWorkspace returns the frozen storage intent, if any.
-func PersistentWorkspace(session *agentsv1alpha1.Session) *agentsv1alpha1.WorkspaceStorage {
+// WorkspacePolicy returns frozen retention intent rather than consulting a mutable Environment.
+func WorkspacePolicy(session *agentsv1alpha1.Session) agentsv1alpha1.DeletionPolicy {
 	if session.Status.EnvironmentSnapshot == nil || session.Status.EnvironmentSnapshot.Profile.SelfHosted == nil {
-		return nil
+		return ""
 	}
-	storage := session.Status.EnvironmentSnapshot.Profile.SelfHosted.WorkspaceStorage
-	if storage == nil || storage.Type != WorkspaceStoragePersistent {
-		return nil
-	}
-	return storage
+	return session.Status.EnvironmentSnapshot.Profile.SelfHosted.Workspace.DeletionPolicy
 }
 
-// WorkspaceClaim builds a Session-specific PVC from the frozen Environment profile.
-func WorkspaceClaim(session *agentsv1alpha1.Session) (*corev1.PersistentVolumeClaim, error) {
-	storage := PersistentWorkspace(session)
-	if storage == nil {
-		return nil, nil
+// WorkspaceClaimName follows Agent Sandbox's native PVC naming contract.
+func WorkspaceClaimName(runtime *sandboxv1beta1.Sandbox) string { return "workspace-" + runtime.Name }
+
+// WorkspaceMount finds the native PVC mounted at the selected executor directory.
+func WorkspaceMount(pod *corev1.Pod, profile *agentsv1alpha1.SelfHostedEnvironment) (string, error) {
+	if pod == nil || profile == nil || len(pod.Spec.Containers) != 1 {
+		return "", errors.New("executor workspace configuration is absent")
 	}
-	if session.UID == "" || len(validation.IsDNS1123Subdomain(storage.StorageClassName)) != 0 ||
-		(storage.ClaimDeletionPolicy != WorkspaceClaimDelete && storage.ClaimDeletionPolicy != WorkspaceClaimRetain) {
-		return nil, errors.New("frozen persistent workspace configuration is invalid")
+	volumeName := ""
+	for _, mount := range pod.Spec.Containers[0].VolumeMounts {
+		if mount.MountPath == profile.Workspace.Directory {
+			if volumeName != "" || mount.ReadOnly || mount.SubPathExpr != "" {
+				return "", errors.New("executor workspace mount is ambiguous or read-only")
+			}
+			volumeName = mount.Name
+		}
 	}
-	size, err := resource.ParseQuantity(session.Status.EnvironmentSnapshot.Profile.SelfHosted.WorkspaceSize)
-	if err != nil || size.Sign() <= 0 || size.Cmp(resource.MustParse("16Gi")) > 0 {
-		return nil, errors.New("frozen persistent workspace size is invalid")
+	for _, volume := range pod.Spec.Volumes {
+		if volume.Name == volumeName && volume.PersistentVolumeClaim != nil && !volume.PersistentVolumeClaim.ReadOnly && volume.PersistentVolumeClaim.ClaimName != "" {
+			return volume.PersistentVolumeClaim.ClaimName, nil
+		}
 	}
-	class := storage.StorageClassName
-	return &corev1.PersistentVolumeClaim{
-		ObjectMeta: metav1.ObjectMeta{Name: WorkspaceClaimNameForUID(string(session.UID)), Namespace: session.Namespace,
-			Labels: map[string]string{WorkspaceSessionUIDLabel: string(session.UID)}},
-		Spec: corev1.PersistentVolumeClaimSpec{
-			AccessModes:      []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
-			Resources:        corev1.VolumeResourceRequirements{Requests: corev1.ResourceList{corev1.ResourceStorage: size}},
-			StorageClassName: &class,
-		},
-	}, nil
+	return "", errors.New("executor workspace must use its native persistent claim")
 }

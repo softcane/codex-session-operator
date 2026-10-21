@@ -2,8 +2,6 @@ package gateway
 
 import (
 	"context"
-	"crypto/sha256"
-	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"io"
@@ -18,18 +16,15 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/validation"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
-// Principal binds a caller token to one Kubernetes namespace and explicit roles.
-// Configuration belongs in a manager/gateway Secret, never a Session or executor.
-type Principal struct {
-	Token     string `json:"token"`
-	Subject   string `json:"subject"`
-	Namespace string `json:"namespace"`
-	Approver  bool   `json:"approver"`
-	Admin     bool   `json:"admin"`
-	digest    [32]byte
+// requestScope carries the namespace selected by the URL and stable service
+// attribution used for durable replay. Access control belongs outside the gateway.
+type requestScope struct {
+	Subject   string
+	Namespace string
 }
 
 const (
@@ -37,20 +32,20 @@ const (
 	_sessionsSegment     = "sessions"
 	_recordsSegment      = "records"
 	_eventsSegment       = "events"
-	_maxPrincipalStreams = 4
+	_maxNamespaceStreams = 4
 )
 
-type streamPrincipal struct {
+type streamScope struct {
 	namespace string
 	subject   string
 }
 
-// Tokens for the same principal share a quota, including during token rotation.
-func (g *Gateway) reserveStream(principal Principal) (func(), bool) {
-	identity := streamPrincipal{namespace: principal.Namespace, subject: principal.Subject}
+// Event streams share a bounded quota within each namespace.
+func (g *Gateway) reserveStream(scope requestScope) (func(), bool) {
+	identity := streamScope{namespace: scope.Namespace, subject: scope.Subject}
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	if g.streamCounts[identity] >= _maxPrincipalStreams {
+	if g.streamCounts[identity] >= _maxNamespaceStreams {
 		return nil, false
 	}
 	select {
@@ -75,27 +70,6 @@ func isEventStream(method string, parts []string) bool {
 		parts[1] == _namespacesSegment && parts[3] == _sessionsSegment && parts[5] == _eventsSegment
 }
 
-func copyPrincipals(principals []Principal) ([]Principal, error) {
-	if len(principals) > 32 {
-		return nil, errors.New("principal limit reached")
-	}
-	result := make([]Principal, len(principals))
-	seen := make(map[[32]byte]bool, len(principals))
-	for i, p := range principals {
-		if len(p.Token) < 32 || len(p.Token) > 512 || p.Subject == "" || p.Namespace == "" {
-			return nil, errors.New("invalid gateway authentication configuration")
-		}
-		p.digest = sha256.Sum256([]byte(p.Token))
-		p.Token = ""
-		if seen[p.digest] {
-			return nil, errors.New("duplicate gateway token")
-		}
-		seen[p.digest] = true
-		result[i] = p
-	}
-	return result, nil
-}
-
 // Ready becomes true only after the leader's server has opened its listener and
 // its manager-owned worker has started. Generic manager health precedes leadership.
 func (g *Gateway) Ready(*http.Request) error {
@@ -105,20 +79,6 @@ func (g *Gateway) Ready(*http.Request) error {
 		return errors.New("gateway is not running")
 	}
 	return nil
-}
-
-func (g *Gateway) authenticate(r *http.Request) (Principal, bool) {
-	header := r.Header.Get("Authorization")
-	if !strings.HasPrefix(header, "Bearer ") || len(header) > 1024 {
-		return Principal{}, false
-	}
-	sum := sha256.Sum256([]byte(strings.TrimPrefix(header, "Bearer ")))
-	for _, principal := range g.principals {
-		if subtle.ConstantTimeCompare(sum[:], principal.digest[:]) == 1 {
-			return principal, true
-		}
-	}
-	return Principal{}, false
 }
 
 func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -135,19 +95,19 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
+	if len(parts) < 3 || parts[0] != "v1" || parts[1] != _namespacesSegment || len(validation.IsDNS1123Label(parts[2])) != 0 {
+		http.NotFound(w, r)
+		return
+	}
+	scope := requestScope{Namespace: parts[2], Subject: g.subject}
 	if isEventStream(r.Method, parts) {
-		principal, ok := g.authenticate(r)
-		if !ok {
-			http.Error(w, "Authentication required", http.StatusUnauthorized)
-			return
-		}
-		release, ok := g.reserveStream(principal)
+		release, ok := g.reserveStream(scope)
 		if !ok {
 			http.Error(w, "Gateway stream capacity reached", http.StatusServiceUnavailable)
 			return
 		}
 		defer release()
-		g.serveAuthenticated(w, r, parts, principal)
+		g.serveScoped(w, r, parts, scope)
 		return
 	}
 	select {
@@ -157,70 +117,65 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Gateway capacity reached", http.StatusServiceUnavailable)
 		return
 	}
-	principal, ok := g.authenticate(r)
-	if !ok {
-		http.Error(w, "Authentication required", http.StatusUnauthorized)
-		return
-	}
-	g.serveAuthenticated(w, r, parts, principal)
+	g.serveScoped(w, r, parts, scope)
 }
 
-func (g *Gateway) serveAuthenticated(w http.ResponseWriter, r *http.Request, parts []string, principal Principal) {
-	if g.serveConversations(w, r, parts, principal) {
+func (g *Gateway) serveScoped(w http.ResponseWriter, r *http.Request, parts []string, scope requestScope) {
+	if g.serveConversations(w, r, parts, scope) {
 		return
 	}
-	if g.serveNamespaceCollection(w, r, parts, principal) {
+	if g.serveNamespaceCollection(w, r, parts, scope) {
 		return
 	}
 	if len(parts) == 5 && parts[0] == "v1" && parts[1] == _namespacesSegment &&
-		parts[2] == principal.Namespace && parts[3] == _profilesSegment {
-		g.handleProfiles(w, r, parts, principal)
+		parts[2] == scope.Namespace && parts[3] == _profilesSegment {
+		g.handleProfiles(w, r, parts, scope)
 		return
 	}
-	if len(parts) == 5 && parts[0] == "v1" && parts[1] == _namespacesSegment && parts[2] == principal.Namespace && parts[3] == _recordsSegment {
-		g.handleAdminRecords(w, r, parts, principal)
+	if len(parts) == 5 && parts[0] == "v1" && parts[1] == _namespacesSegment && parts[2] == scope.Namespace && parts[3] == _recordsSegment {
+		g.handleAdminRecords(w, r, parts, scope)
 		return
 	}
-	if len(parts) < 5 || len(parts) > 7 || parts[0] != "v1" || parts[1] != _namespacesSegment || parts[3] != _sessionsSegment || parts[2] != principal.Namespace {
+	if len(parts) < 5 || len(parts) > 7 || parts[0] != "v1" || parts[1] != _namespacesSegment || parts[3] != _sessionsSegment || parts[2] != scope.Namespace {
 		http.Error(w, "Session not found", http.StatusNotFound)
 		return
 	}
-	g.serveSession(w, r, parts, principal)
+	g.serveSession(w, r, parts, scope)
 }
 
-func (g *Gateway) serveNamespaceCollection(w http.ResponseWriter, r *http.Request, parts []string, principal Principal) bool {
-	if len(parts) != 4 || parts[0] != "v1" || parts[1] != _namespacesSegment || parts[2] != principal.Namespace {
+func (g *Gateway) serveNamespaceCollection(w http.ResponseWriter, r *http.Request, parts []string, scope requestScope) bool {
+	if len(parts) != 4 || parts[0] != "v1" || parts[1] != _namespacesSegment || parts[2] != scope.Namespace {
 		return false
 	}
 	switch parts[3] {
 	case _identitySegment:
-		g.handleIdentity(w, r, principal)
+		g.handleIdentity(w, r, scope)
 		return true
 	case "catalog":
-		g.handleCatalog(w, r, principal)
+		g.handleCatalog(w, r, scope)
 		return true
 	case _profilesSegment:
-		g.handleProfiles(w, r, parts, principal)
+		g.handleProfiles(w, r, parts, scope)
 		return true
 	case _sessionsSegment:
-		g.handleSessionCollection(w, r, principal)
+		g.handleSessionCollection(w, r, scope)
 		return true
 	case _recordsSegment:
-		g.handleAdminRecords(w, r, parts, principal)
+		g.handleAdminRecords(w, r, parts, scope)
 		return true
 	}
 	return false
 }
 
-func (g *Gateway) handleIdentity(w http.ResponseWriter, r *http.Request, principal Principal) {
+func (g *Gateway) handleIdentity(w http.ResponseWriter, r *http.Request, scope requestScope) {
 	if r.Method != http.MethodGet {
 		methodError(w)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]string{_callerSubjectField: principal.Subject, "namespace": principal.Namespace})
+	writeJSON(w, http.StatusOK, map[string]string{_callerSubjectField: scope.Subject, "namespace": scope.Namespace})
 }
 
-func (g *Gateway) serveSession(w http.ResponseWriter, r *http.Request, parts []string, principal Principal) {
+func (g *Gateway) serveSession(w http.ResponseWriter, r *http.Request, parts []string, scope requestScope) {
 	session, record, err := g.lookup(r.Context(), parts[2], parts[4])
 	if err != nil {
 		writeError(w, err)
@@ -255,14 +210,14 @@ func (g *Gateway) serveSession(w http.ResponseWriter, r *http.Request, parts []s
 		}
 		writeJSON(w, http.StatusOK, map[string]any{_historyField: record.History, "recovery_required": record.RecoveryRequired, "last_error": record.LastError})
 	case "actions":
-		g.handleAction(w, r, parts, session, record, principal)
+		g.handleAction(w, r, parts, session, record, scope)
 
 	case _eventsSegment:
 		if len(parts) != 6 || r.Method != http.MethodGet {
 			methodError(w)
 			return
 		}
-		g.serveEvents(w, r, principal.Namespace, record.UID)
+		g.serveEvents(w, r, scope.Namespace, record.UID)
 	default:
 		http.NotFound(w, r)
 	}
@@ -277,7 +232,7 @@ func spendControlReady(session *agentsv1alpha1.Session) bool {
 	if session.Status.SpendControlAttemptedDigest != "" {
 		return false
 	}
-	if session.Spec.SpendControl == nil || session.Spec.SpendControl.Mode != "limited" {
+	if session.Spec.SpendControl == nil || session.Spec.SpendControl.Mode != agentsv1alpha1.SessionSpendModeLimited {
 		return true
 	}
 	return condition != nil && condition.Status == metav1.ConditionTrue && condition.ObservedGeneration == session.Generation
@@ -317,7 +272,7 @@ func (g *Gateway) handleMessage(w http.ResponseWriter, r *http.Request, session 
 	// A none Environment requires its first input in the atomic create request.
 	// Later input waits for spend-control readback and current-generation readiness.
 	firstNoneInput := session.Status.OpenAISessionID == "" && (record.History.Status == _gatewayNoneStatus ||
-		session.Status.EnvironmentSnapshot != nil && session.Status.EnvironmentSnapshot.Profile.Mode == _noneMode) &&
+		session.Status.EnvironmentSnapshot != nil && session.Status.EnvironmentSnapshot.Profile.Mode == agentsv1alpha1.EnvironmentModeNone) &&
 		(record.InitialKey == "" || record.InitialKey == key)
 	if !spendControlReady(session) && !firstNoneInput {
 		http.Error(w, "Session spend control is not verified", http.StatusServiceUnavailable)
@@ -363,17 +318,13 @@ func (g *Gateway) handleCancel(w http.ResponseWriter, r *http.Request, session *
 	}
 	writeJSON(w, http.StatusAccepted, map[string]bool{"queued": true})
 }
-func (g *Gateway) handleAction(w http.ResponseWriter, r *http.Request, parts []string, session *agentsv1alpha1.Session, record Record, principal Principal) {
+func (g *Gateway) handleAction(w http.ResponseWriter, r *http.Request, parts []string, session *agentsv1alpha1.Session, record Record, scope requestScope) {
 	if len(parts) == 6 && r.Method == http.MethodGet {
 		writeJSON(w, http.StatusOK, record.Actions)
 		return
 	}
 	if len(parts) != 7 || r.Method != http.MethodPost {
 		methodError(w)
-		return
-	}
-	if !principal.Approver {
-		http.Error(w, "Approval role required", http.StatusForbidden)
 		return
 	}
 	var input struct {
@@ -390,7 +341,7 @@ func (g *Gateway) handleAction(w http.ResponseWriter, r *http.Request, parts []s
 		writeError(w, err)
 		return
 	}
-	err := g.decide(r.Context(), string(session.UID), parts[6], input.Decision, principal.Subject)
+	err := g.decide(r.Context(), string(session.UID), parts[6], input.Decision, scope.Subject)
 	if err != nil {
 		writeError(w, err)
 		return
@@ -422,7 +373,7 @@ func (g *Gateway) lookup(ctx context.Context, namespace, name string) (*agentsv1
 		if err := g.reader.Get(ctx, client.ObjectKey{Namespace: namespace, Name: session.Spec.EnvironmentRef.Name}, &environment); err != nil {
 			return nil, Record{}, err
 		}
-		if environment.Spec.Mode == _noneMode {
+		if environment.Spec.Mode == agentsv1alpha1.EnvironmentModeNone {
 			if err := g.store.Update(ctx, uid, func(r *Record) error {
 				if r.History.ID == "" {
 					r.History.Status = _gatewayNoneStatus
@@ -509,7 +460,7 @@ func (g *Gateway) enqueue(ctx context.Context, session *agentsv1alpha1.Session, 
 		initial := false
 		if session.Status.OpenAISessionID == "" && session.Spec.EnvironmentRef != nil {
 			if session.Status.EnvironmentSnapshot != nil {
-				initial = session.Status.EnvironmentSnapshot.Profile.Mode == _noneMode
+				initial = session.Status.EnvironmentSnapshot.Profile.Mode == agentsv1alpha1.EnvironmentModeNone
 			} else {
 				initial = r.InitialKey != "" || r.History.Status == _gatewayNoneStatus
 			}
@@ -676,8 +627,8 @@ func writeError(w http.ResponseWriter, err error) {
 	}
 }
 
-// Server joins the HTTP server and worker on shutdown. Loopback HTTP is for local
-// callers/port-forwarding; exposed listeners require configured TLS certificates.
+// Server joins the HTTP server and worker on shutdown. Supplying a certificate
+// and key enables TLS; otherwise it serves HTTP.
 type Server struct {
 	Gateway  *Gateway
 	Address  string
@@ -687,12 +638,8 @@ type Server struct {
 
 func (s *Server) NeedLeaderElection() bool { return true }
 func (s *Server) Start(ctx context.Context) error {
-	host, _, err := net.SplitHostPort(s.Address)
-	if err != nil {
-		return err
-	}
-	if s.CertFile == "" && host != "127.0.0.1" && host != "::1" && host != "localhost" {
-		return errors.New("exposed gateway listeners require TLS")
+	if (s.CertFile == "") != (s.KeyFile == "") {
+		return errors.New("gateway TLS requires both certificate and key")
 	}
 	listener, err := net.Listen("tcp", s.Address)
 	if err != nil {

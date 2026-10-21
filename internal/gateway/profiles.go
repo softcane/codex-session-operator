@@ -5,12 +5,14 @@ import (
 	"errors"
 	"net/http"
 	"os"
+	"reflect"
 	"slices"
 	"strconv"
 	"time"
 
 	agentsv1alpha1 "github.com/softcane/codex-session-operator/api/v1alpha1"
 	"github.com/softcane/codex-session-operator/internal/openaiapi"
+	"github.com/softcane/codex-session-operator/internal/sandbox"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/validation"
@@ -25,7 +27,7 @@ const (
 	_callerSubjectField               = "caller_subject"
 	_sourceField                      = "source"
 	_dependencyIdentityMismatchReason = "DependencyIdentityMismatch"
-	_selfHostedMode                   = "selfHosted"
+	_selfHostedMode                   = "SelfHosted"
 	_selfHostedProviderType           = "self_hosted"
 	_connectedStatus                  = "connected"
 	_identitySegment                  = "identity"
@@ -128,6 +130,16 @@ func (p *ProfileResolver) selection(ctx context.Context, profile *agentsv1alpha1
 	if err := p.dependency(ctx, profile.Namespace, profile.Spec.EnvironmentRef.Name, *profile.Status.Environment, &environment); err != nil {
 		return profileSelection{}, err
 	}
+	if environment.Spec.Mode == _selfHostedMode {
+		pool, err := sandbox.ResolvePool(ctx, p.reader, profile.Namespace, environment.Spec.SelfHosted)
+		if err != nil {
+			return fail("SandboxPoolUnavailable")
+		}
+		if !reflect.DeepEqual(pool, environment.Status.SandboxPool) ||
+			openaiapi.SandboxEnvironmentDigest(environment.Spec, pool) != environment.Status.ConfigurationDigest {
+			return fail("SandboxPoolChanged")
+		}
+	}
 	seen := make(map[string]bool, len(profile.Spec.VaultRefs))
 	vaults := make(map[string]agentsv1alpha1.ProfileDependencyStatus, len(profile.Status.Vaults))
 	for _, dependency := range profile.Status.Vaults {
@@ -220,7 +232,7 @@ func summarizeProfile(profile *agentsv1alpha1.Profile, err error) ProfileSummary
 	return summary
 }
 
-func (g *Gateway) handleProfiles(w http.ResponseWriter, r *http.Request, parts []string, principal Principal) {
+func (g *Gateway) handleProfiles(w http.ResponseWriter, r *http.Request, parts []string, scope requestScope) {
 	if r.Method != http.MethodGet || len(parts) != 4 && len(parts) != 5 {
 		methodError(w)
 		return
@@ -228,12 +240,12 @@ func (g *Gateway) handleProfiles(w http.ResponseWriter, r *http.Request, parts [
 	ctx, cancel := context.WithTimeout(r.Context(), _profileTimeout)
 	defer cancel()
 	if len(parts) == 5 {
-		summary, err := g.profileSummary(ctx, principal.Namespace, parts[4])
+		summary, err := g.profileSummary(ctx, scope.Namespace, parts[4])
 		if err != nil {
 			writeConversationError(w, err)
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]any{_callerSubjectField: principal.Subject,
+		writeJSON(w, http.StatusOK, map[string]any{_callerSubjectField: scope.Subject,
 			_sourceField: g.profileSource(), _profileSourceName: summary})
 		return
 	}
@@ -250,12 +262,12 @@ func (g *Gateway) handleProfiles(w http.ResponseWriter, r *http.Request, parts [
 		http.Error(w, "Invalid Profile page cursor", http.StatusBadRequest)
 		return
 	}
-	items, next, err := g.profileSummaries(ctx, principal.Namespace, after, limit)
+	items, next, err := g.profileSummaries(ctx, scope.Namespace, after, limit)
 	if err != nil {
 		writeConversationError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{_callerSubjectField: principal.Subject,
+	writeJSON(w, http.StatusOK, map[string]any{_callerSubjectField: scope.Subject,
 		_sourceField: g.profileSource(), "profiles": items, _moreField: next != "", "next_cursor": next})
 }
 

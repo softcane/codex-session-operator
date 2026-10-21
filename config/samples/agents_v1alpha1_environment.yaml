@@ -3,7 +3,7 @@ kind: Environment
 metadata:
   name: environment-sample
 spec:
-  mode: openaiHosted
+  mode: OpenAIHosted
   deletionPolicy: Delete
   openaiHosted:
     name: example-hosted-profile

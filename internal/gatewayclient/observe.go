@@ -89,8 +89,8 @@ func terminalRoot(status string) bool {
 	return status == _rootCompleted || status == "failed" || status == "cancelled"
 }
 
-// Lifecycle classification uses structured fields and exact phases, never
-// provider or gateway human error strings.
+// Lifecycle classification uses structured delivery/execution properties and
+// root-turn status. Display phase and human error text are not decision inputs.
 func observationState(detail conversationDetail, roots []rootTurn) string {
 	if detail.RecoveryRequired || detail.Lifecycle != nil && detail.Lifecycle.Recovery.Required {
 		return "recovery_hold"
@@ -125,14 +125,6 @@ func observationState(detail conversationDetail, roots []rootTurn) string {
 		if root.Status == "in_progress" || root.Status == "waiting" {
 			return "running"
 		}
-	}
-	switch detail.Summary.Phase {
-	case "Connecting":
-		return "connecting"
-	case "Ready":
-		return _stateAccepted
-	case "Pending", "Provisioning", "Preparing":
-		return _statePreparing
 	}
 	if detail.History.ID == "" {
 		return _observationUnavailable

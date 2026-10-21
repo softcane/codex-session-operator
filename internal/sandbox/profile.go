@@ -1,7 +1,12 @@
 package sandbox
 
 import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"path"
 	"regexp"
 	"slices"
@@ -11,92 +16,236 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/util/validation"
+	"k8s.io/utils/ptr"
+	extensionsv1beta1 "sigs.k8s.io/agent-sandbox/extensions/api/v1beta1"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
-const (
-	capabilityMountPath  = "/capabilities"
-	capabilityVolumeName = "capabilities"
-)
+const ManagedSetupLabel = "agents.softcane.io/managed"
 
-var capabilityName = regexp.MustCompile(`^[a-z]([a-z0-9-]{0,30}[a-z0-9])?$`)
+var _imageDigest = regexp.MustCompile(`^[^\s@]+@sha256:[a-f0-9]{64}$`)
 
-// ValidateProfile enforces fixed platform security and approved image contracts.
-func ValidateProfile(profile *agentsv1alpha1.SelfHostedEnvironment, executorImages, capabilityImages, storageClasses []string) error {
+// ValidateProfile validates the operator's small reference-based self-hosted API.
+func ValidateProfile(profile *agentsv1alpha1.SelfHostedEnvironment) error {
 	if profile == nil {
 		return errors.New("self-hosted profile is missing")
 	}
-	if ValidateImage(profile.Image) != nil || !slices.Contains(executorImages, profile.Image) {
-		return errors.New("executor image must be pinned and approved by platform configuration")
+	if profile.SandboxPoolRef.Name == "" || len(validation.IsDNS1123Subdomain(profile.SandboxPoolRef.Name)) != 0 {
+		return errors.New("self-hosted environment requires a same-namespace Sandbox pool")
 	}
-	if profile.Architecture != "amd64" && profile.Architecture != "arm64" {
-		return errors.New("executor architecture must be explicit")
-	}
-	if err := ValidateWorkspace(profile.WorkspaceDirectory); err != nil {
+	if err := ValidateWorkspace(profile.Workspace.Directory); err != nil {
 		return err
 	}
-	size, err := resource.ParseQuantity(profile.WorkspaceSize)
-	if err != nil || size.Sign() <= 0 || size.Cmp(resource.MustParse("16Gi")) > 0 {
-		return errors.New("workspace size must be positive and at most 16Gi")
+	if profile.Workspace.DeletionPolicy != WorkspaceClaimDelete && profile.Workspace.DeletionPolicy != WorkspaceClaimRetain {
+		return errors.New("workspace policy must explicitly select Delete or Retain")
 	}
-	if err := ValidateWorkspaceStorage(profile.WorkspaceStorage, storageClasses); err != nil {
-		return err
-	}
-	if err := ValidateRepository(profile.Repository); err != nil {
-		return err
-	}
-	if _, err := ProfileResources(profile.Resources); err != nil {
-		return err
-	}
-	for _, capability := range profile.Capabilities {
-		if ValidateImage(capability.Image) != nil || !slices.Contains(capabilityImages, capability.Image) {
-			return errors.New("capability image must be pinned and approved by platform configuration")
+	for _, directory := range profile.CapabilityDirectories {
+		if !strings.HasPrefix(directory, "/") || path.Clean(directory) != directory || directory == "/" {
+			return errors.New("capability directories must be clean absolute paths other than root")
 		}
-		if err := validateCapability(capability); err != nil {
+	}
+	return nil
+}
+
+// ResolvePool reads native infrastructure authoritatively and returns only safe identities.
+// The caller separately enforces the installation's pool-name allowlist.
+func ResolvePool(ctx context.Context, reader client.Reader, namespace string, profile *agentsv1alpha1.SelfHostedEnvironment) (*agentsv1alpha1.SandboxPoolSnapshot, error) {
+	if err := ValidateProfile(profile); err != nil {
+		return nil, err
+	}
+	var pool extensionsv1beta1.SandboxWarmPool
+	if err := reader.Get(ctx, client.ObjectKey{Namespace: namespace, Name: profile.SandboxPoolRef.Name}, &pool); err != nil {
+		return nil, fmt.Errorf("read Sandbox pool: %w", err)
+	}
+	var template extensionsv1beta1.SandboxTemplate
+	if err := reader.Get(ctx, client.ObjectKey{Namespace: namespace, Name: pool.Spec.TemplateRef.Name}, &template); err != nil {
+		return nil, fmt.Errorf("read Sandbox template: %w", err)
+	}
+	if err := ValidatePool(profile, &pool, &template); err != nil {
+		return nil, err
+	}
+	return &agentsv1alpha1.SandboxPoolSnapshot{
+		Name: pool.Name, UID: string(pool.UID), Generation: pool.Generation,
+		TemplateName: template.Name, TemplateUID: string(template.UID), TemplateGeneration: template.Generation,
+		ConfigurationDigest: digest(struct {
+			Pool     extensionsv1beta1.SandboxWarmPoolSpec
+			Template extensionsv1beta1.SandboxTemplateSpec
+		}{Pool: pool.Spec, Template: template.Spec}),
+	}, nil
+}
+
+// ValidatePool requires on-demand execution and the executor's security and storage contract.
+func ValidatePool(profile *agentsv1alpha1.SelfHostedEnvironment, pool *extensionsv1beta1.SandboxWarmPool, template *extensionsv1beta1.SandboxTemplate) error {
+	if err := ValidateProfile(profile); err != nil {
+		return err
+	}
+	if pool == nil || template == nil || pool.UID == "" || template.UID == "" || pool.Namespace != template.Namespace ||
+		!pool.DeletionTimestamp.IsZero() || !template.DeletionTimestamp.IsZero() || pool.Name != profile.SandboxPoolRef.Name || pool.Spec.TemplateRef.Name != template.Name {
+		return errors.New("sandbox pool and template identities are unavailable")
+	}
+	if pool.Labels[ManagedSetupLabel] != "true" || template.Labels[ManagedSetupLabel] != "true" {
+		return errors.New("sandbox pool and template must opt into the managed immutable-configuration policy")
+	}
+	if pool.Spec.Replicas == nil || *pool.Spec.Replicas != 0 {
+		return errors.New("sandbox pool must explicitly set replicas to zero for Session-bound cold starts")
+	}
+	if template.Spec.EnvVarsInjectionPolicy != extensionsv1beta1.EnvVarsInjectionPolicyAllowed {
+		return errors.New("sandbox template must allow new environment variables without allowing overrides")
+	}
+	pod := &template.Spec.PodTemplate.Spec
+	if len(pod.Containers) != 1 || pod.Containers[0].Name != ExecutorContainerName || len(pod.EphemeralContainers) != 0 {
+		return errors.New("sandbox template must contain exactly one executor container")
+	}
+	if err := validatePodSecurity(pod); err != nil {
+		return err
+	}
+	if err := validateSecretReferences(template); err != nil {
+		return err
+	}
+	if template.Spec.Service == nil || *template.Spec.Service {
+		return errors.New("sandbox template must disable its inbound service")
+	}
+	if err := validateExecutorConnection(&pod.Containers[0], profile.Workspace.Directory); err != nil {
+		return err
+	}
+	containers := append(slices.Clone(pod.Containers), pod.InitContainers...)
+	for _, container := range containers {
+		if err := validateContainer(container); err != nil {
 			return err
 		}
+		if container.Name == RepositoryInitContainerName {
+			for _, env := range container.Env {
+				if env.Name == "SESSION_UID" {
+					return errors.New("repository preparation cannot predefine SESSION_UID")
+				}
+			}
+		}
+	}
+	return validateWorkspaceTemplate(template, profile.Workspace.Directory)
+}
+
+func validatePodSecurity(pod *corev1.PodSpec) error {
+	if ptr.Deref(pod.AutomountServiceAccountToken, true) || pod.HostNetwork || pod.HostPID || pod.HostIPC || ptr.Deref(pod.ShareProcessNamespace, false) ||
+		(pod.ServiceAccountName != "" && pod.ServiceAccountName != "default") {
+		return errors.New("sandbox template cannot expose host namespaces or service-account credentials")
+	}
+	security := pod.SecurityContext
+	if security == nil || len(security.Sysctls) != 0 || !ptr.Deref(security.RunAsNonRoot, false) || ptr.Deref(security.RunAsUser, 0) <= 0 || security.SeccompProfile == nil || security.SeccompProfile.Type != corev1.SeccompProfileTypeRuntimeDefault {
+		return errors.New("sandbox template requires a non-root user and RuntimeDefault seccomp")
+	}
+	if pod.RestartPolicy != "" && pod.RestartPolicy != corev1.RestartPolicyAlways {
+		return errors.New("executor restart policy must be Always")
 	}
 	return nil
 }
 
-func validateCapability(capability agentsv1alpha1.LocalCapability) error {
-	if !capabilityName.MatchString(capability.Name) || len(validation.IsDNS1123Label("capability-"+capability.Name)) != 0 {
-		return errors.New("capability name must produce a valid container name")
+func validateExecutorConnection(executor *corev1.Container, workspace string) error {
+	if !slices.Equal(executor.Command, []string{"codex", "exec-server"}) || !slices.Equal(executor.Args, []string{"--remote", "$(CODEX_REMOTE_URL)", "--environment-id", "$(CODEX_ENVIRONMENT_ID)"}) || executor.WorkingDir != workspace {
+		return errors.New("sandbox executor must use codex exec-server with injected connection settings and the selected working directory")
 	}
-	if capability.Path != "/capabilities/"+capability.Name || (capability.Type != "plugin" && capability.Type != "skills") {
-		return errors.New("capability path must select its unique registered root")
+	credential := false
+	for _, env := range executor.Env {
+		if slices.Contains([]string{"CODEX_ENVIRONMENT_ID", "CODEX_REMOTE_URL", "CODEX_SESSION_UID"}, env.Name) {
+			return errors.New("sandbox template cannot predefine Session-specific environment variables")
+		}
+		if env.Name == ExecutorSecretKey {
+			ref := env.ValueFrom
+			credential = env.Value == "" && ref != nil && ref.SecretKeyRef != nil && ref.SecretKeyRef.Name == ExecutorSecretName && ref.SecretKeyRef.Key == ExecutorSecretKey && !ptr.Deref(ref.SecretKeyRef.Optional, false)
+		}
+	}
+	if !credential {
+		return errors.New("sandbox executor requires the restricted codex-executor credential reference")
 	}
 	return nil
 }
 
-// ValidateWorkspaceStorage requires an approved class and an explicit PVC policy.
-func ValidateWorkspaceStorage(storage *agentsv1alpha1.WorkspaceStorage, storageClasses []string) error {
-	if storage == nil {
-		return nil // Omission selects an ephemeral workspace.
+func validateWorkspaceTemplate(template *extensionsv1beta1.SandboxTemplate, workspace string) error {
+	pod := &template.Spec.PodTemplate.Spec
+	if len(template.Spec.VolumeClaimTemplates) != 1 || template.Spec.VolumeClaimTemplates[0].Name != "workspace" {
+		return errors.New("sandbox template requires exactly one native workspace volume claim template")
 	}
-	switch storage.Type {
-	case WorkspaceStorageEphemeral:
-		if storage.StorageClassName != "" || storage.ClaimDeletionPolicy != "" {
-			return errors.New("ephemeral workspace cannot configure a storage class or claim deletion policy")
+	storage := &template.Spec.VolumeClaimTemplates[0].Spec
+	size := storage.Resources.Requests[corev1.ResourceStorage]
+	if storage.StorageClassName == nil || *storage.StorageClassName == "" || len(validation.IsDNS1123Subdomain(*storage.StorageClassName)) != 0 ||
+		size.Sign() <= 0 || size.Cmp(resource.MustParse("16Gi")) > 0 || len(storage.AccessModes) != 1 || storage.AccessModes[0] != corev1.ReadWriteOnce || storage.Selector != nil || storage.VolumeName != "" || storage.DataSource != nil || storage.DataSourceRef != nil || (storage.VolumeMode != nil && *storage.VolumeMode != corev1.PersistentVolumeFilesystem) {
+		return errors.New("workspace template requires a fresh ReadWriteOnce claim with an explicit class and at most 16Gi")
+	}
+	mounted := false
+	for _, mount := range pod.Containers[0].VolumeMounts {
+		if mount.MountPath == workspace {
+			mounted = mount.Name == "workspace" && !mount.ReadOnly && mount.SubPathExpr == ""
 		}
-	case WorkspaceStoragePersistent:
-		if storage.StorageClassName == "" || storage.StorageClassName == "*" || !slices.Contains(storageClasses, storage.StorageClassName) {
-			return errors.New("persistent workspace requires a platform-approved storage class")
+	}
+	if !mounted {
+		return errors.New("executor must mount its native workspace claim at the selected working directory")
+	}
+	for _, volume := range pod.Volumes {
+		if volume.HostPath != nil || volume.PersistentVolumeClaim != nil {
+			return errors.New("template volumes cannot reference host paths or existing workspace claims")
 		}
-		if storage.ClaimDeletionPolicy != WorkspaceClaimDelete && storage.ClaimDeletionPolicy != WorkspaceClaimRetain {
-			return errors.New("persistent workspace requires an explicit Delete or Retain claim policy")
-		}
-	default:
-		return errors.New("workspace storage type must be Ephemeral or Persistent")
 	}
 	return nil
 }
 
-// ValidateWorkspace excludes paths already used by the platform/runtime.
+func validateContainer(container corev1.Container) error {
+	if err := ValidateImage(container.Image); err != nil {
+		return err
+	}
+	if len(container.EnvFrom) != 0 {
+		return errors.New("sandbox containers cannot use envFrom with Session injection")
+	}
+	seen := make(map[string]struct{}, len(container.Env))
+	for _, env := range container.Env {
+		if _, exists := seen[env.Name]; exists {
+			return errors.New("sandbox container environment names must be unique")
+		}
+		seen[env.Name] = struct{}{}
+		if env.ValueFrom != nil && env.ValueFrom.ConfigMapKeyRef != nil {
+			return errors.New("sandbox containers cannot use untracked ConfigMap values")
+		}
+	}
+	security := container.SecurityContext
+	if security == nil || ptr.Deref(security.AllowPrivilegeEscalation, true) || ptr.Deref(security.Privileged, false) || !ptr.Deref(security.ReadOnlyRootFilesystem, false) ||
+		security.Capabilities == nil || len(security.Capabilities.Add) != 0 || !slices.Contains(security.Capabilities.Drop, corev1.Capability("ALL")) {
+		return errors.New("sandbox containers require read-only roots, dropped capabilities and no privilege escalation")
+	}
+	if security.ProcMount != nil && *security.ProcMount != corev1.DefaultProcMount {
+		return errors.New("sandbox containers cannot expose unmasked proc")
+	}
+	if security.SeccompProfile != nil && security.SeccompProfile.Type != corev1.SeccompProfileTypeRuntimeDefault {
+		return errors.New("sandbox container seccomp cannot weaken RuntimeDefault")
+	}
+	if ptr.Deref(security.RunAsUser, 1000) <= 0 || !ptr.Deref(security.RunAsNonRoot, true) {
+		return errors.New("sandbox containers cannot override the non-root user")
+	}
+	requests, limits := container.Resources.Requests, container.Resources.Limits
+	for _, name := range []corev1.ResourceName{corev1.ResourceCPU, corev1.ResourceMemory} {
+		request, limit := requests[name], limits[name]
+		if request.Sign() <= 0 || request.Cmp(limit) > 0 {
+			return errors.New("sandbox containers require positive CPU and memory requests within explicit limits")
+		}
+	}
+	cpu, memory := limits[corev1.ResourceCPU], limits[corev1.ResourceMemory]
+	if cpu.Cmp(resource.MustParse("8")) > 0 || memory.Cmp(resource.MustParse("16Gi")) > 0 {
+		return errors.New("sandbox container limits exceed 8 CPU or 16Gi memory")
+	}
+	return nil
+}
+
+// ValidateImage requires an immutable image reference. Pool approval is separate.
+func ValidateImage(image string) error {
+	if !_imageDigest.MatchString(image) {
+		return errors.New("sandbox images must be pinned by sha256 digest")
+	}
+	return nil
+}
+
+// ValidateWorkspace excludes platform/runtime directories.
 func ValidateWorkspace(workspace string) error {
 	if !strings.HasPrefix(workspace, "/") || path.Clean(workspace) != workspace || workspace == "/" {
 		return errors.New("executor workspace must be a clean absolute directory other than root")
 	}
-	for _, reserved := range []string{"/home", "/tmp", "/usr", "/bin", "/sbin", "/etc", "/dev", "/proc", "/sys", "/run", capabilityMountPath} {
+	for _, reserved := range []string{"/home", "/tmp", "/usr", "/bin", "/sbin", "/etc", "/dev", "/proc", "/sys", "/run", "/capabilities"} {
 		if workspace == reserved || strings.HasPrefix(workspace, reserved+"/") {
 			return errors.New("executor workspace overlaps a reserved directory")
 		}
@@ -104,68 +253,8 @@ func ValidateWorkspace(workspace string) error {
 	return nil
 }
 
-// ProfileResources bounds both scheduling requests and execution limits.
-func ProfileResources(config *agentsv1alpha1.ExecutorResources) (corev1.ResourceRequirements, error) {
-	values := agentsv1alpha1.ExecutorResources{CPURequest: "100m", CPULimit: "1", MemoryRequest: "128Mi", MemoryLimit: "512Mi"}
-	if config != nil {
-		values = *config
-	}
-	requestCPU, e1 := resource.ParseQuantity(values.CPURequest)
-	limitCPU, e2 := resource.ParseQuantity(values.CPULimit)
-	requestMemory, e3 := resource.ParseQuantity(values.MemoryRequest)
-	limitMemory, e4 := resource.ParseQuantity(values.MemoryLimit)
-	if errors.Join(e1, e2, e3, e4) != nil || requestCPU.Sign() <= 0 || requestMemory.Sign() <= 0 || requestCPU.Cmp(limitCPU) > 0 || requestMemory.Cmp(limitMemory) > 0 ||
-		limitCPU.Cmp(resource.MustParse("8")) > 0 || limitMemory.Cmp(resource.MustParse("16Gi")) > 0 {
-		return corev1.ResourceRequirements{}, errors.New("executor resources must be positive requests within limits of 8 CPU and 16Gi memory")
-	}
-	return corev1.ResourceRequirements{Requests: corev1.ResourceList{corev1.ResourceCPU: requestCPU, corev1.ResourceMemory: requestMemory}, Limits: corev1.ResourceList{corev1.ResourceCPU: limitCPU, corev1.ResourceMemory: limitMemory}}, nil
-}
-
-// ApplyProfile copies frozen fields into a fresh Pod. No profile lookup occurs here.
-func ApplyProfile(pod *corev1.Pod, profile *agentsv1alpha1.SelfHostedEnvironment, sessionUID string) error {
-	if profile == nil {
-		return nil
-	}
-	resources, err := ProfileResources(profile.Resources)
-	if err != nil {
-		return err
-	}
-	pod.Spec.Containers[0].Resources = resources
-	pod.Spec.Containers[0].Env = append(pod.Spec.Containers[0].Env,
-		corev1.EnvVar{Name: "GOCACHE", Value: path.Join(profile.WorkspaceDirectory, ".cache", "go-build")},
-		corev1.EnvVar{Name: "GOMODCACHE", Value: path.Join(profile.WorkspaceDirectory, ".cache", "go-mod")},
-		corev1.EnvVar{Name: "GOPATH", Value: path.Join(profile.WorkspaceDirectory, ".cache", "go")})
-	pod.Spec.NodeSelector = map[string]string{"kubernetes.io/arch": profile.Architecture}
-	size, err := resource.ParseQuantity(profile.WorkspaceSize)
-	if err != nil {
-		return errors.New("invalid frozen workspace size")
-	}
-	if profile.WorkspaceStorage != nil && profile.WorkspaceStorage.Type == WorkspaceStoragePersistent {
-		if sessionUID == "" || profile.WorkspaceStorage.StorageClassName == "" {
-			return errors.New("persistent workspace claim configuration is incomplete")
-		}
-		pod.Spec.Volumes[0].VolumeSource = corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: WorkspaceClaimNameForUID(sessionUID)}}
-	} else {
-		pod.Spec.Volumes[0].EmptyDir.SizeLimit = &size
-	}
-	if len(profile.Capabilities) == 0 {
-		return nil
-	}
-	pod.Spec.Volumes = append(pod.Spec.Volumes, corev1.Volume{Name: capabilityVolumeName, VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{SizeLimit: new(resource.MustParse("1Gi"))}}})
-	pod.Spec.Containers[0].VolumeMounts = append(pod.Spec.Containers[0].VolumeMounts, corev1.VolumeMount{Name: capabilityVolumeName, MountPath: capabilityMountPath, ReadOnly: true})
-	for _, capability := range profile.Capabilities {
-		if err := validateCapability(capability); err != nil {
-			return err
-		}
-		// All interpolated path components are constrained by admission and validation.
-		check := "test -d " + capability.Path + "/skills"
-		if capability.Type == "plugin" {
-			check = "test -f " + capability.Path + "/.codex-plugin/plugin.json"
-		}
-		command := "set -eu; mkdir -p " + capability.Path + "; cp -R /bundle/. " + capability.Path + "/; " + check
-		pod.Spec.InitContainers = append(pod.Spec.InitContainers, corev1.Container{Name: "capability-" + capability.Name, Image: capability.Image, ImagePullPolicy: corev1.PullIfNotPresent,
-			Command: []string{"sh", "-c", command}, SecurityContext: pod.Spec.Containers[0].SecurityContext.DeepCopy(), Resources: resources,
-			VolumeMounts: []corev1.VolumeMount{{Name: capabilityVolumeName, MountPath: capabilityMountPath}}})
-	}
-	return nil
+func digest(value any) string {
+	raw, _ := json.Marshal(value)
+	sum := sha256.Sum256(raw)
+	return hex.EncodeToString(sum[:])
 }

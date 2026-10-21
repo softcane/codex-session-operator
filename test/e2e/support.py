@@ -109,10 +109,10 @@ def prepared_executor(detail, session, pod):
     proof = session.get("status", {}).get("workspacePreparation") or {}
     if pm.get("deletionTimestamp") or detail.get("summary", {}).get("session_uid") != sm["uid"] or pm.get("uid") != proof.get("podUID"):
         return False
-    if pm.get("namespace") != sm.get("namespace") or not any(owner.get("controller") and owner.get("uid") == sm["uid"]
+    if pm.get("namespace") != sm.get("namespace") or not any(owner.get("controller") and owner.get("uid") == session.get("status", {}).get("sandboxUID")
             for owner in pm.get("ownerReferences", [])):
         return False
-    if not proof.get("configDigest") or pm.get("annotations", {}).get("agents.softcane.io/executor-config") != proof["configDigest"]:
+    if not proof.get("configDigest") or not pm.get("annotations", {}).get("agents.softcane.io/executor-config"):
         return False
     if proof.get("claimUID", "") != session.get("status", {}).get("workspaceClaimUID", "") or pod.get("status", {}).get("phase") != "Running":
         return False
@@ -129,8 +129,45 @@ def prepared_executor(detail, session, pod):
     instance = containers[0]
     started = instance.get("state", {}).get("running", {}).get("startedAt")
     return bool(instance.get("ready") and instance.get("restartCount") == 0 and instance.get("containerID") and started and
-                instance["containerID"] == proof.get("containerID") and started == proof.get("startedAt") and
+                instance["containerID"] == proof.get("containerID") and started == proof.get("startTime") and
                 instance.get("restartCount") == proof.get("restartCount"))
+
+
+def controlled_by(value, owner):
+    return bool(value and owner) and any(ref.get("controller") and ref.get("uid") == owner["metadata"]["uid"]
+                                         for ref in value["metadata"].get("ownerReferences", []))
+
+
+def sandbox_chain(checks, session, pod):
+    """Verify the complete Session -> Claim -> Sandbox -> Pod ownership chain."""
+    status = session["status"]
+    claim = checks.get("sandboxclaim", status["sandboxClaimName"])
+    sandbox = checks.get("sandbox", status["sandboxName"])
+    ensure(claim and sandbox and claim["metadata"]["uid"] == status["sandboxClaimUID"] and
+           sandbox["metadata"]["uid"] == status["sandboxUID"] and controlled_by(claim, session) and
+           controlled_by(sandbox, claim) and controlled_by(pod, sandbox), "Sandbox ownership chain differs from Session proof")
+    config = claim["metadata"].get("annotations", {}).get("agents.softcane.io/executor-config")
+    ensure(config and sandbox["spec"]["podTemplate"].get("metadata", {}).get("annotations", {}).get("agents.softcane.io/executor-config") == config and
+           pod["metadata"].get("annotations", {}).get("agents.softcane.io/executor-config") == config,
+           "Claim, Sandbox and Pod configuration annotations differ")
+    return claim, sandbox
+
+
+def workspace_claim(checks, session, pod=None):
+    pod = pod or checks.get("pod", session["status"]["podName"])
+    volume = next(item for item in pod["spec"]["volumes"] if item["name"] == "workspace")
+    name = volume.get("persistentVolumeClaim", {}).get("claimName")
+    return checks.get("pvc", name) if name else None
+
+
+def retained_sandbox(checks, session):
+    sandbox = checks.get("sandbox", session["status"]["sandboxName"])
+    ensure(sandbox and sandbox["metadata"]["uid"] == session["status"]["sandboxUID"] and
+           sandbox["spec"]["operatingMode"] == "Suspended" and not sandbox["metadata"].get("ownerReferences") and
+           sandbox["metadata"].get("labels", {}).get("agents.softcane.io/session-uid") == session["metadata"]["uid"] and
+           checks.get("sandboxclaim", session["status"]["sandboxClaimName"]) is None,
+           "Retained Sandbox must be suspended, orphaned, and match the original Session UID")
+    return sandbox
 
 
 def wait_executor(checks, detail, label, timeout=240, different_uid=None):
@@ -147,8 +184,9 @@ def wait_executor(checks, detail, label, timeout=240, different_uid=None):
         if not prepared_executor(value, session, pod) or pod["metadata"]["uid"] == different_uid:
             previous = None
             return None
+        sandbox_chain(checks, session, pod)
         proof = session["status"]["workspacePreparation"]
-        identity = (proof["podUID"], proof["containerID"], proof["startedAt"], proof["configDigest"])
+        identity = (proof["podUID"], proof["containerID"], proof["startTime"], proof["configDigest"])
         stable = previous == identity
         previous = identity
         return (value, session, pod) if stable else None
@@ -193,14 +231,12 @@ class Evidence:
 
 
 class API:
-    def __init__(self, port, token, context):
-        self.base = f"https://127.0.0.1:{port}"
-        self.token = token
+    def __init__(self, port, context=None):
+        self.base = f"{'https' if context else 'http'}://127.0.0.1:{port}"
         self.context = context
 
     def request(self, suffix, method="GET", body=None, key=None):
-        headers = {"Authorization": "Bearer " + self.token,
-                   "Content-Type": "application/json"}
+        headers = {"Content-Type": "application/json"}
         if key:
             headers["Idempotency-Key"] = key
         request = urllib.request.Request(self.base + suffix, headers=headers, method=method,

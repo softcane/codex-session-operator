@@ -8,11 +8,11 @@ import (
 )
 
 const testVaultTransportField = "transport"
-const testSelfHostedMode = "selfHosted"
+const testSelfHostedMode = "SelfHosted"
 const testRestrictedAccess = "restricted"
 
 func TestHostedCredentialsRejectSelfHostedAndNetworkMismatches(t *testing.T) {
-	c := agentsv1alpha1.VaultCredential{Spec: agentsv1alpha1.VaultCredentialSpec{Auth: agentsv1alpha1.VaultCredentialAuth{Type: "environment_variable", EnvironmentVariable: &agentsv1alpha1.VaultEnvironmentVariable{SecretName: "CONTROLLED_TOKEN", Networking: agentsv1alpha1.VaultCredentialNetworking{Type: testLimitedMode, AllowedHosts: []string{"api.example.com"}}}}}}
+	c := agentsv1alpha1.VaultCredential{Spec: agentsv1alpha1.VaultCredentialSpec{Auth: agentsv1alpha1.VaultCredentialAuth{Type: "environment_variable", EnvironmentVariable: &agentsv1alpha1.VaultEnvironmentVariable{VariableName: "CONTROLLED_TOKEN", Networking: agentsv1alpha1.VaultCredentialNetworking{Type: testLimitedMode, AllowedHosts: []string{"api.example.com"}}}}}}
 	tests := []struct {
 		name      string
 		profile   *agentsv1alpha1.SessionEnvironmentSnapshot

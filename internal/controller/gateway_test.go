@@ -95,7 +95,7 @@ var _ = Describe("Gateway coordinated none creation", func() {
 			_, err := ar.Reconcile(ctx, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(agent)})
 			Expect(err).NotTo(HaveOccurred())
 		}
-		environment = &agentsv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{GenerateName: "gateway-none-", Namespace: testNamespace}, Spec: agentsv1alpha1.EnvironmentSpec{Mode: _noneMode, DeletionPolicy: "Delete"}}
+		environment = &agentsv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{GenerateName: "gateway-none-", Namespace: testNamespace}, Spec: agentsv1alpha1.EnvironmentSpec{Mode: agentsv1alpha1.EnvironmentModeNone, DeletionPolicy: deletePolicy}}
 		Expect(k8sClient.Create(ctx, environment)).To(Succeed())
 		er := &EnvironmentReconciler{Client: k8sClient, APIReader: k8sClient, OwnerScope: testAgentScope, GatewayEnabled: true}
 		for range 2 {
@@ -148,7 +148,7 @@ var _ = Describe("Gateway coordinated none creation", func() {
 		initial.beforePost = func() {
 			current := read()
 			Expect(current.Status.CreationAttempted).To(BeTrue())
-			Expect(current.Status.EnvironmentSnapshot.Profile.Mode).To(Equal(_noneMode))
+			Expect(current.Status.EnvironmentSnapshot.Profile.Mode).To(Equal(agentsv1alpha1.EnvironmentModeNone))
 			Expect(current.Finalizers).To(ContainElement(sessionFinalizer))
 		}
 		Expect(step()).To(Succeed())
@@ -208,7 +208,7 @@ var _ = Describe("Gateway coordinated none creation", func() {
 	})
 	It("accepts function tools only with a registered gateway and rejects computer use without desktop", func() {
 		fields := map[string]any{"tools": []any{map[string]any{_wireType: _testGatewayFunction, "name": "gateway_echo"}}}
-		snapshot := &agentsv1alpha1.SessionEnvironmentSnapshot{Profile: agentsv1alpha1.EnvironmentSpec{Mode: _noneMode}}
+		snapshot := &agentsv1alpha1.SessionEnvironmentSnapshot{Profile: agentsv1alpha1.EnvironmentSpec{Mode: agentsv1alpha1.EnvironmentModeNone}}
 		reason, _ := r.gatewayAgentBlock(ctx, fields, snapshot)
 		Expect(reason).To(BeEmpty())
 		fields["tools"] = []any{map[string]any{_wireType: "computer_use"}}

@@ -7,10 +7,10 @@ Read [README.md](README.md) for the user workflow, [docs/architecture.md](docs/a
 | Path | Responsibility |
 | --- | --- |
 | `api/v1alpha1/` | The six namespaced CRD APIs: Agent, Environment, Profile, Vault, VaultCredential, Session. |
-| `internal/controller/` | Kubernetes reconciliation, remote identity, dependency snapshots, finalizers, executor and workspace lifecycle. |
+| `internal/controller/` | Kubernetes reconciliation, remote identity, dependency snapshots, finalizers, Sandbox claim binding and cleanup. |
 | `internal/openaiapi/` | OpenAI SDK adapter, provider ownership checks, configuration conversion and error redaction. |
-| `internal/gateway/` | Authenticated HTTP, Profile admission, durable conversations and history, approvals, PostgreSQL storage and worker fencing. |
-| `internal/sandbox/` | Validation and construction of approved executor Pods and workspaces. |
+| `internal/gateway/` | HTTP, Profile admission, durable conversations and history, approvals, PostgreSQL storage and worker fencing. |
+| `internal/sandbox/` | Validation of approved Sandbox recipes, claim construction, and executor ownership/preparation proofs. |
 | `cmd/main.go`, `cmd/gateway/`, `cmd/gateway-admin/`, `cmd/gateway-client/`, `cmd/workspace-bootstrap/` | Controller, gateway, offline administration, durable caller and repository preparation binaries. |
 | `config/` | Kubebuilder manifests, overlays and example custom resources; `config/demo/` uses a simulated provider. |
 | `hack/` | Copyright boilerplate and release installer rendering. |
@@ -20,12 +20,13 @@ Read [README.md](README.md) for the user workflow, [docs/architecture.md](docs/a
 ## Rules that protect the system's contract
 
 - Keep prompts, turns, event bodies, approvals, replay keys and transcripts in the gateway store. CR status carries remote IDs, conditions, frozen safe configuration and source versions, not conversation content or credential values.
-- A new Session needs same-namespace `agentRef` and `environmentRef` plus explicit `spendControl`. Resolve Ready dependencies before freezing their identities and creation settings. A `none` Environment needs durable initial gateway input before remote Session creation.
+- A new Session needs same-namespace `agentRef` and `environmentRef` plus explicit `spendControl`. Resolve Ready dependencies before freezing their identities and creation settings. A `None` Environment needs durable initial gateway input before remote Session creation.
 - Treat remote create, update and delete outcomes as potentially ambiguous. Persist one-time claims before remote creates; recover by Kubernetes UID and verified owner scope. Do not clear a claim, replace a missing remote identity or remove a finalizer to bypass an uncertain outcome.
-- Keep self-hosted executor Pods and workspace claims tied to the Session UID. Validate approved image digests, storage classes and Secret references. Preserve `Delete`/`Retain` policy behavior and stop gateway input before cleanup.
+- Self-hosted execution uses Agent Sandbox, with the ownership chain `Session → SandboxClaim → Sandbox → Pod` and a Sandbox-owned workspace PVC. Approve same-namespace pools through `SANDBOX_POOLS`, freeze pool/template identities, and validate administrator recipes and Secret references. Keep managed template and pool specifications immutable through the installed admission policy; create a versioned setup for configuration changes. Never recreate a missing frozen claim or adopt a replacement workspace silently.
+- Stop gateway input and suspend the Sandbox before cleanup. `Delete` removes the claim and its dependent execution resources. `Retain` suspends the Sandbox, waits for its Pod to disappear, detaches the Sandbox from the claim and deletes the claim while preserving files. Do not leave a retained claim that can recreate execution. Delegate Pod and PVC creation to Agent Sandbox.
 - Use a separate restricted executor credential. Never log, commit or put Secret contents, API keys or generated demo credentials in status, Events, reports or examples.
 - A gateway HTTP `202` means input was durably accepted. Turn completion needs a later history read. Use stable idempotency keys for retries, and reject changed content under the same identity.
-- Ship the controller and gateway together as separate Deployments and images. Provision PostgreSQL separately; the gateway initializes its tables at startup under a database lock so replicas can start safely together. Keep the initial schema in `internal/gateway/schema.sql`.
+- Ship the controller and gateway together as separate Deployments and images. Install the pinned upstream Agent Sandbox core and extensions separately. Provision PostgreSQL separately; the gateway initializes its tables at startup under a database lock so replicas can start safely together. Keep the initial schema in `internal/gateway/schema.sql`.
 
 ## Editing and verification
 

@@ -97,23 +97,23 @@ func TestPostgreSQLStorageBehavior(t *testing.T) {
 	t.Run("receipt replay and changed input", func(t *testing.T) {
 		g, _, _ := profileConversationGateway(t, store)
 		body := _profileTestBody
-		first := request(g, http.MethodPost, _conversationPath, _token, "backend-event", body)
+		first := request(g, http.MethodPost, _conversationPath, "backend-event", body)
 		if first.Code != 202 {
 			t.Fatal(first.Code, first.Body.String())
 		}
-		second := request(g, http.MethodPost, _conversationPath, _token, "backend-event", body)
+		second := request(g, http.MethodPost, _conversationPath, "backend-event", body)
 		if second.Code != 202 || second.Body.String() != first.Body.String() {
 			t.Fatal("receipt changed")
 		}
 		changed := strings.Replace(body, "Inspect the repository", "Changed", 1)
-		if response := request(g, http.MethodPost, _conversationPath, _token, "backend-event", changed); response.Code != 409 {
+		if response := request(g, http.MethodPost, _conversationPath, "backend-event", changed); response.Code != 409 {
 			t.Fatal(response.Code)
 		}
 	})
 	t.Run("lost provider reply and pending approval", func(t *testing.T) {
 		p := simulatorForTest()
 		g, _ := testGateway(t, store, p, testSession())
-		if response := request(g, http.MethodPost, _testMessagePath, _token, "contract-input", `{"text":"queued"}`); response.Code != 202 {
+		if response := request(g, http.MethodPost, _testMessagePath, "contract-input", `{"text":"queued"}`); response.Code != 202 {
 			t.Fatal(response.Code)
 		}
 		p.lose = true
@@ -178,7 +178,7 @@ func TestPostgreSQLConcurrentAcceptance(t *testing.T) {
 			if i%2 == 1 {
 				g = g2
 			}
-			r := request(g, http.MethodPost, _conversationPath, _token, "concurrent-delivery", body)
+			r := request(g, http.MethodPost, _conversationPath, "concurrent-delivery", body)
 			responses <- fmt.Sprintf("%d:%s", r.Code, r.Body.String())
 		})
 	}
@@ -201,7 +201,7 @@ func TestPostgreSQLConcurrentAcceptance(t *testing.T) {
 		t.Fatal("duplicate acceptance", err)
 	}
 	changed := strings.Replace(body, "Inspect the repository", "different", 1)
-	if r := request(g2, http.MethodPost, _conversationPath, _token, "concurrent-delivery", changed); r.Code != 409 {
+	if r := request(g2, http.MethodPost, _conversationPath, "concurrent-delivery", changed); r.Code != 409 {
 		t.Fatal("creation key accepted changed input", r.Code)
 	}
 }
@@ -291,7 +291,7 @@ func (w *heldReceiptWriter) Write(raw []byte) (int, error) {
 func TestPostgreSQLBackupRestore(t *testing.T) {
 	store, _ := postgresForTest(t)
 	g, _, _ := profileConversationGateway(t, store)
-	response := request(g, http.MethodPost, _conversationPath, _token, "restore-pending", _profileTestBody)
+	response := request(g, http.MethodPost, _conversationPath, "restore-pending", _profileTestBody)
 	if response.Code != 202 {
 		t.Fatal(response.Code)
 	}
@@ -397,7 +397,7 @@ func TestPostgreSQLCrashProof(t *testing.T) {
 		t.Fatal(server.ListenAndServe())
 	}
 	body := `{"route_id":"payments","text":"durably accepted"}`
-	receipt := request(g, http.MethodPost, _conversationPath, _token, "crash-proof", body)
+	receipt := request(g, http.MethodPost, _conversationPath, "crash-proof", body)
 	if receipt.Code != http.StatusAccepted {
 		t.Fatal(receipt.Code)
 	}
@@ -413,7 +413,7 @@ func TestPostgreSQLCrashProof(t *testing.T) {
 		t.Fatal("process crash lost original receipt", err)
 	}
 	changed := strings.Replace(body, "durably accepted", "different", 1)
-	if response := request(g, http.MethodPost, _conversationPath, _token, "crash-proof", changed); response.Code != http.StatusConflict {
+	if response := request(g, http.MethodPost, _conversationPath, "crash-proof", changed); response.Code != http.StatusConflict {
 		t.Fatal("process crash lost replay conflict", response.Code)
 	}
 }
@@ -492,7 +492,7 @@ func TestPostgreSQLWorkerFencingAndOperationRecovery(t *testing.T) {
 	p := simulatorForTest()
 	p.history.Actions = []openaiapi.PendingAction{{Type: _functionCall, TurnID: _testTurnID, CallID: _testCallID, Name: _testExternal, Arguments: json.RawMessage(`{"value":1}`)}}
 	g, _ := testGateway(t, first, p, testSession())
-	_ = request(g, http.MethodGet, "/v1/namespaces/team/sessions/work", _token, "", "")
+	_ = request(g, http.MethodGet, "/v1/namespaces/team/sessions/work", "", "")
 	if err := g.recover(t.Context(), _testUID, p.history, false); err != nil {
 		t.Fatal(err)
 	}
@@ -596,7 +596,7 @@ func TestPostgreSQLRetainedQuotaReservesConversation(t *testing.T) {
 		t.Fatal("configure retained quota")
 	}
 	g, _, _ := profileConversationGateway(t, store)
-	response := request(g, http.MethodPost, _conversationPath, _token, "no-room-for-conversation", _profileTestBody)
+	response := request(g, http.MethodPost, _conversationPath, "no-room-for-conversation", _profileTestBody)
 	if response.Code == 202 {
 		t.Fatal("accepted work without its future conversation capacity")
 	}

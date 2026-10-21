@@ -28,6 +28,10 @@ const deleteMissingScenario = "delete-404"
 const deleteConfirmedScenario = "delete-confirmed"
 
 const getMissingScenario = "get-404"
+const testInvalidRequestType = "invalid_request_error"
+const testUnknownParameterCode = "unknown_parameter"
+const testPrivateParameter = "private_parameter"
+const testUnsupportedSpendControlMessage = "Unknown parameter: 'spend_control'."
 
 func remoteJSON(uid, id string) map[string]any {
 	return map[string]any{"id": id, objectField: "agent.session", "status": "idle", agentField: map[string]any{modelField: SessionModel}, metadataField: map[string]string{ownerKey: uid, operatorKey: operatorValue}, testEnvironmentField: map[string]any{typeField: selfHostedType, "id": testEnvironmentID, "remote_url": testRemoteURL, workspaceDirectoryField: testWorkspace}}
@@ -47,15 +51,45 @@ type roundTripFunc func(*http.Request) (*http.Response, error)
 func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
 
 func TestSpendControlUnavailableErrorIsClassifiedWithoutRawBody(t *testing.T) {
-	rejected := &openai.Error{StatusCode: http.StatusBadRequest, Param: spendControlField,
-		Message: "Session budget configuration is not enabled"}
-	if got := safeError(createOperation, rejected); !errors.Is(got, ErrSpendControlUnavailable) {
-		t.Fatalf("known project capability rejection was not classified: %v", got)
+	tests := []struct {
+		name            string
+		rejection       openai.Error
+		wantUnavailable bool
+	}{
+		{name: "project feature disabled", rejection: openai.Error{StatusCode: http.StatusBadRequest, Param: spendControlField,
+			Message: "Session budget configuration is not enabled"}, wantUnavailable: true},
+		{name: "API parameter unsupported", rejection: openai.Error{StatusCode: http.StatusBadRequest,
+			Type: testInvalidRequestType, Code: testUnknownParameterCode, Param: spendControlField,
+			Message: testUnsupportedSpendControlMessage}, wantUnavailable: true},
+		{name: "unrelated unsupported parameter", rejection: openai.Error{StatusCode: http.StatusBadRequest,
+			Type: testInvalidRequestType, Code: testUnknownParameterCode, Param: testPrivateParameter,
+			Message: "Unknown parameter: 'private_parameter'."}},
+		{name: "unexpected error type", rejection: openai.Error{StatusCode: http.StatusBadRequest,
+			Type: "api_error", Code: testUnknownParameterCode, Param: spendControlField,
+			Message: testUnsupportedSpendControlMessage}},
+		{name: "unexpected error code", rejection: openai.Error{StatusCode: http.StatusBadRequest,
+			Type: testInvalidRequestType, Code: "invalid_value", Param: spendControlField,
+			Message: testUnsupportedSpendControlMessage}},
+		{name: "unexpected status", rejection: openai.Error{StatusCode: http.StatusInternalServerError,
+			Type: testInvalidRequestType, Code: testUnknownParameterCode, Param: spendControlField,
+			Message: testUnsupportedSpendControlMessage}},
+		{name: "unrecognized provider message", rejection: openai.Error{StatusCode: http.StatusBadRequest,
+			Type: testInvalidRequestType, Code: testUnknownParameterCode, Param: spendControlField,
+			Message: "sensitive unexpected provider text"}},
 	}
-	other := &openai.Error{StatusCode: http.StatusBadRequest, Param: spendControlField,
-		Message: "sensitive unexpected provider text"}
-	if got := safeError(createOperation, other); strings.Contains(got.Error(), other.Message) {
-		t.Fatal("unrecognized provider message leaked")
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := safeError(createOperation, &tt.rejection)
+			if errors.Is(got, ErrSpendControlUnavailable) != tt.wantUnavailable {
+				t.Fatalf("unavailable classification = %v, want %v", got, tt.wantUnavailable)
+			}
+			if strings.Contains(got.Error(), tt.rejection.Message) {
+				t.Fatal("provider message leaked")
+			}
+			if _, ok := errors.AsType[*openai.Error](got); ok {
+				t.Fatal("raw SDK error remained in the returned chain")
+			}
+		})
 	}
 }
 

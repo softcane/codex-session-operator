@@ -8,8 +8,8 @@ import (
 	"errors"
 	"maps"
 	"net/url"
-	"reflect"
 	"regexp"
+	"slices"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -18,6 +18,7 @@ import (
 	"github.com/openai/openai-go/v3/option"
 	agentsv1alpha1 "github.com/softcane/codex-session-operator/api/v1alpha1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/util/validation"
 )
 
 const httpsScheme = "https"
@@ -118,8 +119,8 @@ func CredentialAuth(spec agentsv1alpha1.VaultCredentialAuth, secret *corev1.Secr
 		if !rotate {
 			auth["mcp_server_url"] = b.ServerURL
 		}
-		if b.ExpiresAt != nil {
-			auth["expires_at"] = b.ExpiresAt.UTC().Format(time.RFC3339)
+		if b.ExpirationTime != nil {
+			auth["expires_at"] = b.ExpirationTime.UTC().Format(time.RFC3339)
 		} else if rotate {
 			auth["expires_at"] = nil
 		}
@@ -135,7 +136,7 @@ func CredentialAuth(spec agentsv1alpha1.VaultCredentialAuth, secret *corev1.Secr
 			return nil, errors.New("environment credential branch is required")
 		}
 		b := spec.EnvironmentVariable
-		if !regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]{0,127}$`).MatchString(b.SecretName) || reservedCredentialVariable(b.SecretName) {
+		if !regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]{0,127}$`).MatchString(b.VariableName) || reservedCredentialVariable(b.VariableName) {
 			return nil, errors.New("environment credential name is invalid or reserved")
 		}
 		if err := validateCredentialNetworking(b.Networking); err != nil {
@@ -147,7 +148,7 @@ func CredentialAuth(spec agentsv1alpha1.VaultCredentialAuth, secret *corev1.Secr
 		}
 		auth["secret_value"] = value
 		if !rotate {
-			auth["secret_name"] = b.SecretName
+			auth["secret_name"] = b.VariableName
 			network := map[string]any{typeField: b.Networking.Type}
 			if b.Networking.Type == limitedNetworkingType {
 				network["allowed_hosts"] = append([]string(nil), b.Networking.AllowedHosts...)
@@ -232,7 +233,7 @@ func validateCredentialNetworking(n agentsv1alpha1.VaultCredentialNetworking) er
 	}
 	seen := make(map[string]bool)
 	for _, host := range n.AllowedHosts {
-		if host != strings.ToLower(host) || !regexp.MustCompile(`^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$`).MatchString(host) || strings.Contains(host, "..") || seen[host] {
+		if host != strings.ToLower(host) || len(validation.IsDNS1123Subdomain(host)) != 0 || seen[host] {
 			return errors.New("credential hosts must be unique exact lowercase hostnames or IPv4 addresses")
 		}
 		seen[host] = true
@@ -276,7 +277,7 @@ func CredentialPublicMatches(spec agentsv1alpha1.VaultCredentialAuth, remote Cre
 		}
 		b := spec.EnvironmentVariable
 		network, _ := remote.Auth["networking"].(map[string]any)
-		if network[typeField] != b.Networking.Type || remote.Auth["secret_name"] != b.SecretName {
+		if network[typeField] != b.Networking.Type || remote.Auth["secret_name"] != b.VariableName {
 			return false
 		}
 		if b.Networking.Type == "unrestricted" {
@@ -284,15 +285,23 @@ func CredentialPublicMatches(spec agentsv1alpha1.VaultCredentialAuth, remote Cre
 		}
 		raw, _ := json.Marshal(network["allowed_hosts"])
 		var hosts []string
-		_ = json.Unmarshal(raw, &hosts)
-		return reflect.DeepEqual(hosts, b.Networking.AllowedHosts)
+		if json.Unmarshal(raw, &hosts) != nil {
+			return false
+		}
+		return slices.Equal(sortedStrings(hosts), sortedStrings(b.Networking.AllowedHosts))
 	}
 	return false
 }
 
 // CredentialDigest hashes public configuration and source versions, never protected values.
 func CredentialDigest(spec agentsv1alpha1.VaultCredentialSpec, sources []agentsv1alpha1.CredentialSourceVersion) string {
+	spec = *spec.DeepCopy()
 	spec.DeletionPolicy = ""
+	if env := spec.Auth.EnvironmentVariable; env != nil {
+		slices.Sort(env.Networking.AllowedHosts)
+	}
+	sources = slices.Clone(sources)
+	slices.SortFunc(sources, func(a, b agentsv1alpha1.CredentialSourceVersion) int { return strings.Compare(a.Name, b.Name) })
 	raw, _ := json.Marshal(struct {
 		Spec    agentsv1alpha1.VaultCredentialSpec       `json:"Spec"`
 		Sources []agentsv1alpha1.CredentialSourceVersion `json:"Sources"`

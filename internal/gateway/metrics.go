@@ -88,7 +88,7 @@ func newGatewayMetrics(store Storage) *gatewayMetrics {
 	return &gatewayMetrics{
 		store: store,
 		requests: prometheus.NewCounterVec(prometheus.CounterOpts{Name: "codex_gateway_http_requests_total",
-			Help: "Completed public gateway requests, including authentication and capacity rejections."}, []string{_metricsRouteLabel, _metricsMethodLabel, _metricsCodeLabel}),
+			Help: "Completed public gateway requests, including validation and capacity rejections."}, []string{_metricsRouteLabel, _metricsMethodLabel, _metricsCodeLabel}),
 		duration: prometheus.NewHistogramVec(prometheus.HistogramOpts{Name: "codex_gateway_http_request_duration_seconds",
 			Help: "Public HTTP request duration; established SSE connections are excluded.", Buckets: prometheus.DefBuckets}, []string{_metricsRouteLabel, _metricsMethodLabel}),
 		sseDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{Name: "codex_gateway_sse_connection_duration_seconds",

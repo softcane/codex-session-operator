@@ -17,6 +17,8 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	sandboxv1beta1 "sigs.k8s.io/agent-sandbox/api/v1beta1"
+	extensionsv1beta1 "sigs.k8s.io/agent-sandbox/extensions/api/v1beta1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
@@ -34,7 +36,9 @@ const (
 	_testFirstMessage     = "first message"
 	_testFirstMessageBody = `{"text":"first message"}`
 )
-const _token = "0123456789abcdefghijklmnopqrstuvwxyz"
+
+// A privacy canary for ignored Authorization headers, not a gateway credential.
+const _testAuthorizationValue = "0123456789abcdefghijklmnopqrstuvwxyz"
 
 type simulator struct {
 	mu            sync.Mutex
@@ -143,8 +147,14 @@ func testGateway(t *testing.T, store Storage, p *simulator, objects ...client.Ob
 	if err := agentsv1alpha1.AddToScheme(scheme); err != nil {
 		t.Fatal(err)
 	}
+	if err := sandboxv1beta1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := extensionsv1beta1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
 	k8s := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objects...).Build()
-	g, err := New(store, k8s, p, []Principal{{Token: _token, Subject: "writer", Namespace: _testNamespace}, {Token: _token + "-approver", Subject: _testApprover, Namespace: _testNamespace, Approver: true}}, nil)
+	g, err := New(store, k8s, p, "writer", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -164,9 +174,8 @@ func testGateway(t *testing.T, store Storage, p *simulator, objects ...client.Ob
 func testSession() *agentsv1alpha1.Session {
 	return &agentsv1alpha1.Session{ObjectMeta: metav1.ObjectMeta{Name: _testSessionName, Namespace: _testNamespace, UID: "uid-1"}, Status: agentsv1alpha1.SessionStatus{OpenAISessionID: _testRemoteID}}
 }
-func request(g *Gateway, method, path, token, key, body string) *httptest.ResponseRecorder {
+func request(g *Gateway, method, path, key, body string) *httptest.ResponseRecorder {
 	req := httptest.NewRequest(method, path, strings.NewReader(body))
-	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Idempotency-Key", key)
 	w := httptest.NewRecorder()
 	g.ServeHTTP(w, req)
@@ -197,7 +206,7 @@ func TestDurableRetryAfterLostAcceptanceAndRestart(t *testing.T) {
 		}
 	}
 	path := _testMessagePath
-	if got := request(g, http.MethodPost, path, _token, "message-1", `{"text":"same text"}`).Code; got != http.StatusAccepted {
+	if got := request(g, http.MethodPost, path, "message-1", `{"text":"same text"}`).Code; got != http.StatusAccepted {
 		t.Fatal(got)
 	}
 	if err := g.sync(context.Background(), "uid-1"); err == nil {
@@ -221,13 +230,13 @@ func TestDurableRetryAfterLostAcceptanceAndRestart(t *testing.T) {
 	if p.commits != 1 || p.posts != 2 || !record.Submissions[0].Accepted || record.Submissions[0].Attempts != 2 {
 		t.Fatalf("duplicate or missing acceptance: commits=%d posts=%d record=%+v", p.commits, p.posts, record.Submissions)
 	}
-	if got := request(next, http.MethodPost, path, _token, "message-1", `{"text":"different"}`).Code; got != http.StatusConflict {
+	if got := request(next, http.MethodPost, path, "message-1", `{"text":"different"}`).Code; got != http.StatusConflict {
 		t.Fatal(got)
 	}
-	if got := request(next, http.MethodPost, path, _token, "message-1", `{"text":"same text"}`).Code; got != http.StatusAccepted {
+	if got := request(next, http.MethodPost, path, "message-1", `{"text":"same text"}`).Code; got != http.StatusAccepted {
 		t.Fatal(got)
 	}
-	if got := request(next, http.MethodPost, path, _token, "message-2", `{"text":"same text"}`).Code; got != http.StatusAccepted {
+	if got := request(next, http.MethodPost, path, "message-2", `{"text":"same text"}`).Code; got != http.StatusAccepted {
 		t.Fatal(got)
 	}
 	if err := next.sync(context.Background(), "uid-1"); err != nil {
@@ -238,21 +247,39 @@ func TestDurableRetryAfterLostAcceptanceAndRestart(t *testing.T) {
 	}
 }
 
-func TestAuthenticationEveryEndpointAndTenant(t *testing.T) {
-	store := testStore(t)
-	g, _ := testGateway(t, store, simulatorForTest(), testSession())
-	for _, endpoint := range []string{"", "/messages", "/history", "/events", "/cancel", "/actions", "/actions/turn:call"} {
-		t.Run(endpoint, func(t *testing.T) {
-			if got := request(g, http.MethodGet, "/v1/namespaces/team/sessions/work"+endpoint, "invalid", "", "").Code; got != http.StatusUnauthorized {
-				t.Fatal(got)
-			}
-			if got := request(g, http.MethodGet, "/v1/namespaces/other/sessions/work"+endpoint, _token, "", "").Code; got != http.StatusNotFound {
-				t.Fatal(got)
-			}
-		})
+func TestGatewayDefaultServiceReplayIdentity(t *testing.T) {
+	store, provider := testStore(t), simulatorForTest()
+	_, reader := testGateway(t, store, provider)
+	g, err := New(store, reader, provider, "", nil)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if records, err := store.Records(t.Context()); err != nil || len(records) != 0 {
-		t.Fatal("unauthenticated request accessed store")
+	response := request(g, http.MethodGet, _identityTestPath, "", "")
+	var identity map[string]string
+	if response.Code != http.StatusOK || json.Unmarshal(response.Body.Bytes(), &identity) != nil ||
+		identity[_callerSubjectField] != "gateway" || identity["namespace"] != _testNamespace {
+		t.Fatalf("default service replay identity: %d %s", response.Code, response.Body.String())
+	}
+}
+
+func TestHTTPUsesURLNamespaceWithoutAuthentication(t *testing.T) {
+	g, _ := testGateway(t, testStore(t), simulatorForTest(), testSession())
+	for _, authorization := range []string{"", "Bearer ignored-header"} {
+		for _, tt := range []struct {
+			path   string
+			status int
+		}{
+			{path: _identityTestPath, status: http.StatusOK},
+			{path: "/v1/namespaces/other/sessions/work/history", status: http.StatusNotFound},
+		} {
+			req := httptest.NewRequest(http.MethodGet, tt.path, nil)
+			req.Header.Set("Authorization", authorization)
+			response := httptest.NewRecorder()
+			g.ServeHTTP(response, req)
+			if response.Code != tt.status {
+				t.Fatalf("URL namespace/header contract: got %d, want %d", response.Code, tt.status)
+			}
+		}
 	}
 }
 
@@ -262,13 +289,13 @@ func TestNoneInitialMessageNeverSentAgain(t *testing.T) {
 	session := testSession()
 	session.Status.OpenAISessionID = ""
 	session.Spec.EnvironmentRef = &agentsv1alpha1.AgentReference{Name: _testNone}
-	environment := &agentsv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{Name: _testNone, Namespace: _testNamespace}, Spec: agentsv1alpha1.EnvironmentSpec{Mode: _testNone}}
+	environment := &agentsv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{Name: _testNone, Namespace: _testNamespace}, Spec: agentsv1alpha1.EnvironmentSpec{Mode: agentsv1alpha1.EnvironmentModeNone}}
 	g, k8s := testGateway(t, store, p, session, environment)
 	path := _testMessagePath
-	if got := request(g, http.MethodPost, path, _token, "first", _testFirstMessageBody).Code; got != http.StatusAccepted {
+	if got := request(g, http.MethodPost, path, "first", _testFirstMessageBody).Code; got != http.StatusAccepted {
 		t.Fatal(got)
 	}
-	if got := request(g, http.MethodPost, path, _token, "second", `{"text":"follow up"}`).Code; got != http.StatusAccepted {
+	if got := request(g, http.MethodPost, path, "second", `{"text":"follow up"}`).Code; got != http.StatusAccepted {
 		t.Fatal(got)
 	}
 	text, key, err := g.InitialInput(context.Background(), "uid-1")
@@ -276,7 +303,7 @@ func TestNoneInitialMessageNeverSentAgain(t *testing.T) {
 		t.Fatal(text, key, err)
 	}
 	session.Status.OpenAISessionID = _testRemoteID
-	session.Status.EnvironmentSnapshot = &agentsv1alpha1.SessionEnvironmentSnapshot{Profile: agentsv1alpha1.EnvironmentSpec{Mode: _testNone}}
+	session.Status.EnvironmentSnapshot = &agentsv1alpha1.SessionEnvironmentSnapshot{Profile: agentsv1alpha1.EnvironmentSpec{Mode: agentsv1alpha1.EnvironmentModeNone}}
 	if err := k8s.Update(context.Background(), session); err != nil {
 		t.Fatal(err)
 	}
@@ -286,7 +313,7 @@ func TestNoneInitialMessageNeverSentAgain(t *testing.T) {
 	if p.commits != 1 || p.keys[wireKey("uid-1", "first")] != "" || p.keys[wireKey("uid-1", "second")] == "" {
 		t.Fatal("initial message was replayed")
 	}
-	if got := request(g, http.MethodPost, path, _token, "first", _testFirstMessageBody).Code; got != http.StatusAccepted {
+	if got := request(g, http.MethodPost, path, "first", _testFirstMessageBody).Code; got != http.StatusAccepted {
 		t.Fatal(got)
 	}
 }
@@ -297,7 +324,7 @@ func TestApprovalDurableCallAndResultRecovery(t *testing.T) {
 	p.history.Status = "requires_action"
 	p.history.Actions = []openaiapi.PendingAction{{Type: _functionCall, TurnID: _testTurnID, CallID: _testCallID, Name: "gateway_record_note", Arguments: json.RawMessage(`{"note":"reviewed write"}`)}}
 	g, _ := testGateway(t, store, p, testSession())
-	if got := request(g, http.MethodGet, "/v1/namespaces/team/sessions/work", _token, "", "").Code; got != 200 {
+	if got := request(g, http.MethodGet, "/v1/namespaces/team/sessions/work", "", "").Code; got != 200 {
 		t.Fatal(got)
 	}
 	if err := g.sync(context.Background(), "uid-1"); err != nil {
@@ -307,10 +334,7 @@ func TestApprovalDurableCallAndResultRecovery(t *testing.T) {
 		t.Fatal("write ran before approval")
 	}
 	path := "/v1/namespaces/team/sessions/work/actions/turn-1:call-1"
-	if got := request(g, http.MethodPost, path, _token, "", `{"decision":"approve"}`).Code; got != 403 {
-		t.Fatal(got)
-	}
-	if got := request(g, http.MethodPost, path, _token+"-approver", "", `{"decision":"approve"}`).Code; got != 202 {
+	if got := request(g, http.MethodPost, path, "", `{"decision":"approve"}`).Code; got != 202 {
 		t.Fatal(got)
 	}
 	p.lose = true
@@ -323,7 +347,7 @@ func TestApprovalDurableCallAndResultRecovery(t *testing.T) {
 		t.Fatal(err)
 	}
 	r := mustRecord(t, store)
-	if len(r.Notes) != 1 || len(r.Submissions) != 1 || p.commits != 1 || !r.Submissions[0].Accepted || r.Actions["turn-1:call-1"].DecidedBy != _testApprover {
+	if len(r.Notes) != 1 || len(r.Submissions) != 1 || p.commits != 1 || !r.Submissions[0].Accepted || r.Actions["turn-1:call-1"].DecidedBy != _testConversationSubject {
 		t.Fatal("approval/result lost or write duplicated")
 	}
 	// Reusing a call ID for changed arguments must not execute it again.
@@ -354,7 +378,7 @@ func TestExternalFunctionRecoveryUsesSameOperationID(t *testing.T) {
 		}
 		return outcomes[op.ID], nil
 	}}
-	_ = request(g, http.MethodGet, "/v1/namespaces/team/sessions/work", _token, "", "")
+	_ = request(g, http.MethodGet, "/v1/namespaces/team/sessions/work", "", "")
 	if err := g.sync(context.Background(), "uid-1"); err != nil {
 		t.Fatal(err)
 	}
@@ -376,7 +400,7 @@ func TestStreamLossRecoversSavedHistoryWithoutMessageReplay(t *testing.T) {
 	store := testStore(t)
 	p := simulatorForTest()
 	g, _ := testGateway(t, store, p, testSession())
-	_ = request(g, http.MethodPost, _testMessagePath, _token, "m1", `{"text":"work"}`)
+	_ = request(g, http.MethodPost, _testMessagePath, "m1", `{"text":"work"}`)
 	if err := g.sync(context.Background(), "uid-1"); err != nil {
 		t.Fatal(err)
 	}
@@ -408,14 +432,14 @@ func TestActiveSteeringAndTargetedCancellation(t *testing.T) {
 	p.history.Status = _testInProgress
 	p.history.Turns = []json.RawMessage{json.RawMessage(`{"id":"turn-1","status":"in_progress","subagent_id":null}`)}
 	g, _ := testGateway(t, store, p, testSession())
-	_ = request(g, http.MethodPost, _testMessagePath, _token, "steer", `{"text":"change direction"}`)
+	_ = request(g, http.MethodPost, _testMessagePath, "steer", `{"text":"change direction"}`)
 	if err := g.sync(context.Background(), "uid-1"); err != nil {
 		t.Fatal(err)
 	}
 	if !strings.Contains(p.keys[wireKey("uid-1", "steer")], "agent.session.input.message") {
 		t.Fatal("steering not sent to existing Session")
 	}
-	_ = request(g, http.MethodPost, "/v1/namespaces/team/sessions/work/cancel", _token, "cancel", `{"turn_id":"turn-1"}`)
+	_ = request(g, http.MethodPost, "/v1/namespaces/team/sessions/work/cancel", "cancel", `{"turn_id":"turn-1"}`)
 	p.lose = true
 	if err := g.sync(context.Background(), "uid-1"); err == nil {
 		t.Fatal("lost cancel hidden")
@@ -434,12 +458,12 @@ func TestCleanupStopsInputStreamAndUIDReuse(t *testing.T) {
 	p := simulatorForTest()
 	session := testSession()
 	g, k8s := testGateway(t, store, p, session)
-	_ = request(g, http.MethodPost, _testMessagePath, _token, "queued", `{"text":"must not run after closure"}`)
+	_ = request(g, http.MethodPost, _testMessagePath, "queued", `{"text":"must not run after closure"}`)
 	p.history.Status = "requires_action"
 	if err := g.Quiesce(context.Background(), "uid-1", _testRemoteID); err != nil {
 		t.Fatal(err)
 	}
-	if got := request(g, http.MethodPost, _testMessagePath, _token, "later", `{"text":"blocked"}`).Code; got != http.StatusGone {
+	if got := request(g, http.MethodPost, _testMessagePath, "later", `{"text":"blocked"}`).Code; got != http.StatusGone {
 		t.Fatal(got)
 	}
 	if err := g.sync(context.Background(), "uid-1"); err != nil {
@@ -457,7 +481,7 @@ func TestCleanupStopsInputStreamAndUIDReuse(t *testing.T) {
 	if err := k8s.Create(context.Background(), replacement); err != nil {
 		t.Fatal(err)
 	}
-	if got := request(g, http.MethodGet, "/v1/namespaces/team/sessions/work", _token, "", "").Code; got != http.StatusOK {
+	if got := request(g, http.MethodGet, "/v1/namespaces/team/sessions/work", "", "").Code; got != http.StatusOK {
 		t.Fatal(got)
 	}
 	old := mustRecord(t, store)
@@ -469,7 +493,7 @@ func TestCleanupStopsInputStreamAndUIDReuse(t *testing.T) {
 func TestSSELiveEventsAndExpiredCursorSnapshot(t *testing.T) {
 	store := testStore(t)
 	g, _ := testGateway(t, store, simulatorForTest(), testSession())
-	_ = request(g, http.MethodGet, "/v1/namespaces/team/sessions/work", _token, "", "")
+	_ = request(g, http.MethodGet, "/v1/namespaces/team/sessions/work", "", "")
 	if err := store.Update(t.Context(), "uid-1", func(r *Record) error {
 		for range _maxEvents + 2 {
 			appendEvent(r, json.RawMessage(`{"session_id":"sess-1","type":"agent.session.turn.output_text.delta","delta":"live"}`))
@@ -484,7 +508,6 @@ func TestSSELiveEventsAndExpiredCursorSnapshot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	req.Header.Set("Authorization", "Bearer "+_token)
 	req.Header.Set("Last-Event-ID", "1")
 	httpClient := &http.Client{Timeout: 3 * time.Second}
 	response, err := httpClient.Do(req)
@@ -519,16 +542,16 @@ func TestSSELiveEventsAndExpiredCursorSnapshot(t *testing.T) {
 	}
 }
 
-func TestServerShutdownAndTLSBoundary(t *testing.T) {
+func TestServerShutdownAndOptionalTLS(t *testing.T) {
 	store := testStore(t)
 	g, _ := testGateway(t, store, simulatorForTest(), testSession())
-	if err := (&Server{Gateway: g, Address: "0.0.0.0:0"}).Start(context.Background()); err == nil {
-		t.Fatal("exposed HTTP listener accepted")
+	if err := (&Server{Gateway: g, Address: "0.0.0.0:0", CertFile: "missing-key.crt"}).Start(context.Background()); err == nil {
+		t.Fatal("incomplete TLS configuration accepted")
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	done := make(chan error, 1)
-	go func() { done <- (&Server{Gateway: g, Address: "127.0.0.1:0"}).Start(ctx) }()
+	go func() { done <- (&Server{Gateway: g, Address: "0.0.0.0:0"}).Start(ctx) }()
 	select {
 	case err := <-done:
 		if err != nil {
@@ -571,7 +594,7 @@ func TestComputerApprovalVariantsAndDeniedFunction(t *testing.T) {
 	p := simulatorForTest()
 	p.history.Actions = []openaiapi.PendingAction{{Type: _functionCall, TurnID: _testTurnID, CallID: _testCallID, Name: "gateway_record_note", Arguments: json.RawMessage(`{"note":"denied"}`)}}
 	g, _ := testGateway(t, store, p, testSession())
-	_ = request(g, http.MethodGet, "/v1/namespaces/team/sessions/work", _token, "", "")
+	_ = request(g, http.MethodGet, "/v1/namespaces/team/sessions/work", "", "")
 	if err := g.sync(context.Background(), "uid-1"); err != nil {
 		t.Fatal(err)
 	}
@@ -591,7 +614,7 @@ func TestPendingCallIgnoresJSONFormattingAndKeyOrder(t *testing.T) {
 	p := simulatorForTest()
 	p.history.Actions = []openaiapi.PendingAction{{Type: _functionCall, TurnID: _testTurnID, CallID: _testCallID, Name: _echoFunction, Arguments: json.RawMessage(`{ "a": 1, "b": 2 }`)}}
 	g, _ := testGateway(t, store, p, testSession())
-	_ = request(g, http.MethodGet, "/v1/namespaces/team/sessions/work", _token, "", "")
+	_ = request(g, http.MethodGet, "/v1/namespaces/team/sessions/work", "", "")
 	if err := g.sync(context.Background(), "uid-1"); err != nil {
 		t.Fatal(err)
 	}
@@ -634,9 +657,9 @@ func TestForeignRemoteOwnershipCannotStreamOrAcknowledgeInput(t *testing.T) {
 	p := simulatorForTest()
 	p.history.Metadata["kubernetes_uid"] = "foreign-uid"
 	session := testSession()
-	session.Status.EnvironmentSnapshot = &agentsv1alpha1.SessionEnvironmentSnapshot{Profile: agentsv1alpha1.EnvironmentSpec{Mode: _noneMode}}
+	session.Status.EnvironmentSnapshot = &agentsv1alpha1.SessionEnvironmentSnapshot{Profile: agentsv1alpha1.EnvironmentSpec{Mode: agentsv1alpha1.EnvironmentModeNone}}
 	g, _ := testGateway(t, store, p, session)
-	_ = request(g, http.MethodPost, _testMessagePath, _token, "message", `{"text":"protected input"}`)
+	_ = request(g, http.MethodPost, _testMessagePath, "message", `{"text":"protected input"}`)
 	if err := g.sync(context.Background(), "uid-1"); err == nil {
 		t.Fatal("foreign Session accepted")
 	}

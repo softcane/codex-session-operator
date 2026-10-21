@@ -35,22 +35,18 @@ func closedForPurge(record Record) bool {
 	return record.Closed || record.Work != nil && record.Work.State == _workClosed
 }
 
-func (g *Gateway) handleAdminRecords(w http.ResponseWriter, r *http.Request, parts []string, principal Principal) {
-	if !principal.Admin {
-		http.Error(w, "Admin role required", http.StatusForbidden)
-		return
-	}
+func (g *Gateway) handleAdminRecords(w http.ResponseWriter, r *http.Request, parts []string, scope requestScope) {
 	if len(parts) == 4 {
 		if r.Method != http.MethodGet {
 			methodError(w)
 			return
 		}
-		records, err := g.recordSummaries(r.Context(), principal.Namespace, "")
+		records, err := g.recordSummaries(r.Context(), scope.Namespace, "")
 		if err != nil {
 			writeError(w, err)
 			return
 		}
-		summaries := summarizeClosedRecords(records, principal.Namespace)
+		summaries := summarizeClosedRecords(records, scope.Namespace)
 		writeJSON(w, http.StatusOK, map[string]any{_recordsSegment: summaries})
 		return
 	}
@@ -66,8 +62,8 @@ func (g *Gateway) handleAdminRecords(w http.ResponseWriter, r *http.Request, par
 	gate := g.gate(uid)
 	gate.Lock()
 	defer gate.Unlock()
-	record, err := g.store.GetInNamespace(r.Context(), principal.Namespace, uid)
-	if errors.Is(err, os.ErrNotExist) || err == nil && record.Namespace != principal.Namespace {
+	record, err := g.store.GetInNamespace(r.Context(), scope.Namespace, uid)
+	if errors.Is(err, os.ErrNotExist) || err == nil && record.Namespace != scope.Namespace {
 		http.NotFound(w, r)
 		return
 	}

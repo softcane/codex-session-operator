@@ -5,6 +5,7 @@ apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 resources:
 - ../gateway
+- ../sandbox-policy
 
 # Keep the Kubebuilder CRD conversion scaffold anchors in the conventional
 # public overlay as well as the controller-only base.

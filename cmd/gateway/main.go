@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"crypto/tls"
-	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -28,6 +27,8 @@ import (
 	agentsv1alpha1 "github.com/softcane/codex-session-operator/api/v1alpha1"
 	"github.com/softcane/codex-session-operator/internal/gateway"
 	"github.com/softcane/codex-session-operator/internal/openaiapi"
+	sandboxv1beta1 "sigs.k8s.io/agent-sandbox/api/v1beta1"
+	extensionsv1beta1 "sigs.k8s.io/agent-sandbox/extensions/api/v1beta1"
 )
 
 func main() {
@@ -39,19 +40,25 @@ func main() {
 
 func run() (returnErr error) {
 	var (
-		address, internalAddress, authFile, internalTokenFile, certFile, keyFile string
-		databaseFile, metricsAddress                                             string
-		maxActive, maxRecords                                                    int
-		insecureLocal                                                            bool
+		address, internalAddress, subject, certFile, keyFile          string
+		databaseFile, metricsAddress, metricsCertFile, metricsKeyFile string
+		maxActive, maxRecords                                         int
+		insecureLocal                                                 bool
 	)
-	flag.StringVar(&address, "gateway-address", os.Getenv("GATEWAY_ADDRESS"), "Public HTTPS listener")
+	flag.StringVar(&address, "gateway-address", os.Getenv("GATEWAY_ADDRESS"),
+		"Public HTTP listener; optional TLS with gateway-cert and gateway-key")
 	flag.StringVar(&internalAddress, "gateway-internal-address", os.Getenv("GATEWAY_INTERNAL_ADDRESS"),
-		"Controller RPC HTTPS listener")
-	flag.StringVar(&authFile, "gateway-auth-file", os.Getenv("GATEWAY_AUTH_FILE"), "Secret-mounted caller principals")
-	flag.StringVar(&internalTokenFile, "gateway-internal-token-file", os.Getenv("GATEWAY_INTERNAL_TOKEN_FILE"),
-		"Secret-mounted controller token")
+		"Controller RPC HTTP listener; optional TLS with gateway-cert and gateway-key")
+	defaultSubject := os.Getenv("GATEWAY_SUBJECT")
+	if defaultSubject == "" {
+		defaultSubject = "gateway"
+	}
+	flag.StringVar(&subject, "gateway-subject", defaultSubject,
+		"Stable service identity for durable replay; not authentication")
 	flag.StringVar(&certFile, "gateway-cert", os.Getenv("GATEWAY_CERT"), "TLS certificate")
 	flag.StringVar(&keyFile, "gateway-key", os.Getenv("GATEWAY_KEY"), "TLS private key")
+	flag.StringVar(&metricsCertFile, "gateway-metrics-cert", os.Getenv("GATEWAY_METRICS_CERT"), "Metrics TLS certificate")
+	flag.StringVar(&metricsKeyFile, "gateway-metrics-key", os.Getenv("GATEWAY_METRICS_KEY"), "Metrics TLS private key")
 	flag.StringVar(&databaseFile, "gateway-database-file", os.Getenv("GATEWAY_DATABASE_FILE"),
 		"Required Secret-mounted PostgreSQL DSN")
 	flag.IntVar(&maxActive, "gateway-max-active", 32, "Database active execution quota")
@@ -67,8 +74,11 @@ func run() (returnErr error) {
 	logOptions.BindFlags(flag.CommandLine)
 	flag.Parse()
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&logOptions)))
-	if address == "" || internalAddress == "" || certFile == "" || keyFile == "" {
-		return errors.New("gateway listener and TLS configuration required")
+	if address == "" || internalAddress == "" {
+		return errors.New("gateway listener configuration required")
+	}
+	if (certFile == "") != (keyFile == "") {
+		return errors.New("gateway TLS requires both certificate and key")
 	}
 	if databaseFile == "" {
 		return errors.New("gateway database configuration required")
@@ -84,18 +94,11 @@ func run() (returnErr error) {
 		return fmt.Errorf("open gateway store: %w", err)
 	}
 	defer func() { returnErr = errors.Join(returnErr, store.Close()) }()
-	principalJSON, principalErr := os.ReadFile(authFile)
-	internalToken, tokenErr := os.ReadFile(internalTokenFile)
-	if principalErr != nil || tokenErr != nil {
-		return fmt.Errorf("read gateway authentication configuration: %w", errors.Join(principalErr, tokenErr))
-	}
-	var principals []gateway.Principal
-	if err := json.Unmarshal(principalJSON, &principals); err != nil {
-		return fmt.Errorf("parse gateway authentication configuration: %w", err)
-	}
 	scheme := runtime.NewScheme()
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
 	utilruntime.Must(agentsv1alpha1.AddToScheme(scheme))
+	utilruntime.Must(sandboxv1beta1.AddToScheme(scheme))
+	utilruntime.Must(extensionsv1beta1.AddToScheme(scheme))
 	config, err := ctrl.GetConfig()
 	if err != nil {
 		return fmt.Errorf("load Kubernetes configuration: %w", err)
@@ -108,7 +111,7 @@ func run() (returnErr error) {
 	if err != nil {
 		return fmt.Errorf("configure OpenAI client: %w", err)
 	}
-	g, err := gateway.New(store, k8s, provider, principals, nil)
+	g, err := gateway.New(store, k8s, provider, subject, nil)
 	if err != nil {
 		return fmt.Errorf("configure gateway: %w", err)
 	}
@@ -121,13 +124,13 @@ func run() (returnErr error) {
 	if err := g.EnableProfiles(k8s); err != nil {
 		return fmt.Errorf("configure Kubernetes Profiles: %w", err)
 	}
-	internalHandler, err := g.InternalHandler(strings.TrimSpace(string(internalToken)))
-	if err != nil {
-		return fmt.Errorf("configure internal gateway listener: %w", err)
-	}
+	internalHandler := g.InternalHandler()
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	metricServer, err := secureMetricsServer(metricsAddress, certFile, keyFile, config)
+	if metricsCertFile == "" && metricsKeyFile == "" {
+		metricsCertFile, metricsKeyFile = certFile, keyFile
+	}
+	metricServer, err := secureMetricsServer(metricsAddress, metricsCertFile, metricsKeyFile, config)
 	if err != nil {
 		return fmt.Errorf("configure secure gateway metrics: %w", err)
 	}
@@ -167,6 +170,9 @@ func serveListeners(ctx context.Context, stop context.CancelFunc, listeners []li
 func secureMetricsServer(address, certFile, keyFile string, config *rest.Config) (metricsserver.Server, error) {
 	if address == "0" {
 		return nil, nil
+	}
+	if certFile == "" || keyFile == "" {
+		return nil, errors.New("metrics TLS certificate and key required")
 	}
 	if filepath.Dir(certFile) != filepath.Dir(keyFile) {
 		return nil, errors.New("metrics certificate and key must share a mounted directory")

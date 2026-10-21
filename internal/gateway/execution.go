@@ -3,6 +3,7 @@ package gateway
 import (
 	"context"
 	"encoding/json"
+	"reflect"
 	"slices"
 
 	agentsv1alpha1 "github.com/softcane/codex-session-operator/api/v1alpha1"
@@ -11,6 +12,8 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	sandboxv1beta1 "sigs.k8s.io/agent-sandbox/api/v1beta1"
+	extensionsv1beta1 "sigs.k8s.io/agent-sandbox/extensions/api/v1beta1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
@@ -21,6 +24,7 @@ type executionConnectionProvider interface {
 var _ executionConnectionProvider = (*openaiapi.Client)(nil)
 
 const (
+	_executorConfigurationMismatch  = "ExecutorConfigurationMismatch"
 	_deliveryRuntimeOnly            = "runtime_only"
 	_deliveryLocalWorker            = "local_worker"
 	_deliveryLocalWorkerHeld        = "local_worker_held"
@@ -68,32 +72,28 @@ func (g *Gateway) preparedComputeReady(ctx context.Context, session *agentsv1alp
 	if !currentConditionTrue(session, "EnvironmentConnected") {
 		return false, "EnvironmentConnecting"
 	}
-	if session.Status.PodName != sandbox.PodName(session) || !session.DeletionTimestamp.IsZero() {
+	if session.Status.PodName == "" || session.Status.SandboxClaimName == "" ||
+		session.Status.SandboxName == "" || !session.DeletionTimestamp.IsZero() {
 		return false, "ExecutorIdentityMismatch"
 	}
+	var claim extensionsv1beta1.SandboxClaim
+	var runtime sandboxv1beta1.Sandbox
 	var pod corev1.Pod
-	if err := g.reader.Get(ctx, client.ObjectKey{Namespace: session.Namespace, Name: session.Status.PodName}, &pod); err != nil {
+	if g.reader.Get(ctx, client.ObjectKey{Namespace: session.Namespace, Name: session.Status.SandboxClaimName}, &claim) != nil ||
+		g.reader.Get(ctx, client.ObjectKey{Namespace: session.Namespace, Name: session.Status.SandboxName}, &runtime) != nil ||
+		g.reader.Get(ctx, client.ObjectKey{Namespace: session.Namespace, Name: session.Status.PodName}, &pod) != nil {
 		return false, "ExecutorObservationUnavailable"
 	}
-	if !metav1.IsControlledBy(&pod, session) || string(pod.UID) != proof.PodUID ||
-		!pod.DeletionTimestamp.IsZero() {
+	if !sandbox.OwnsExecutor(session, &claim, &runtime, &pod) ||
+		proof.SandboxClaimUID != session.Status.SandboxClaimUID || proof.SandboxUID != session.Status.SandboxUID ||
+		string(pod.UID) != proof.PodUID || string(pod.UID) != session.Status.ExecutorPodUID || !pod.DeletionTimestamp.IsZero() {
 		return false, "ExecutorIdentityMismatch"
 	}
-	if pod.Annotations[sandbox.ConfigAnnotation] != proof.ConfigDigest ||
-		proof.ClaimUID != session.Status.WorkspaceClaimUID {
+	if !g.executorConfigurationMatches(ctx, session, &claim, &runtime, &pod) {
+		return false, _executorConfigurationMismatch
+	}
+	if !g.preparedWorkspaceMatches(ctx, session, &runtime, &pod) {
 		return false, "WorkspaceIdentityMismatch"
-	}
-	profile := snapshot.Profile.SelfHosted
-	if profile == nil {
-		return false, "ExecutorConfigurationMismatch"
-	}
-	if profile.Repository != nil && (proof.RepositoryDigest != sandbox.RepositoryDigest(profile.Repository) ||
-		proof.InitialCommit != profile.Repository.Commit) {
-		return false, "WorkspaceIdentityMismatch"
-	}
-	desired, err := sandbox.Pod(session, profile.WorkspaceDirectory, proof.ConfigDigest)
-	if err != nil || !sandbox.ExecutorMatches(&pod, desired) {
-		return false, "ExecutorConfigurationMismatch"
 	}
 	if pod.Status.Phase != corev1.PodRunning || !sandbox.InitContainersPrepared(&pod) ||
 		!slices.ContainsFunc(pod.Status.Conditions, func(c corev1.PodCondition) bool {
@@ -107,10 +107,54 @@ func (g *Gateway) preparedComputeReady(ctx context.Context, session *agentsv1alp
 	return true, ""
 }
 
+func (g *Gateway) executorConfigurationMatches(ctx context.Context, session *agentsv1alpha1.Session,
+	claim *extensionsv1beta1.SandboxClaim, runtime *sandboxv1beta1.Sandbox, pod *corev1.Pod) bool {
+	if session.Status.ExecutorConfigDigest == "" || claim.Annotations[sandbox.ConfigAnnotation] != session.Status.ExecutorConfigDigest ||
+		claim.Spec.AdditionalPodMetadata.Annotations[sandbox.ConfigAnnotation] != session.Status.ExecutorConfigDigest ||
+		runtime.Spec.PodTemplate.ObjectMeta.Annotations[sandbox.ConfigAnnotation] != session.Status.ExecutorConfigDigest ||
+		pod.Annotations[sandbox.ConfigAnnotation] != session.Status.ExecutorConfigDigest {
+		return false
+	}
+	profile := session.Status.EnvironmentSnapshot.Profile.SelfHosted
+	if profile == nil {
+		return false
+	}
+	resolved, err := sandbox.ResolvePool(ctx, g.reader, session.Namespace, profile)
+	if err != nil || !reflect.DeepEqual(resolved, session.Status.EnvironmentSnapshot.SandboxPool) {
+		return false
+	}
+	var template extensionsv1beta1.SandboxTemplate
+	if g.reader.Get(ctx, client.ObjectKey{Namespace: session.Namespace, Name: resolved.TemplateName}, &template) != nil ||
+		!sandbox.RuntimeMatches(session, claim, runtime, &template) || session.Status.WorkspacePreparation.ConfigDigest != sandbox.ConfigDigest(runtime) {
+		return false
+	}
+	desired, err := sandbox.ExpectedPod(runtime)
+	if err != nil || !sandbox.ExecutorMatches(pod, desired) {
+		return false
+	}
+	return true
+}
+
+func (g *Gateway) preparedWorkspaceMatches(ctx context.Context, session *agentsv1alpha1.Session,
+	runtime *sandboxv1beta1.Sandbox, pod *corev1.Pod) bool {
+	workspaceName, err := sandbox.WorkspaceMount(pod, session.Status.EnvironmentSnapshot.Profile.SelfHosted)
+	if err != nil || workspaceName != sandbox.WorkspaceClaimName(runtime) ||
+		session.Status.WorkspacePreparation.ClaimUID == "" || session.Status.WorkspacePreparation.ClaimUID != session.Status.WorkspaceClaimUID {
+		return false
+	}
+	var workspace corev1.PersistentVolumeClaim
+	if g.reader.Get(ctx, client.ObjectKey{Namespace: session.Namespace, Name: workspaceName}, &workspace) != nil ||
+		string(workspace.UID) != session.Status.WorkspacePreparation.ClaimUID || !workspace.DeletionTimestamp.IsZero() ||
+		!metav1.IsControlledBy(&workspace, runtime) {
+		return false
+	}
+	return true
+}
+
 func preparedInstanceMatches(proof *agentsv1alpha1.SessionWorkspacePreparationStatus, pod *corev1.Pod) bool {
 	instance, ok := sandbox.ExecutorInstance(pod)
 	return ok && proof.ContainerID == instance.ContainerID && proof.RestartCount == instance.RestartCount &&
-		proof.StartedAt.Equal(&instance.State.Running.StartedAt)
+		proof.StartTime.Equal(&instance.State.Running.StartedAt)
 }
 
 func (g *Gateway) finalSendAllowed(session *agentsv1alpha1.Session, submission Submission) bool {

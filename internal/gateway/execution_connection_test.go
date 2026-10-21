@@ -41,9 +41,9 @@ func TestSelfHostedLiveConnectionReadAndStreamLossRecovery(t *testing.T) {
 	store := testStore(t)
 	provider := &executionConnectionFixture{simulator: simulatorForTest(),
 		state: openaiapi.HistoryEnvironment{ID: session.Status.EnvironmentID, Type: _selfHostedProviderType, Status: _connectedStatus}}
-	g, _ := testGateway(t, store, provider.simulator, session, pod)
+	g, _ := testGateway(t, store, provider.simulator, executionObjects(t, session, pod)...)
 	g.provider = provider
-	if response := request(g, http.MethodPost, _testMessagePath, _token, "live-first", `{"text":"First"}`); response.Code != http.StatusAccepted {
+	if response := request(g, http.MethodPost, _testMessagePath, "live-first", `{"text":"First"}`); response.Code != http.StatusAccepted {
 		t.Fatal(response.Code)
 	}
 	// No connected event is replayed. A current runtime GET plus the active new
@@ -53,7 +53,7 @@ func TestSelfHostedLiveConnectionReadAndStreamLossRecovery(t *testing.T) {
 	}
 	g.stopWatch(_testUID)
 	provider.unavailable = true
-	if response := request(g, http.MethodPost, _testMessagePath, _token, "live-second", `{"text":"Second"}`); response.Code != http.StatusAccepted {
+	if response := request(g, http.MethodPost, _testMessagePath, "live-second", `{"text":"Second"}`); response.Code != http.StatusAccepted {
 		t.Fatal(response.Code)
 	}
 	if err := g.sync(t.Context(), _testUID); err != nil || provider.posts != 1 {
@@ -80,9 +80,9 @@ func TestSelfHostedLiveConnectionRejectsMissingForeignAndNegativeState(t *testin
 			session, pod := executionSessionAndPod(t)
 			store := testStore(t)
 			provider := &executionConnectionFixture{simulator: simulatorForTest(), state: tt.state}
-			g, _ := testGateway(t, store, provider.simulator, session, pod)
+			g, _ := testGateway(t, store, provider.simulator, executionObjects(t, session, pod)...)
 			g.provider = provider
-			if response := request(g, http.MethodPost, _testMessagePath, _token, "live-held", `{"text":"Held"}`); response.Code != http.StatusAccepted {
+			if response := request(g, http.MethodPost, _testMessagePath, "live-held", `{"text":"Held"}`); response.Code != http.StatusAccepted {
 				t.Fatal(response.Code)
 			}
 			if err := g.sync(t.Context(), _testUID); err != nil || provider.posts != 0 || mustRecord(t, store).Submissions[0].Attempts != 0 {
@@ -97,9 +97,9 @@ func TestSelfHostedLiveNegativeEventWinsOverInFlightRead(t *testing.T) {
 	store := testStore(t)
 	provider := &executionConnectionFixture{simulator: simulatorForTest(),
 		state: openaiapi.HistoryEnvironment{ID: session.Status.EnvironmentID, Type: _selfHostedProviderType, Status: _connectedStatus}}
-	g, _ := testGateway(t, store, provider.simulator, session, pod)
+	g, _ := testGateway(t, store, provider.simulator, executionObjects(t, session, pod)...)
 	g.provider = provider
-	if response := request(g, http.MethodPost, _testMessagePath, _token, "inflight-live", `{"text":"Held during disconnect"}`); response.Code != http.StatusAccepted {
+	if response := request(g, http.MethodPost, _testMessagePath, "inflight-live", `{"text":"Held during disconnect"}`); response.Code != http.StatusAccepted {
 		t.Fatal(response.Code)
 	}
 	provider.onRead = func() {
@@ -130,9 +130,9 @@ func TestSelfHostedFreshRuntimeReadRecoversReorderedPendingSnapshot(t *testing.T
 	store := testStore(t)
 	provider := &executionConnectionFixture{simulator: simulatorForTest(),
 		state: openaiapi.HistoryEnvironment{ID: session.Status.EnvironmentID, Type: _selfHostedProviderType, Status: _connectedStatus}}
-	g, _ := testGateway(t, store, provider.simulator, session, pod)
+	g, _ := testGateway(t, store, provider.simulator, executionObjects(t, session, pod)...)
 	g.provider = provider
-	if response := request(g, http.MethodPost, _testMessagePath, _token, "ordered-first", `{"text":"First"}`); response.Code != http.StatusAccepted {
+	if response := request(g, http.MethodPost, _testMessagePath, "ordered-first", `{"text":"First"}`); response.Code != http.StatusAccepted {
 		t.Fatal(response.Code)
 	}
 	if err := g.sync(t.Context(), _testUID); err != nil || provider.posts != 1 {
@@ -146,7 +146,7 @@ func TestSelfHostedFreshRuntimeReadRecoversReorderedPendingSnapshot(t *testing.T
 	if g.executionWatchAvailable(session) {
 		t.Fatal("late negative snapshot did not immediately revoke eligibility")
 	}
-	if response := request(g, http.MethodPost, _testMessagePath, _token, "ordered-second", `{"text":"Second"}`); response.Code != http.StatusAccepted {
+	if response := request(g, http.MethodPost, _testMessagePath, "ordered-second", `{"text":"Second"}`); response.Code != http.StatusAccepted {
 		t.Fatal(response.Code)
 	}
 	// The runtime has already connected. No additional connected SSE event is
@@ -162,7 +162,7 @@ func TestSelfHostedConnectionLossBeforeApprovedWritePreventsExecution(t *testing
 	provider := &executionConnectionFixture{simulator: simulatorForTest(),
 		state: openaiapi.HistoryEnvironment{ID: session.Status.EnvironmentID, Type: _selfHostedProviderType, Status: _connectedStatus}}
 	provider.history.Actions = []openaiapi.PendingAction{scenarioPendingAction()}
-	g, _ := testGateway(t, store, provider.simulator, session, pod)
+	g, _ := testGateway(t, store, provider.simulator, executionObjects(t, session, pod)...)
 	g.provider = provider
 	if _, _, err := g.lookup(t.Context(), _testNamespace, _testSessionName); err != nil {
 		t.Fatal(err)
@@ -220,8 +220,8 @@ func TestSelfHostedStreamLossAfterDeliveryClaimPreventsProviderPost(t *testing.T
 	session, pod := executionSessionAndPod(t)
 	store := &executionClaimFaultStore{memoryStore: testStore(t)}
 	provider := simulatorForTest()
-	g, _ := testGateway(t, store, provider, session, pod)
-	if response := request(g, http.MethodPost, _testMessagePath, _token, "claim-loss", `{"text":"Preserve the keyed input"}`); response.Code != http.StatusAccepted {
+	g, _ := testGateway(t, store, provider, executionObjects(t, session, pod)...)
+	if response := request(g, http.MethodPost, _testMessagePath, "claim-loss", `{"text":"Preserve the keyed input"}`); response.Code != http.StatusAccepted {
 		t.Fatal(response.Code)
 	}
 	store.afterClaim = func() { g.stopWatch(_testUID) }
@@ -245,7 +245,7 @@ func TestSelfHostedStreamLossAfterFunctionClaimPreventsExternalSideEffect(t *tes
 	pending := scenarioPendingAction()
 	pending.Name = "external-write"
 	provider.history.Actions = []openaiapi.PendingAction{pending}
-	g, _ := testGateway(t, store, provider, session, pod)
+	g, _ := testGateway(t, store, provider, executionObjects(t, session, pod)...)
 	calls := 0
 	g.functions[pending.Name] = Function{Consequential: true, DownstreamDeduplicates: true,
 		Execute: func(context.Context, Operation) (string, error) { calls++; return "Written", nil }}

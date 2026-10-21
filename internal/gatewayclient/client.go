@@ -22,13 +22,12 @@ const _maxResponseBytes = 8 << 20
 type client struct {
 	origin    string
 	namespace string
-	token     string
 	http      *http.Client
 }
 
 type clientConfig struct {
-	origin, namespace, tokenFile, caFile string
-	requestTimeout                       time.Duration
+	origin, namespace, caFile string
+	requestTimeout            time.Duration
 }
 
 type apiError struct {
@@ -41,7 +40,7 @@ func (e *apiError) Error() string {
 	case http.StatusBadRequest:
 		reason = "invalid request"
 	case http.StatusUnauthorized, http.StatusForbidden:
-		reason = "authentication or namespace authorization failed"
+		reason = "deployment access control rejected the request"
 	case http.StatusNotFound:
 		reason = "conversation, profile or namespace unavailable"
 	case http.StatusConflict:
@@ -57,27 +56,19 @@ func (e *apiError) Error() string {
 func newClient(config clientConfig) (*client, error) {
 	u, err := url.Parse(config.origin)
 	if err != nil || u == nil {
-		return nil, errors.New("origin must be an explicit HTTPS origin")
+		return nil, errors.New("origin must be an explicit HTTP or HTTPS origin")
 	}
-	invalidAuthority := u.Scheme != "https" || u.Hostname() == "" || u.User != nil
+	invalidAuthority := (u.Scheme != "http" && u.Scheme != "https") || u.Hostname() == "" || u.User != nil
 	invalidSuffix := strings.ContainsAny(config.origin, "?#") || u.RawPath != "" || u.Opaque != "" ||
 		(u.Path != "" && u.Path != "/")
 	if invalidAuthority || invalidSuffix || strings.TrimSpace(config.origin) != config.origin {
-		return nil, errors.New("origin must be an explicit HTTPS origin without credentials, path, query or fragment")
+		return nil, errors.New("origin must be an explicit HTTP or HTTPS origin without credentials, path, query or fragment")
 	}
 	if !validNamespace(config.namespace) {
 		return nil, errors.New("namespace must be an explicit Kubernetes namespace")
 	}
 	if config.requestTimeout <= 0 || config.requestTimeout > 5*time.Minute {
 		return nil, errors.New("request timeout must be positive and at most 5m")
-	}
-	tokenBytes, err := readPrivateFile(config.tokenFile, 1024)
-	if err != nil {
-		return nil, errors.New("read restricted regular token file")
-	}
-	token := strings.TrimSpace(string(tokenBytes))
-	if token == "" || len(token)+len("Bearer ") > 1024 || strings.ContainsAny(token, "\r\n\t ") {
-		return nil, errors.New("invalid token file")
 	}
 	pool, err := x509.SystemCertPool()
 	if err != nil {
@@ -92,7 +83,7 @@ func newClient(config clientConfig) (*client, error) {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.TLSClientConfig = &tls.Config{MinVersion: tls.VersionTLS12, RootCAs: pool}
 	return &client{
-		origin: strings.TrimSuffix(config.origin, "/"), namespace: config.namespace, token: token,
+		origin: strings.TrimSuffix(config.origin, "/"), namespace: config.namespace,
 		http: &http.Client{Transport: transport, Timeout: config.requestTimeout,
 			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }},
 	}, nil
@@ -112,7 +103,6 @@ func (c *client) request(ctx context.Context, method, path, key string, body []b
 	if err != nil {
 		return errors.New("construct gateway request")
 	}
-	r.Header.Set("Authorization", "Bearer "+c.token)
 	r.Header.Set("Accept", "application/json")
 	if method == http.MethodPost {
 		// Retry only through the persisted operation, rather than the transport's
@@ -161,7 +151,7 @@ func (c *client) subject(ctx context.Context) (string, error) {
 		return "", err
 	}
 	if strings.TrimSpace(identity.Subject) == "" || identity.Namespace != c.namespace {
-		return "", errors.New("gateway did not provide authenticated subject and namespace")
+		return "", errors.New("gateway did not provide service replay subject and namespace")
 	}
 	return identity.Subject, nil
 }

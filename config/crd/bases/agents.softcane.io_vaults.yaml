@@ -43,6 +43,8 @@ spec:
                 description: ClearName requests an explicit null name on update.
                 type: boolean
               deletionPolicy:
+                description: DeletionPolicy selects deletion or administrative retention
+                  of owned resources.
                 enum:
                 - Delete
                 - Retain
@@ -124,6 +126,7 @@ spec:
                   - status
                   - type
                   type: object
+                maxItems: 16
                 type: array
                 x-kubernetes-list-map-keys:
                 - type
@@ -135,6 +138,8 @@ spec:
                   ManagedMetadataKeys remembers old and new user keys while a whole-map
                   update is pending, without claiming unrelated remote metadata.
                 items:
+                  maxLength: 256
+                  minLength: 1
                   type: string
                 maxItems: 26
                 type: array

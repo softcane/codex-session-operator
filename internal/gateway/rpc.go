@@ -3,8 +3,6 @@ package gateway
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
-	"crypto/subtle"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
@@ -38,13 +36,9 @@ type initialResponse struct {
 	Key  string `json:"key"`
 }
 
-// InternalHandler exposes only the four lifecycle operations the controller
-// needs. The token is independent of caller tokens and is never logged.
-func (g *Gateway) InternalHandler(token string) (http.Handler, error) {
-	if len(token) < 32 || len(token) > 512 {
-		return nil, errors.New("invalid gateway internal token")
-	}
-	digest := sha256.Sum256([]byte(token))
+// InternalHandler exposes only the lifecycle operations the controller needs.
+// Deployment network policy restricts access to this separate port.
+func (g *Gateway) InternalHandler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == internalPath+"readyz" && r.Method == http.MethodGet {
 			if err := g.Ready(r); err != nil {
@@ -56,16 +50,6 @@ func (g *Gateway) InternalHandler(token string) (http.Handler, error) {
 		}
 		if r.Method != http.MethodPost || !strings.HasPrefix(r.URL.Path, internalPath) {
 			http.NotFound(w, r)
-			return
-		}
-		auth := r.Header.Get("Authorization")
-		if !strings.HasPrefix(auth, "Bearer ") || len(auth) > 1024 {
-			http.Error(w, "Authentication required", http.StatusUnauthorized)
-			return
-		}
-		got := sha256.Sum256([]byte(strings.TrimPrefix(auth, "Bearer ")))
-		if subtle.ConstantTimeCompare(got[:], digest[:]) != 1 {
-			http.Error(w, "Authentication required", http.StatusUnauthorized)
 			return
 		}
 		r.Body = http.MaxBytesReader(w, r.Body, internalMaxBytes)
@@ -109,10 +93,11 @@ func (g *Gateway) InternalHandler(token string) (http.Handler, error) {
 		default:
 			http.NotFound(w, r)
 		}
-	}), nil
+	})
 }
 
-// InternalServer keeps controller RPC on a separate TLS port from public input.
+// InternalServer keeps controller RPC on a separate port from public input.
+// Supplying a certificate and key enables TLS; otherwise it serves HTTP.
 type InternalServer struct {
 	Handler  http.Handler
 	Address  string
@@ -121,8 +106,11 @@ type InternalServer struct {
 }
 
 func (s *InternalServer) Start(ctx context.Context) error {
-	if s.Handler == nil || s.CertFile == "" || s.KeyFile == "" {
-		return errors.New("gateway internal TLS configuration required")
+	if s.Handler == nil {
+		return errors.New("gateway internal handler required")
+	}
+	if (s.CertFile == "") != (s.KeyFile == "") {
+		return errors.New("gateway internal TLS requires both certificate and key")
 	}
 	listener, err := net.Listen("tcp", s.Address)
 	if err != nil {
@@ -131,7 +119,13 @@ func (s *InternalServer) Start(ctx context.Context) error {
 	defer func() { _ = listener.Close() }()
 	server := gatewayHTTPServer(ctx, s.Handler)
 	done := make(chan error, 1)
-	go func() { done <- server.ServeTLS(listener, s.CertFile, s.KeyFile) }()
+	go func() {
+		if s.CertFile != "" {
+			done <- server.ServeTLS(listener, s.CertFile, s.KeyFile)
+			return
+		}
+		done <- server.Serve(listener)
+	}()
 	select {
 	case <-ctx.Done():
 		err = shutdownHTTPServer(server, done, 5*time.Second)
@@ -164,21 +158,19 @@ func shutdownHTTPServer(server *http.Server, done <-chan error, timeout time.Dur
 // gateway store and never sends the application key to the gateway RPC port.
 type RemoteClient struct {
 	endpoint string
-	token    string
 	http     *http.Client
 }
 
-func NewRemoteClient(endpoint, token string, caPEM []byte) (*RemoteClient, error) {
+func NewRemoteClient(endpoint string, caPEM []byte) (*RemoteClient, error) {
 	parsed, err := url.Parse(endpoint)
-	if err != nil || parsed.Scheme != "https" || parsed.Host == "" || parsed.User != nil || parsed.Path != "" || parsed.RawQuery != "" || parsed.Fragment != "" ||
-		len(token) < 32 || len(token) > 512 {
+	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" || parsed.User != nil || parsed.Path != "" || parsed.RawQuery != "" || parsed.Fragment != "" {
 		return nil, errors.New("invalid gateway internal client configuration")
 	}
 	roots := x509.NewCertPool()
-	if !roots.AppendCertsFromPEM(caPEM) {
+	if parsed.Scheme == "https" && !roots.AppendCertsFromPEM(caPEM) {
 		return nil, errors.New("invalid gateway internal CA")
 	}
-	return &RemoteClient{endpoint: parsed.String(), token: token,
+	return &RemoteClient{endpoint: parsed.String(),
 		http: &http.Client{Timeout: internalCallTimeout, Transport: &http.Transport{
 			TLSClientConfig: &tls.Config{RootCAs: roots, MinVersion: tls.VersionTLS12},
 		}}}, nil
@@ -195,7 +187,6 @@ func (c *RemoteClient) call(ctx context.Context, operation string, input interna
 	if err != nil {
 		return errors.New("invalid gateway internal endpoint")
 	}
-	req.Header.Set("Authorization", "Bearer "+c.token)
 	req.Header.Set("Content-Type", "application/json")
 	response, err := c.http.Do(req)
 	if err != nil {

@@ -1,6 +1,7 @@
 CONTROLLER_IMG ?= controller:latest
 GATEWAY_IMG ?= gateway:latest
 EXECUTOR_IMG ?=
+SANDBOX_POOLS ?=
 EXECUTOR_BUILD_IMG ?= codex-executor:0.162.0-alpha.20
 APPLICATION_EXECUTOR_IMG ?= my-go-project-executor:latest
 CONTAINER_TOOL ?= docker
@@ -90,7 +91,7 @@ docker-buildx-gateway: ## Build and push the gateway image for amd64 and arm64.
 
 .PHONY: build-installer
 build-installer: manifests generate kustomize ## Render the combined controller and gateway release manifest.
-	python3 -B hack/render-installer.py --kustomize "$(KUSTOMIZE)" --controller-image "$(CONTROLLER_IMG)" --gateway-image "$(GATEWAY_IMG)" $(if $(EXECUTOR_IMG),--executor-image "$(EXECUTOR_IMG)") --output dist/install.yaml
+	python3 -B hack/render-installer.py --kustomize "$(KUSTOMIZE)" --controller-image "$(CONTROLLER_IMG)" --gateway-image "$(GATEWAY_IMG)" $(if $(SANDBOX_POOLS),--sandbox-pools "$(SANDBOX_POOLS)") --output dist/install.yaml
 
 ##@ Deployment
 .PHONY: local-up

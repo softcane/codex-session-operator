@@ -9,10 +9,8 @@ import json
 import re
 import os
 from pathlib import Path
-import secrets
 import shlex
 import socket
-import ssl
 import shutil
 import subprocess
 import sys
@@ -24,7 +22,7 @@ import urllib.request
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "test/e2e"))
 from support import NODE_IMAGE, NS, DEPLOYMENT, immutable_reference, source_hashes
-import gateway_tls
+import sandbox_resources
 
 CLUSTER = "codex-local"
 CONTEXT = "kind-" + CLUSTER
@@ -145,9 +143,8 @@ def manifest(local, kustomize):
         return local.run([str(kustomize), "build", temporary])
 
 
-def check_gateway(local, directory, port, token, timeout=90):
-    """Verify health and authenticated catalog over TLS, then stop the temporary tunnel."""
-    context = ssl.create_default_context(cafile=str(directory / "gateway.crt"))
+def check_gateway(local, directory, port, timeout=90):
+    """Verify HTTP health and catalog, then stop the temporary tunnel."""
     log_path = directory / "port-forward.log"
     private_write(log_path, "")
     with log_path.open("a") as log:
@@ -161,19 +158,18 @@ def check_gateway(local, directory, port, token, timeout=90):
                     raise RuntimeError("Temporary gateway tunnel exited; inspect private port-forward.log")
                 try:
                     for path in ("/readyz", "/v1/namespaces/" + NS + "/catalog"):
-                        request = urllib.request.Request("https://127.0.0.1:" + str(port) + path,
-                                  headers={"Authorization": "Bearer " + token})
-                        with urllib.request.urlopen(request, context=context, timeout=3) as response:
+                        request = urllib.request.Request("http://127.0.0.1:" + str(port) + path)
+                        with urllib.request.urlopen(request, timeout=3) as response:
                             if response.status != 200:
                                 raise RuntimeError("Gateway readiness did not return HTTP 200")
                             if path.endswith("/catalog"):
                                 catalog = json.load(response)
-                                if catalog.get("caller_subject") != "local-user":
-                                    raise RuntimeError("Gateway catalog did not authenticate the local caller")
+                                if catalog.get("caller_subject") != "gateway":
+                                    raise RuntimeError("Gateway catalog returned an unexpected replay subject")
                     return
                 except (OSError, urllib.error.URLError):
                     time.sleep(0.5)
-            raise RuntimeError("Gateway TLS and authenticated catalog readiness timed out")
+            raise RuntimeError("Gateway HTTP and catalog readiness timed out")
         finally:
             forward.terminate()
             try:
@@ -199,20 +195,21 @@ def author_resources(args, executor, architecture):
             "agent": resource("Agent", "sandbox-agent", {"name": "Sandbox investigator", "model": args.model,
                              "instructions": "Use the prepared repository and real shell evidence. Do not inspect credentials.",
                              "deletionPolicy": "Delete"}),
-            "environment": resource("Environment", "sandbox-environment", {"mode": "selfHosted", "deletionPolicy": "Delete",
-                "selfHosted": {"image": executor, "architecture": architecture, "workspaceDirectory": "/workspace",
-                    "workspaceSize": "1Gi", "workspaceStorage": {"type": "Persistent", "storageClassName": args.storage_class,
-                        "claimDeletionPolicy": "Delete"}, "repository": {"url": args.repository_url, "commit": args.repository_commit}}}),
+            "environment": resource("Environment", "sandbox-environment", {"mode": "SelfHosted", "deletionPolicy": "Delete",
+                "selfHosted": {"sandboxPoolRef": {"name": "sandbox-v1"}, "workspace": {"directory": "/workspace", "deletionPolicy": "Delete"}}}),
+            **{("sandbox-template" if value["kind"] == "SandboxTemplate" else "sandbox-pool"): value
+               for value in sandbox_resources.resources("sandbox-v1", NS, executor, architecture,
+                   args.repository_url, args.repository_commit, storage_class=args.storage_class)},
             "profile": resource("Profile", "sandbox", {"agentRef": {"name": "sandbox-agent"},
-                "environmentRef": {"name": "sandbox-environment"}, "spendControl": {"mode": "limited", "limitCents": 500}}),
+                "environmentRef": {"name": "sandbox-environment"}, "spendControl": {"mode": "Limited", "limitCents": 500}}),
         }
     return {
         "agent": resource("Agent", "investigator", {"name": "Investigator", "model": args.model,
                          "instructions": "Explain the supplied evidence clearly and state uncertainty.",
                          "deletionPolicy": "Delete"}),
-        "environment": resource("Environment", "text-only", {"mode": "none", "deletionPolicy": "Delete"}),
+        "environment": resource("Environment", "text-only", {"mode": "None", "deletionPolicy": "Delete"}),
         "profile": resource("Profile", "investigation", {"agentRef": {"name": "investigator"},
-            "environmentRef": {"name": "text-only"}, "spendControl": {"mode": "limited", "limitCents": 500}}),
+            "environmentRef": {"name": "text-only"}, "spendControl": {"mode": "Limited", "limitCents": 500}}),
     }
 
 
@@ -231,7 +228,7 @@ def main():
         args.port = choose_port(args.port)
     except ValueError as error:
         parser.error(str(error))
-    for executable in ("docker", "go", "kind", "kubectl", "openssl", "make"):
+    for executable in ("docker", "go", "kind", "kubectl", "make"):
         if not shutil.which(executable):
             parser.error(executable + " is required")
     if not args.kustomize.exists():
@@ -306,20 +303,16 @@ def main():
                 raise RuntimeError("Executor manifest was not imported under its verified digest")
             local.secret("codex-executor", {"CODEX_API_KEY": executor_key})
             report.update({"executorImage": executor, "executorArchitecture": architecture, "repositoryURL": args.repository_url, "repositoryCommit": args.repository_commit})
-        token = secrets.token_urlsafe(48)
-        local.secret("gateway-auth", {"principals.json": json.dumps([{"token": token, "subject": "local-user", "namespace": NS}])})
-        gateway_tls.provision(local, directory, days=30)
-        (directory / "gateway.key").chmod(0o600)
         database_url = "postgres://postgres@gateway-postgres:5432/postgres?sslmode=disable"
         local.secret("gateway-database", {"url": database_url})
         local.kubectl("apply", "-f", "config/demo/postgres.yaml")
         local.kubectl("rollout", "status", "deployment/gateway-postgres", "-n", NS, "--timeout=180s")
+        sandbox_resources.install(local)
         installed = True
         local.kubectl("apply", "-f", "-", data=manifest(local, args.kustomize.resolve()))
         local.kubectl("wait", "--for=condition=Established", *["crd/" + kind + ".agents.softcane.io" for kind in KINDS], "--timeout=90s")
         if executor:
-            local.kubectl("set", "env", "deployment/" + DEPLOYMENT, "-n", NS, "EXECUTOR_IMAGES=" + executor,
-                          "WORKSPACE_STORAGE_CLASSES=" + args.storage_class, "REPOSITORY_URLS=" + args.repository_url)
+            local.kubectl("set", "env", "deployment/" + DEPLOYMENT, "-n", NS, "SANDBOX_POOLS=sandbox-v1")
             local.kubectl("get", "storageclass", args.storage_class)
         for deployment in (DEPLOYMENT, GATEWAY):
             local.kubectl("rollout", "status", "deployment/" + deployment, "-n", NS, "--timeout=180s")
@@ -329,8 +322,8 @@ def main():
         report["resourceInstances"] = len(resources)
         if resources:
             raise RuntimeError("Setup expected no custom-resource instances; apply author YAML explicitly after setup")
-        check_gateway(local, directory, args.port, token)
-        report["gatewayTLSAndAuthenticationReady"] = True
+        check_gateway(local, directory, args.port)
+        report["gatewayHTTPReady"] = True
         if global_configs() != baseline:
             raise RuntimeError("A global kubeconfig changed during setup")
         author = directory / "author"
@@ -340,9 +333,8 @@ def main():
         report["authorDirectory"] = str(author)
         values = {"LOCAL_PROFILE": "sandbox" if executor else "investigation", "LOCAL_DIR": str(directory),
                   "LOCAL_CONTEXT": CONTEXT, "NAMESPACE": NS, "LOCAL_PORT": str(args.port),
-                  "GATEWAY_URL": "https://127.0.0.1:" + str(args.port), "KUBECONFIG": local.env["KUBECONFIG"]}
+                  "GATEWAY_URL": "http://127.0.0.1:" + str(args.port), "KUBECONFIG": local.env["KUBECONFIG"]}
         private_write(directory / "env.sh", "".join("export " + name + "=" + shlex.quote(value) + "\n" for name, value in values.items()))
-        private_write(directory / "gateway-token", token + "\n")
         private_write(directory / "task.txt", "Hello\n")
         if source_hashes() != report["sourceHashes"]:
             raise RuntimeError("Sources changed during setup; do not publish mixed-source infrastructure")
@@ -371,8 +363,8 @@ def main():
     print("source " + shlex.quote(str(directory / "env.sh")))
     print('kubectl --context "$LOCAL_CONTEXT" -n "$NAMESPACE" port-forward --address 127.0.0.1 service/' + GATEWAY + ' "$LOCAL_PORT:8082"')
     print('In another sourced terminal: kubectl --context "$LOCAL_CONTEXT" apply -f "$LOCAL_DIR/author"')
-    print('Then: bin/gateway-client --origin "$GATEWAY_URL" --namespace "$NAMESPACE" --token-file "$LOCAL_DIR/gateway-token" ' +
-          '--ca-file "$LOCAL_DIR/gateway.crt" --state-dir "$LOCAL_DIR/operations" start --profile "$LOCAL_PROFILE" ' +
+    print('Then: bin/gateway-client --origin "$GATEWAY_URL" --namespace "$NAMESPACE" ' +
+          '--state-dir "$LOCAL_DIR/operations" start --profile "$LOCAL_PROFILE" ' +
           '--text-file "$LOCAL_DIR/task.txt" --operation first-conversation')
     return 0
 

@@ -72,7 +72,6 @@ func (p *dependencyScenarioSessionProvider) CreateConfiguredSession(ctx context.
 	remote := &p.lifecycle.remote
 	remote.ID = "sess_dependency_" + uid
 	remote.AgentConfiguration = openaiapi.EffectiveSessionAgent(copyConfiguration(p.agents.remote.Config), overrides)
-	remote.AgentConfigurationDigest = openaiapi.AgentConfigurationDigest(remote.AgentConfiguration)
 	remote.Model, _ = remote.AgentConfiguration[agentModelField].(string)
 	remote.EnvironmentType, _ = environment[agentTypeField].(string)
 	remote.SelfHosted = remote.EnvironmentType == dependencyScenarioSelfHosted
@@ -451,7 +450,7 @@ var _ = Describe("Dependency scenarios with shipped CRDs", func() {
 		for range 3 {
 			f.sessionStep(first)
 		}
-		Expect(first.Status.Phase).To(Equal("Ready"))
+		Expect(meta.IsStatusConditionTrue(first.Status.Conditions, readyCondition)).To(BeTrue())
 		agentSnapshot := *first.Status.AgentSnapshot
 		environmentSnapshot := first.Status.EnvironmentSnapshot.DeepCopy()
 		f.read(f.agent)
@@ -479,13 +478,13 @@ var _ = Describe("Dependency scenarios with shipped CRDs", func() {
 		for range 3 {
 			later.sessionStep(second)
 		}
-		Expect(second.Status.Phase).To(Equal("Ready"))
+		Expect(meta.IsStatusConditionTrue(second.Status.Conditions, readyCondition)).To(BeTrue())
 		Expect(second.Status.OpenAISessionID).NotTo(Equal(first.Status.OpenAISessionID))
 		Expect(second.Status.AgentSnapshot.Generation).To(BeNumerically(">", agentSnapshot.Generation))
 		Expect(second.Status.EnvironmentSnapshot.Profile.OpenAIHosted.ContainerSize).To(Equal("large"))
 		Expect(later.sessions.remote.AgentConfiguration["instructions"]).To(Equal(updatedInstructions))
 		f.sessionStep(first)
-		Expect(first.Status.Phase).To(Equal("Ready"))
+		Expect(meta.IsStatusConditionTrue(first.Status.Conditions, readyCondition)).To(BeTrue())
 		Expect(*first.Status.AgentSnapshot).To(Equal(agentSnapshot))
 		Expect(first.Status.EnvironmentSnapshot).To(Equal(environmentSnapshot))
 		Expect(f.sessions.remote.AgentConfiguration["instructions"]).NotTo(Equal(updatedInstructions))

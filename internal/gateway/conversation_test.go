@@ -22,7 +22,7 @@ const (
 )
 
 func conversationRequest(g *Gateway, method, path, key, body string) *httptest.ResponseRecorder {
-	return request(g, method, path, _token, key, body)
+	return request(g, method, path, key, body)
 }
 
 func readConversationReceipt(t *testing.T, response *httptest.ResponseRecorder) ConversationReceipt {
@@ -114,7 +114,7 @@ func TestConversationCollectionPagesAttemptsAndRejectsInvalidCursors(t *testing.
 			t.Fatal(err)
 		}
 	}
-	if _, _, err := g.createConversation(t.Context(), Principal{Namespace: _testOtherConversationNamespace, Subject: _testConversationSubject}, "first",
+	if _, _, err := g.createConversation(t.Context(), requestScope{Namespace: _testOtherConversationNamespace, Subject: _testConversationSubject}, "first",
 		ConversationInput{RouteID: _profileTestName, Text: "Other namespace"}); err != nil {
 		t.Fatal(err)
 	}
@@ -311,7 +311,7 @@ func TestConversationRejectsInvalidInputAndHeldFreshMutation(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
-	if _, _, err := g.createConversation(ctx, Principal{Namespace: _testNamespace, Subject: _testConversationSubject}, "canceled",
+	if _, _, err := g.createConversation(ctx, requestScope{Namespace: _testNamespace, Subject: _testConversationSubject}, "canceled",
 		ConversationInput{RouteID: _testWorkRouteID, Text: "x"}); err == nil {
 		t.Fatal("canceled creation succeeded")
 	}

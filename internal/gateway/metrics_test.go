@@ -144,9 +144,9 @@ func gatewayMetric(t *testing.T, registry *prometheus.Registry, name string, lab
 	return nil
 }
 
-func metricsRequest(handler http.Handler, method, path, token, body string) *httptest.ResponseRecorder {
+func metricsRequest(handler http.Handler, method, path, authorization, body string) *httptest.ResponseRecorder {
 	r := httptest.NewRequest(method, path, strings.NewReader(body))
-	r.Header.Set("Authorization", "Bearer "+token)
+	r.Header.Set("Authorization", "Bearer "+authorization)
 	r.Header.Set("Idempotency-Key", "metrics-input")
 	w := httptest.NewRecorder()
 	handler.ServeHTTP(w, r)
@@ -158,20 +158,20 @@ func TestGatewayMetricsCountRejectedAndSuccessfulRequests(t *testing.T) {
 	registry := gatewayMetricsRegistry(t, g)
 	handler := g.InstrumentedHandler()
 	tests := []struct {
-		method string
-		path   string
-		token  string
-		body   string
-		route  string
-		code   int
+		method        string
+		path          string
+		authorization string
+		body          string
+		route         string
+		code          int
 	}{
-		{method: http.MethodPost, path: _testMessagePath, token: _token, body: _testFirstMessageBody, route: _metricsMessages, code: http.StatusAccepted},
-		{method: http.MethodPost, path: _testMessagePath, body: _testFirstMessageBody, route: _metricsMessages, code: http.StatusUnauthorized},
-		{method: http.MethodPut, path: _testMessagePath, token: _token, route: _metricsMessages, code: http.StatusMethodNotAllowed},
+		{method: http.MethodPost, path: _testMessagePath, authorization: _testAuthorizationValue, body: _testFirstMessageBody, route: _metricsMessages, code: http.StatusAccepted},
+		{method: http.MethodPost, path: _testMessagePath, body: `{}`, route: _metricsMessages, code: http.StatusBadRequest},
+		{method: http.MethodPut, path: _testMessagePath, authorization: _testAuthorizationValue, route: _metricsMessages, code: http.StatusMethodNotAllowed},
 		{method: http.MethodGet, path: "/readyz", route: "ready", code: http.StatusOK},
 	}
 	for _, tt := range tests {
-		if got := metricsRequest(handler, tt.method, tt.path, tt.token, tt.body).Code; got != tt.code {
+		if got := metricsRequest(handler, tt.method, tt.path, tt.authorization, tt.body).Code; got != tt.code {
 			t.Fatal(got, tt.code)
 		}
 		metric := gatewayMetric(t, registry, _testGatewayRequestsMetric,
@@ -183,7 +183,7 @@ func TestGatewayMetricsCountRejectedAndSuccessfulRequests(t *testing.T) {
 	for range cap(g.requestSlots) {
 		g.requestSlots <- struct{}{}
 	}
-	response := metricsRequest(handler, http.MethodPost, _testMessagePath, _token, _testFirstMessageBody)
+	response := metricsRequest(handler, http.MethodPost, _testMessagePath, _testAuthorizationValue, _testFirstMessageBody)
 	for range cap(g.requestSlots) {
 		<-g.requestSlots
 	}
@@ -197,7 +197,7 @@ func TestGatewayMetricsCountRejectedAndSuccessfulRequests(t *testing.T) {
 	}
 	if metric := gatewayMetric(t, registry, _testGatewayLatencyMetric,
 		map[string]string{_metricsRouteLabel: _metricsMessages, _metricsMethodLabel: http.MethodPost}); metric == nil || metric.GetHistogram().GetSampleCount() != 3 {
-		t.Fatal("ordinary HTTP latency did not include successful/auth/capacity requests")
+		t.Fatal("ordinary HTTP latency did not include successful/rejected/capacity requests")
 	}
 }
 
@@ -218,7 +218,7 @@ func TestGatewayMetricsLabelsRemainBoundedAndPrivate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(string(encoded), "private-resource-") || strings.Contains(string(encoded), "PRIVATE0") || strings.Contains(string(encoded), _token) {
+	if strings.Contains(string(encoded), "private-resource-") || strings.Contains(string(encoded), "PRIVATE0") || strings.Contains(string(encoded), _testAuthorizationValue) {
 		t.Fatal("operational metrics leaked request/resource/authentication values")
 	}
 	for _, family := range families {
@@ -243,7 +243,7 @@ func TestGatewayMetricsSSEPreservesFlushingAndSeparateDuration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	req.Header.Set("Authorization", "Bearer "+_token)
+	req.Header.Set("Authorization", "Bearer "+_testAuthorizationValue)
 	response, err := server.Client().Do(req)
 	if err != nil {
 		t.Fatal(err)
@@ -271,7 +271,7 @@ func TestGatewayMetricsSSEPreservesFlushingAndSeparateDuration(t *testing.T) {
 	if metric := gatewayMetric(t, registry, _testGatewaySSEActive, map[string]string{_metricsRouteLabel: _testGatewayEventsRoute}); metric == nil || metric.GetGauge().GetValue() != 0 {
 		t.Fatal("completed SSE left a live-connection metric")
 	}
-	metricsRequest(g.InstrumentedHandler(), http.MethodGet, _scenarioSessionPath+"/events", "wrong-token", "")
+	metricsRequest(g.InstrumentedHandler(), http.MethodGet, "/v1/namespaces/team/sessions/missing/events", "", "")
 	if metric := gatewayMetric(t, registry, _testGatewayLatencyMetric,
 		map[string]string{_metricsRouteLabel: _testGatewayEventsRoute, _metricsMethodLabel: http.MethodGet}); metric == nil || metric.GetHistogram().GetSampleCount() != 1 {
 		t.Fatal("rejected SSE request was omitted from ordinary HTTP latency")
@@ -288,7 +288,7 @@ func TestGatewayMetricsPreserveResponseControllerAndOptionalInterfaces(t *testin
 		t.Fatal(err)
 	}
 	req := httptest.NewRequest(http.MethodGet, _scenarioSessionPath+"/events", nil)
-	req.Header.Set("Authorization", "Bearer "+_token)
+	req.Header.Set("Authorization", "Bearer "+_testAuthorizationValue)
 	writer := &metricsDeadlineWriter{ResponseRecorder: httptest.NewRecorder()}
 	g.InstrumentedHandler().ServeHTTP(writer, req)
 	if !writer.Flushed || writer.deadlines.Load() == 0 || writer.Code != http.StatusOK {
@@ -317,11 +317,11 @@ func TestGatewayMetricsRegistryIsolationAndConcurrentConstruction(t *testing.T) 
 	second := gatewayMetricsRegistry(t, other)
 	metricsRequest(g.InstrumentedHandler(), http.MethodGet, "/unknown", "", "")
 	if gatewayMetric(t, first, _testGatewayRequestsMetric,
-		map[string]string{_metricsRouteLabel: _metricsUnmatched, _metricsMethodLabel: http.MethodGet, _metricsCodeLabel: "401"}) == nil {
+		map[string]string{_metricsRouteLabel: _metricsUnmatched, _metricsMethodLabel: http.MethodGet, _metricsCodeLabel: "404"}) == nil {
 		t.Fatal("first registry did not receive its request")
 	}
 	if gatewayMetric(t, second, _testGatewayRequestsMetric,
-		map[string]string{_metricsRouteLabel: _metricsUnmatched, _metricsMethodLabel: http.MethodGet, _metricsCodeLabel: "401"}) != nil {
+		map[string]string{_metricsRouteLabel: _metricsUnmatched, _metricsMethodLabel: http.MethodGet, _metricsCodeLabel: "404"}) != nil {
 		t.Fatal("gateway instances shared counters/default-registry state")
 	}
 	if gatewayMetric(t, first, _testGatewayDatabaseMetric, nil) != nil {

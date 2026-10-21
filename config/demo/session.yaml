@@ -11,5 +11,5 @@ spec:
   environmentRef:
     name: demo-text-v1
   spendControl:
-    mode: unlimited
+    mode: Unlimited
 # In none mode, first input through the Session message API triggers remote creation.

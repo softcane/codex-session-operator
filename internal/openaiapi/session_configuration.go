@@ -15,8 +15,8 @@ import (
 
 const (
 	maxSessionSpendLimitCents int64 = 4503599627370495
-	sessionSpendModeLimited         = "limited"
-	sessionSpendModeUnlimited       = "unlimited"
+	sessionSpendModeLimited         = agentsv1alpha1.SessionSpendModeLimited
+	sessionSpendModeUnlimited       = agentsv1alpha1.SessionSpendModeUnlimited
 	spendControlField               = "spend_control"
 	spendLimitField                 = "limit"
 	spendConsumedField              = "consumed"

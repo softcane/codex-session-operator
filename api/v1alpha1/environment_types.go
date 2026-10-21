@@ -21,138 +21,92 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 )
 
+// EnvironmentMode selects a runtime; provider wire literals are translated by the adapter.
+type EnvironmentMode string
+
+const (
+	EnvironmentModeSelfHosted   EnvironmentMode = "SelfHosted"
+	EnvironmentModeOpenAIHosted EnvironmentMode = "OpenAIHosted"
+	EnvironmentModeNone         EnvironmentMode = "None"
+)
+
+// DeletionPolicy selects deletion or administrative retention of owned resources.
+type DeletionPolicy string
+
+const (
+	DeletionPolicyDelete DeletionPolicy = "Delete"
+	DeletionPolicyRetain DeletionPolicy = "Retain"
+)
+
 // EnvironmentSpec is a reusable recipe, never an active runtime.
 // +kubebuilder:validation:XValidation:rule="self.mode == oldSelf.mode",message="Environment mode is immutable"
-// +kubebuilder:validation:XValidation:rule="(self.mode == 'selfHosted') == has(self.selfHosted)",message="selfHosted branch must match mode"
-// +kubebuilder:validation:XValidation:rule="(self.mode == 'openaiHosted') == has(self.openaiHosted)",message="openaiHosted branch must match mode"
+// +kubebuilder:validation:XValidation:rule="(self.mode == 'SelfHosted') == has(self.selfHosted)",message="selfHosted branch must match mode"
+// +kubebuilder:validation:XValidation:rule="(self.mode == 'OpenAIHosted') == has(self.openaiHosted)",message="openaiHosted branch must match mode"
 type EnvironmentSpec struct {
-	// +kubebuilder:validation:Enum=selfHosted;openaiHosted;none
-	Mode string `json:"mode"`
+	// +kubebuilder:validation:Enum=SelfHosted;OpenAIHosted;None
+	// +required
+	Mode EnvironmentMode `json:"mode"`
 	// +optional
 	SelfHosted *SelfHostedEnvironment `json:"selfHosted,omitempty"`
 	// +optional
 	OpenAIHosted *HostedEnvironment `json:"openaiHosted,omitempty"`
 	// +kubebuilder:validation:Enum=Delete;Retain
-	DeletionPolicy string `json:"deletionPolicy"`
+	// +required
+	DeletionPolicy DeletionPolicy `json:"deletionPolicy"`
 }
 
-// SelfHostedEnvironment describes platform-approved local compute.
+// SelfHostedEnvironment selects an administrator-approved Agent Sandbox pool.
+// Compute, repository preparation and storage configuration belong to its template.
 type SelfHostedEnvironment struct {
-	// +kubebuilder:validation:Pattern="^[^\\s@]+@sha256:[a-f0-9]{64}$"
-	// +kubebuilder:validation:MaxLength=512
-	Image string `json:"image"`
-	// +kubebuilder:validation:Enum=amd64;arm64
-	Architecture string `json:"architecture"`
+	// SandboxPoolRef selects a same-namespace SandboxWarmPool.
+	// +required
+	SandboxPoolRef AgentReference `json:"sandboxPoolRef"`
+	// Workspace configures the workspace location and cleanup policy.
+	// +required
+	Workspace SelfHostedWorkspace `json:"workspace"`
+	// CapabilityDirectories names prepared installation paths in the template.
+	// +kubebuilder:validation:MaxItems=32
+	// +kubebuilder:validation:items:Pattern="^/[^/]+(/[^/]+)*$"
+	// +kubebuilder:validation:XValidation:rule="self.all(d, d.split('/').all(p, p != '.' && p != '..'))",message="capability paths must be clean absolute directories"
+	// +kubebuilder:validation:items:MaxLength=4096
+	// +listType=set
+	// +optional
+	CapabilityDirectories []string `json:"capabilityDirectories,omitempty"`
+}
+
+// SelfHostedWorkspace configures files managed by the selected Sandbox template.
+// +kubebuilder:validation:XValidation:rule="!['/home', '/tmp', '/usr', '/bin', '/sbin', '/etc', '/dev', '/proc', '/sys', '/run', '/capabilities'].exists(p, self.directory == p || self.directory.startsWith(p + '/'))",message="workspace directory overlaps a reserved runtime directory"
+type SelfHostedWorkspace struct {
+	// Directory must be a clean absolute directory other than root.
 	// +kubebuilder:default="/workspace"
-	// +kubebuilder:validation:Pattern="^/"
+	// +kubebuilder:validation:Pattern="^/[^/]+(/[^/]+)*$"
 	// +kubebuilder:validation:MaxLength=4096
+	// +kubebuilder:validation:XValidation:rule="self.split('/').all(p, p != '.' && p != '..')",message="directory must be a clean absolute path"
 	// +optional
-	WorkspaceDirectory string `json:"workspaceDirectory,omitempty"`
-	// WorkspaceSize bounds an ephemeral volume or requests a persistent claim.
-	// +kubebuilder:default="1Gi"
-	// +kubebuilder:validation:MaxLength=32
-	// +optional
-	WorkspaceSize string `json:"workspaceSize,omitempty"`
-	// WorkspaceStorage selects whether files survive executor Pod replacement.
-	// Omission selects an ephemeral workspace with the configured size.
-	// +optional
-	WorkspaceStorage *WorkspaceStorage `json:"workspaceStorage,omitempty"`
-	// Repository prepares a trusted checkout before the executor starts.
-	// Changes apply only to future Sessions; replacement Pods preserve existing files.
-	// +optional
-	Repository *RepositorySpec `json:"repository,omitempty"`
-	// +optional
-	Resources *ExecutorResources `json:"resources,omitempty"`
-	// +kubebuilder:validation:MaxItems=16
-	// +listType=map
-	// +listMapKey=name
-	// +optional
-	Capabilities []LocalCapability `json:"capabilities,omitempty"`
-}
-
-// RepositorySpec pins a platform-approved, credential-free HTTPS repository.
-// +kubebuilder:validation:XValidation:rule="!has(self.mountCredentialsInExecutor) || !self.mountCredentialsInExecutor || has(self.credentialSecretRef)",message="executor credential mounting requires credentialSecretRef"
-type RepositorySpec struct {
-	// URL must also be approved by the operator's exact repository URL allowlist.
-	// +kubebuilder:validation:Pattern="^https://[^/@?#]+/[^?#]+$"
-	// +kubebuilder:validation:MaxLength=2048
-	URL string `json:"url"`
-	// Commit is a complete immutable SHA-1 object identity, never a branch or tag.
-	// +kubebuilder:validation:Pattern="^[a-f0-9]{40}$"
-	Commit string `json:"commit"`
-	// CredentialSecretRef selects protected material mounted into preparation by default.
-	// +optional
-	CredentialSecretRef *RepositoryCredentialSecretReference `json:"credentialSecretRef,omitempty"`
-	// MountCredentialsInExecutor explicitly exposes the selected repository credential
-	// files to task commands. Omission keeps credentials in preparation only.
-	// Credential permissions must be restricted by the Git hosting provider.
-	// +optional
-	MountCredentialsInExecutor bool `json:"mountCredentialsInExecutor,omitempty"`
-}
-
-// RepositoryCredentialSecretReference cannot select arbitrary namespace Secrets.
-// +kubebuilder:validation:XValidation:rule="!has(self.usernameKey) || self.usernameKey != self.key",message="repository token and username keys must be distinct"
-type RepositoryCredentialSecretReference struct {
-	// +kubebuilder:validation:Enum=codex-repository
-	Name string `json:"name"`
-	// Key selects the access token; its value is never placed in public configuration.
-	// +kubebuilder:validation:Pattern="^[a-zA-Z0-9._-]{1,253}$"
-	Key string `json:"key"`
-	// UsernameKey selects an optional username; omission uses x-access-token.
-	// +kubebuilder:validation:Pattern="^[a-zA-Z0-9._-]{1,253}$"
-	// +optional
-	UsernameKey string `json:"usernameKey,omitempty"`
-}
-
-// WorkspaceStorage controls the Session-owned workspace claim lifecycle.
-// +kubebuilder:validation:XValidation:rule="self.type == 'Persistent' ? has(self.storageClassName) && has(self.claimDeletionPolicy) : !has(self.storageClassName) && !has(self.claimDeletionPolicy)",message="Persistent storage requires a class and claim deletion policy; Ephemeral permits neither"
-type WorkspaceStorage struct {
-	// +kubebuilder:validation:Enum=Ephemeral;Persistent
-	Type string `json:"type"`
-	// StorageClassName must also be approved by the operator allowlist.
-	// +kubebuilder:validation:Pattern="^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$"
-	// +kubebuilder:validation:MaxLength=253
-	// +optional
-	StorageClassName string `json:"storageClassName,omitempty"`
-	// ClaimDeletionPolicy deletes or retains the PVC when its Session is deleted.
-	// A StorageClass separately controls whether its backing volume is reclaimed.
+	Directory string `json:"directory,omitempty"`
+	// DeletionPolicy deletes the Sandbox and files, or retains a suspended workspace.
 	// +kubebuilder:validation:Enum=Delete;Retain
-	// +optional
-	ClaimDeletionPolicy string `json:"claimDeletionPolicy,omitempty"`
+	// +required
+	DeletionPolicy DeletionPolicy `json:"deletionPolicy"`
 }
 
-// ExecutorResources permits CPU and memory only; controller enforces platform bounds.
-type ExecutorResources struct {
-	// +kubebuilder:default="100m"
-	// +kubebuilder:validation:MaxLength=32
-	// +optional
-	CPURequest string `json:"cpuRequest,omitempty"`
-	// +kubebuilder:default="1"
-	// +kubebuilder:validation:MaxLength=32
-	// +optional
-	CPULimit string `json:"cpuLimit,omitempty"`
-	// +kubebuilder:default="128Mi"
-	// +kubebuilder:validation:MaxLength=32
-	// +optional
-	MemoryRequest string `json:"memoryRequest,omitempty"`
-	// +kubebuilder:default="512Mi"
-	// +kubebuilder:validation:MaxLength=32
-	// +optional
-	MemoryLimit string `json:"memoryLimit,omitempty"`
-}
-
-// LocalCapability is a versioned /bundle image copied before the executor starts.
-type LocalCapability struct {
-	// +kubebuilder:validation:Pattern="^[a-z]([a-z0-9-]{0,30}[a-z0-9])?$"
+// SandboxPoolSnapshot freezes public identities and configuration of approved infrastructure.
+// Template configuration remains in native Agent Sandbox resources.
+type SandboxPoolSnapshot struct {
+	// +required
 	Name string `json:"name"`
-	// +kubebuilder:validation:Pattern="^[^\\s@]+@sha256:[a-f0-9]{64}$"
-	// +kubebuilder:validation:MaxLength=512
-	Image string `json:"image"`
-	// Path selects the actual plugin root, or a directory containing skills.
-	// +kubebuilder:validation:Pattern="^/capabilities/[a-z]([a-z0-9-]{0,30}[a-z0-9])?$"
-	Path string `json:"path"`
-	// +kubebuilder:validation:Enum=plugin;skills
-	Type string `json:"type"`
+	// +required
+	UID string `json:"uid"`
+	// +required
+	Generation int64 `json:"generation"`
+	// +required
+	TemplateName string `json:"templateName"`
+	// +required
+	TemplateUID string `json:"templateUID"`
+	// +required
+	TemplateGeneration int64 `json:"templateGeneration"`
+	// +required
+	ConfigurationDigest string `json:"configurationDigest"`
 }
 
 // HostedEnvironment owns the full remote template configuration.
@@ -166,13 +120,15 @@ type HostedEnvironment struct {
 	// +optional
 	ContainerSize string `json:"containerSize,omitempty"`
 	// +optional
-	Desktop bool          `json:"desktop,omitempty"`
+	Desktop bool `json:"desktop,omitempty"`
+	// +required
 	Network HostedNetwork `json:"network"`
 	// +optional
 	Packages *HostedPackages `json:"packages,omitempty"`
 	// +kubebuilder:validation:MaxItems=32
 	// +listType=set
-	// +kubebuilder:validation:items:Pattern="^/workspace/"
+	// +kubebuilder:validation:items:Pattern="^/workspace/[^/]+(/[^/]+)*$"
+	// +kubebuilder:validation:XValidation:rule="self.all(d, d.split('/').all(p, p != '.' && p != '..'))",message="capability paths must stay inside workspace"
 	// +kubebuilder:validation:items:MaxLength=4096
 	// +optional
 	CapabilityDirectories []string `json:"capabilityDirectories,omitempty"`
@@ -207,20 +163,25 @@ type HostedEnvironment struct {
 // +kubebuilder:validation:XValidation:rule="self.access != 'restricted' || size(self.allowedDomains) + size(self.blockedDomains) > 0",message="Restricted access requires domains"
 type HostedNetwork struct {
 	// +kubebuilder:validation:Enum=enabled;disabled;restricted
+	// +required
 	Access string `json:"access"`
 	// +kubebuilder:validation:MaxItems=100
-	// +kubebuilder:validation:items:Pattern="^[a-zA-Z0-9]([a-zA-Z0-9.-]*[a-zA-Z0-9])?$"
+	// +kubebuilder:validation:items:Pattern="^[a-zA-Z0-9]([-a-zA-Z0-9]*[a-zA-Z0-9])?(\\.[a-zA-Z0-9]([-a-zA-Z0-9]*[a-zA-Z0-9])?)*$"
 	// +kubebuilder:validation:items:MaxLength=253
 	// +listType=set
 	// +kubebuilder:default={}
 	// +optional
+	// +kubebuilder:validation:items:MinLength=1
+	// +kubebuilder:validation:items:MaxLength=256
+	// +kubebuilder:validation:XValidation:rule="self.all(h, !h.contains('..'))",message="domains must be exact host names"
 	AllowedDomains []string `json:"allowedDomains,omitempty"`
 	// +kubebuilder:validation:MaxItems=100
-	// +kubebuilder:validation:items:Pattern="^[a-zA-Z0-9]([a-zA-Z0-9.-]*[a-zA-Z0-9])?$"
+	// +kubebuilder:validation:items:Pattern="^[a-zA-Z0-9]([-a-zA-Z0-9]*[a-zA-Z0-9])?(\\.[a-zA-Z0-9]([-a-zA-Z0-9]*[a-zA-Z0-9])?)*$"
 	// +kubebuilder:validation:items:MaxLength=253
 	// +listType=set
 	// +kubebuilder:default={}
 	// +optional
+	// +kubebuilder:validation:XValidation:rule="self.all(h, !h.contains('..'))",message="domains must be exact host names"
 	BlockedDomains []string `json:"blockedDomains,omitempty"`
 }
 
@@ -229,14 +190,23 @@ type HostedPackages struct {
 	// +kubebuilder:validation:MaxItems=64
 	// +kubebuilder:validation:items:MaxLength=256
 	// +optional
+	// +listType=atomic
+	// +kubebuilder:validation:items:MinLength=1
+	// +kubebuilder:validation:items:MaxLength=256
 	Python []string `json:"python,omitempty"`
 	// +kubebuilder:validation:MaxItems=64
 	// +kubebuilder:validation:items:MaxLength=256
 	// +optional
+	// +listType=atomic
+	// +kubebuilder:validation:items:MinLength=1
+	// +kubebuilder:validation:items:MaxLength=256
 	System []string `json:"system,omitempty"`
 	// +kubebuilder:validation:MaxItems=64
 	// +kubebuilder:validation:items:MaxLength=256
 	// +optional
+	// +listType=atomic
+	// +kubebuilder:validation:items:MinLength=1
+	// +kubebuilder:validation:items:MaxLength=256
 	NPM []string `json:"npm,omitempty"`
 }
 
@@ -244,19 +214,40 @@ type HostedPackages struct {
 // HostedVariable reads values from the platform's codex-environment Secret.
 type HostedVariable struct {
 	// +kubebuilder:validation:Pattern="^[A-Za-z_][A-Za-z0-9_]{0,127}$"
+	// +required
 	Name string `json:"name"`
 	// +kubebuilder:validation:Pattern="^[a-zA-Z0-9._-]{1,253}$"
+	// +required
 	SecretKey string `json:"secretKey"`
 }
 
+// HostedFileType selects a protected source and is translated to the provider file type.
+type HostedFileType string
+
+const (
+	HostedFileTypeFileID HostedFileType = "FileID"
+	HostedFileTypeInline HostedFileType = "Inline"
+)
+
+// HostedSkillType selects a pinned provider reference or a protected archive.
+type HostedSkillType string
+
+const (
+	HostedSkillTypeSkillReference HostedSkillType = "SkillReference"
+	HostedSkillTypeInline         HostedSkillType = "Inline"
+)
+
 // HostedFile never stores inline bytes in the API.
-// +kubebuilder:validation:XValidation:rule="(self.type == 'fileID') == has(self.fileID)",message="fileID branch must match type"
-// +kubebuilder:validation:XValidation:rule="(self.type == 'inline') == has(self.secretKey)",message="inline branch must match type"
+// +kubebuilder:validation:XValidation:rule="(self.type == 'FileID') == has(self.fileID)",message="fileID branch must match type"
+// +kubebuilder:validation:XValidation:rule="(self.type == 'Inline') == has(self.secretKey)",message="inline branch must match type"
 type HostedFile struct {
-	// +kubebuilder:validation:Enum=fileID;inline
-	Type string `json:"type"`
-	// +kubebuilder:validation:Pattern="^/workspace/"
+	// +kubebuilder:validation:Enum=FileID;Inline
+	// +required
+	Type HostedFileType `json:"type"`
+	// +kubebuilder:validation:Pattern="^/workspace/[^/]+(/[^/]+)*$"
+	// +kubebuilder:validation:XValidation:rule="self.split('/').all(p, p != '.' && p != '..')",message="path must be clean"
 	// +kubebuilder:validation:MaxLength=4096
+	// +required
 	Path string `json:"path"`
 	// +kubebuilder:validation:MinLength=1
 	// +kubebuilder:validation:MaxLength=256
@@ -270,32 +261,39 @@ type HostedFile struct {
 // HostedArchive pins a protected ZIP to an immutable Secret object version.
 type HostedArchive struct {
 	// +kubebuilder:validation:Pattern="^[a-zA-Z0-9._-]{1,253}$"
+	// +required
 	SecretKey string `json:"secretKey"`
 	// +kubebuilder:validation:MinLength=1
 	// +kubebuilder:validation:MaxLength=128
+	// +required
 	SecretUID string `json:"secretUID"`
 	// +kubebuilder:validation:MinLength=1
 	// +kubebuilder:validation:MaxLength=128
+	// +required
 	SecretResourceVersion string `json:"secretResourceVersion"`
 }
 
 // HostedInlineCapability carries safe metadata and a protected archive reference.
 type HostedInlineCapability struct {
 	// +kubebuilder:validation:Pattern="^[a-z][a-z0-9-]{0,63}$"
+	// +required
 	Name string `json:"name"`
 	// +kubebuilder:validation:MinLength=1
 	// +kubebuilder:validation:MaxLength=2048
-	Description string        `json:"description"`
-	Source      HostedArchive `json:"source"`
+	// +required
+	Description string `json:"description"`
+	// +required
+	Source HostedArchive `json:"source"`
 }
 
 // HostedSkill selects an exact API version or a pinned protected archive.
-// +kubebuilder:validation:XValidation:rule="(self.type == 'skillReference') == (has(self.skillID) && has(self.version))",message="skillReference requires ID and concrete version"
-// +kubebuilder:validation:XValidation:rule="(self.type == 'inline') == has(self.inline)",message="inline branch must match type"
-// +kubebuilder:validation:XValidation:rule="self.type == 'skillReference' || (!has(self.skillID) && !has(self.version))",message="inline skill cannot carry reference fields"
+// +kubebuilder:validation:XValidation:rule="(self.type == 'SkillReference') == (has(self.skillID) && has(self.version))",message="skillReference requires ID and concrete version"
+// +kubebuilder:validation:XValidation:rule="(self.type == 'Inline') == has(self.inline)",message="inline branch must match type"
+// +kubebuilder:validation:XValidation:rule="self.type == 'SkillReference' || (!has(self.skillID) && !has(self.version))",message="inline skill cannot carry reference fields"
 type HostedSkill struct {
-	// +kubebuilder:validation:Enum=skillReference;inline
-	Type string `json:"type"`
+	// +kubebuilder:validation:Enum=SkillReference;Inline
+	// +required
+	Type HostedSkillType `json:"type"`
 	// +kubebuilder:validation:MinLength=1
 	// +kubebuilder:validation:MaxLength=256
 	// +optional
@@ -311,27 +309,33 @@ type HostedSkill struct {
 // HostedSetupCommand reads its command from the protected platform Secret.
 type HostedSetupCommand struct {
 	// +kubebuilder:validation:Pattern="^[a-zA-Z0-9._-]{1,253}$"
+	// +required
 	SecretKey string `json:"secretKey"`
 	// +kubebuilder:default="/workspace"
-	// +kubebuilder:validation:Pattern="^/workspace($|/)"
+	// +kubebuilder:validation:Pattern="^/workspace(/[^/]+)*$"
+	// +kubebuilder:validation:XValidation:rule="self.split('/').all(p, p != '.' && p != '..')",message="working directory must be clean"
 	// +kubebuilder:validation:MaxLength=4096
 	// +optional
-	Cwd string `json:"cwd,omitempty"`
+	WorkingDirectory string `json:"workingDirectory,omitempty"`
 }
 
 // EnvironmentSourceVersion identifies protected material without hashing values.
 type EnvironmentSourceVersion struct {
-	UID             string `json:"uid"`
+	// +required
+	UID string `json:"uid"`
+	// +required
 	ResourceVersion string `json:"resourceVersion"`
 }
 
 // EnvironmentStatus records identity, acknowledged intent and audit candidates.
 type EnvironmentStatus struct {
-	CreationAttempted   bool   `json:"creationAttempted,omitempty"`
-	OwnerScope          string `json:"ownerScope,omitempty"`
-	CreationName        string `json:"creationName,omitempty"`
-	OpenAITemplateID    string `json:"openaiTemplateID,omitempty"`
-	ConfigurationDigest string `json:"configurationDigest,omitempty"`
+	// +optional
+	SandboxPool         *SandboxPoolSnapshot `json:"sandboxPool,omitempty"`
+	CreationAttempted   bool                 `json:"creationAttempted,omitempty"`
+	OwnerScope          string               `json:"ownerScope,omitempty"`
+	CreationName        string               `json:"creationName,omitempty"`
+	OpenAITemplateID    string               `json:"openaiTemplateID,omitempty"`
+	ConfigurationDigest string               `json:"configurationDigest,omitempty"`
 	// TemplateConfigurationDigest excludes container size and local deletion policy.
 	TemplateConfigurationDigest string `json:"templateConfigurationDigest,omitempty"`
 	// +optional
@@ -339,10 +343,14 @@ type EnvironmentStatus struct {
 	// Audit candidates are never adopted automatically.
 	// +kubebuilder:validation:MaxItems=1000
 	// +optional
+	// +listType=set
+	// +kubebuilder:validation:items:MinLength=1
+	// +kubebuilder:validation:items:MaxLength=256
 	AuditCandidateIDs []string `json:"auditCandidateIDs,omitempty"`
 	// +listType=map
 	// +listMapKey=type
 	// +optional
+	// +kubebuilder:validation:MaxItems=16
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
 }
 

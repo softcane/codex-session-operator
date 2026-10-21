@@ -1,0 +1,130 @@
+# Administrator recipe; replace digests, repository and storage class.
+apiVersion: extensions.agents.x-k8s.io/v1beta1
+kind: SandboxTemplate
+metadata:
+  name: codex-workspace-v1
+  namespace: codex-session-operator-system
+  labels:
+    agents.softcane.io/managed: 'true'
+spec:
+  envVarsInjectionPolicy: Allowed
+  service: false
+  podTemplate:
+    spec:
+      automountServiceAccountToken: false
+      restartPolicy: Always
+      terminationGracePeriodSeconds: 10
+      nodeSelector:
+        kubernetes.io/arch: amd64
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      initContainers:
+      - name: repository-prepare
+        image: registry.example/executor@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+        imagePullPolicy: IfNotPresent
+        command:
+        - /workspace-bootstrap
+        args:
+        - --storage-root
+        - /workspace-storage
+        - --session-uid
+        - $(SESSION_UID)
+        - --url
+        - https://github.com/example/project.git
+        - --commit
+        - bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+        env:
+        - name: TMPDIR
+          value: /tmp
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop:
+            - ALL
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+          limits:
+            cpu: '1'
+            memory: 512Mi
+        volumeMounts:
+        - name: workspace
+          mountPath: /workspace-storage
+        - name: tmp
+          mountPath: /tmp
+      containers:
+      - name: executor
+        image: registry.example/executor@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+        imagePullPolicy: IfNotPresent
+        workingDir: /workspace
+        command:
+        - codex
+        - exec-server
+        args:
+        - --remote
+        - $(CODEX_REMOTE_URL)
+        - --environment-id
+        - $(CODEX_ENVIRONMENT_ID)
+        env:
+        - name: CODEX_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: codex-executor
+              key: CODEX_API_KEY
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop:
+            - ALL
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+          limits:
+            cpu: '1'
+            memory: 512Mi
+        volumeMounts:
+        - name: workspace
+          mountPath: /workspace
+          subPath: project
+        - name: home
+          mountPath: /home/node
+        - name: tmp
+          mountPath: /tmp
+      volumes:
+      - name: home
+        emptyDir:
+          sizeLimit: 128Mi
+      - name: tmp
+        emptyDir:
+          sizeLimit: 1Gi
+  volumeClaimTemplates:
+  - metadata:
+      name: workspace
+    spec:
+      accessModes:
+      - ReadWriteOnce
+      storageClassName: approved-storage-class
+      resources:
+        requests:
+          storage: 1Gi
+---
+apiVersion: extensions.agents.x-k8s.io/v1beta1
+kind: SandboxWarmPool
+metadata:
+  name: codex-workspace-v1
+  namespace: codex-session-operator-system
+  labels:
+    agents.softcane.io/managed: 'true'
+spec:
+  replicas: 0
+  sandboxTemplateRef:
+    name: codex-workspace-v1

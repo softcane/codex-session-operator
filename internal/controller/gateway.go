@@ -67,7 +67,7 @@ func (r *SessionReconciler) gatewayAgentBlock(ctx context.Context, fields map[st
 }
 
 func (r *SessionReconciler) initialGatewayInput(ctx context.Context, s *agentsv1alpha1.Session, snapshot *agentsv1alpha1.SessionEnvironmentSnapshot) (string, string, error) {
-	if snapshot == nil || snapshot.Profile.Mode != _noneMode {
+	if snapshot == nil || snapshot.Profile.Mode != agentsv1alpha1.EnvironmentModeNone {
 		return "", "", nil
 	}
 	if r.Gateway == nil || r.InitialSessions == nil {
@@ -78,7 +78,7 @@ func (r *SessionReconciler) initialGatewayInput(ctx context.Context, s *agentsv1
 
 func (r *SessionReconciler) sessionGatewayBlock(ctx context.Context, remote openaiapi.Session, environment *agentsv1alpha1.SessionEnvironmentSnapshot) (string, string) {
 	if r.Gateway == nil {
-		return sessionAgentBlock(remote, environment)
+		return agentEnvironmentBlock(remote.AgentConfiguration, environment)
 	}
 	return r.gatewayAgentBlock(ctx, remote.AgentConfiguration, environment)
 }

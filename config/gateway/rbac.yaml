@@ -52,6 +52,21 @@ rules:
   - ""
   resources:
   - pods
+  - persistentvolumeclaims
+  verbs:
+  - get
+- apiGroups:
+  - extensions.agents.x-k8s.io
+  resources:
+  - sandboxclaims
+  - sandboxwarmpools
+  - sandboxtemplates
+  verbs:
+  - get
+- apiGroups:
+  - agents.x-k8s.io
+  resources:
+  - sandboxes
   verbs:
   - get
 ---

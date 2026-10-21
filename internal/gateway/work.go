@@ -94,10 +94,10 @@ func (g *Gateway) syncWork(ctx context.Context, id string) error {
 	if err := checkWorkOwnership(record, attempt, &session); err != nil {
 		return err
 	}
-	if attempt.SessionUID == "" || attempt.Phase != session.Status.Phase {
+	if attempt.SessionUID == "" || attempt.Phase != sessionDisplayPhase(&session) {
 		if err := g.store.Update(ctx, id, func(r *Record) error {
 			r.Work.Attempts[len(r.Work.Attempts)-1].SessionUID = string(session.UID)
-			r.Work.Attempts[len(r.Work.Attempts)-1].Phase = session.Status.Phase
+			r.Work.Attempts[len(r.Work.Attempts)-1].Phase = sessionDisplayPhase(&session)
 			return nil
 		}); err != nil {
 			return err
@@ -258,22 +258,6 @@ func (g *Gateway) workRecord(ctx context.Context, session *agentsv1alpha1.Sessio
 		}
 	}
 	return Record{}, false, nil
-}
-
-func (g *Gateway) workSessionOpen(ctx context.Context, session *agentsv1alpha1.Session) error {
-	record, found, err := g.workRecord(ctx, session)
-	if err != nil || !found {
-		return err
-	}
-	if record.Work == nil || record.Work.State != _workOpen || len(record.Work.Attempts) == 0 {
-		return errClosed
-	}
-	attempt := record.Work.Attempts[len(record.Work.Attempts)-1]
-	if !attempt.CreationClaimed || !attempt.InitialQueued || attempt.Cleaned ||
-		attempt.SessionUID == "" || !session.DeletionTimestamp.IsZero() {
-		return errUnavailable
-	}
-	return checkWorkOwnership(record, attempt, session)
 }
 
 func (g *Gateway) validateWorkSession(ctx context.Context, session *agentsv1alpha1.Session, environment *agentsv1alpha1.SessionEnvironmentSnapshot) error {

@@ -91,7 +91,7 @@ func (g *Gateway) observeConversation(ctx context.Context, record Record) conver
 	if attempt.SessionUID == "" || string(session.UID) != attempt.SessionUID || session.Annotations[_workAnnotation] != work.ID {
 		return summary
 	}
-	summary.Phase = session.Status.Phase
+	summary.Phase = sessionDisplayPhase(&session)
 	summary.SessionURL = "/v1/namespaces/" + record.Namespace + "/sessions/" + attempt.SessionName
 	return summary
 }

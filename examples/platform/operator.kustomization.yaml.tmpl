@@ -29,10 +29,7 @@ patches:
             imagePullPolicy: IfNotPresent
             env:
             - {name: OPENAI_AGENT_OWNER_SCOPE, value: '${OWNER_SCOPE}'}
-            - {name: EXECUTOR_IMAGES, value: '${EXECUTOR_IMAGE}'}
-            - {name: CAPABILITY_IMAGES, value: '${SKILLS_IMAGE}'}
-            - {name: WORKSPACE_STORAGE_CLASSES, value: '${STORAGE_CLASS}'}
-            - {name: REPOSITORY_URLS, value: '${REPOSITORY_URL}'}
+            - {name: SANDBOX_POOLS, value: 'my-go-project-v1'}
             resources:
               limits:
                 memory: 512Mi

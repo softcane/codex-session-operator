@@ -4,11 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"testing"
+
+	agentsv1alpha1 "github.com/softcane/codex-session-operator/api/v1alpha1"
 )
 
 const (
 	_testWorkRouteID   = _profileTestName
-	_testWorkUnlimited = "unlimited"
+	_testWorkUnlimited = agentsv1alpha1.SessionSpendModeUnlimited
 	_testWorkOther     = "other"
 	_testWorkPhase     = "Ready"
 )

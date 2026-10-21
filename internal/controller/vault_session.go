@@ -29,8 +29,8 @@ var _ SessionConfigurationProvider = (*openaiapi.Client)(nil)
 
 const (
 	deletePolicy           = "Delete"
-	spendModeLimited       = "limited"
-	spendModeUnlimited     = "unlimited"
+	spendModeLimited       = agentsv1alpha1.SessionSpendModeLimited
+	spendModeUnlimited     = agentsv1alpha1.SessionSpendModeUnlimited
 	spendUnavailableReason = "SpendControlUnavailable"
 )
 
@@ -38,7 +38,7 @@ func spendControlDigest(spec *agentsv1alpha1.SessionSpendControl) string {
 	if spec == nil {
 		return ""
 	}
-	value := spec.Mode
+	value := string(spec.Mode)
 	if spec.LimitCents != nil {
 		value += ":" + strconv.FormatInt(*spec.LimitCents, 10)
 	}
@@ -233,12 +233,12 @@ func resolveSessionCredentials(credentials []agentsv1alpha1.VaultCredential, env
 			}
 			credential := c.Spec.Auth.EnvironmentVariable
 			hosted := environment.Profile.OpenAIHosted
-			if names[credential.SecretName] {
-				return "Attached hosted credentials require unique secret names"
+			if names[credential.VariableName] {
+				return "Attached hosted credentials require unique variable names"
 			}
-			names[credential.SecretName] = true
+			names[credential.VariableName] = true
 			for _, entry := range hosted.Env {
-				if entry.Name == credential.SecretName {
+				if entry.Name == credential.VariableName {
 					return "Hosted credential name conflicts with Environment env"
 				}
 			}
@@ -347,13 +347,16 @@ func (r *SessionReconciler) syncSessionSettings(ctx context.Context, s *agentsv1
 		return ctrl.Result{}, false, nil
 	}
 	base := s.DeepCopy()
+	setRemoteSessionCondition(s, metav1.ConditionTrue, "RemoteSessionCreated", remoteSessionExistsMessage)
 	if spend.changed {
 		s.Status.SpendControlAttemptedDigest = spendControlDigest(s.Spec.SpendControl)
 	} else if spend.present && spendControlMatches(s.Spec.SpendControl, remote) {
 		s.Status.SpendControlAttemptedDigest = ""
 	}
 	s.Status.ManagedMetadataKeys = pendingMetadataKeys(s.Spec.Metadata, remote.Metadata, s.Status.ManagedMetadataKeys)
-	setState(s, "Updating", metav1.ConditionFalse, "UpdatingSession", "Supported settings for subsequent turns are pending")
+	setState(s, metav1.ConditionFalse, "UpdatingSession", "Supported settings for subsequent turns are pending")
+	meta.SetStatusCondition(&s.Status.Conditions, metav1.Condition{Type: "ConfigurationCurrent", Status: metav1.ConditionFalse,
+		Reason: "UpdatingSession", Message: "Supported settings for subsequent turns are pending", ObservedGeneration: s.Generation})
 	if err := r.patchStatus(ctx, s, base); err != nil {
 		return ctrl.Result{}, true, err
 	}

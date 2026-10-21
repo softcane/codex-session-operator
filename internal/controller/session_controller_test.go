@@ -11,7 +11,6 @@ import (
 	. "github.com/onsi/gomega"
 	agentsv1alpha1 "github.com/softcane/codex-session-operator/api/v1alpha1"
 	"github.com/softcane/codex-session-operator/internal/openaiapi"
-	"github.com/softcane/codex-session-operator/internal/sandbox"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -33,6 +32,7 @@ type sessionProviderStub struct {
 	loseResponse     bool
 	hideDiscovery    bool
 	deleteFailure    bool
+	getFailure       error
 	onCreate         func()
 }
 
@@ -53,6 +53,9 @@ func (p *sessionProviderStub) createSession(uid, workspace string) (openaiapi.Se
 func (p *sessionProviderStub) GetSession(_ context.Context, id string) (openaiapi.Session, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if p.getFailure != nil {
+		return openaiapi.Session{}, p.getFailure
+	}
 	if p.remote.ID != id || id == "" {
 		return openaiapi.Session{}, openaiapi.ErrNotFound
 	}
@@ -129,52 +132,8 @@ type staleClient struct {
 }
 
 type currentSessionDependencies struct {
-	agent        *agentsv1alpha1.Agent
-	environment  *agentsv1alpha1.Environment
-	agents       *agentProviderStub
-	environments *environmentProviderStub
-}
-
-func readySelfHostedSessionDependencies(namespace string) *currentSessionDependencies {
-	agent := &agentsv1alpha1.Agent{ObjectMeta: metav1.ObjectMeta{GenerateName: "session-agent-", Namespace: namespace},
-		Spec: agentsv1alpha1.AgentSpec{Model: openaiapi.SessionModel, DeletionPolicy: deletePolicy}}
-	environment := &agentsv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{GenerateName: "session-environment-", Namespace: namespace},
-		Spec: agentsv1alpha1.EnvironmentSpec{Mode: testSelfHostedMode, DeletionPolicy: deletePolicy,
-			SelfHosted: &agentsv1alpha1.SelfHostedEnvironment{Image: testExecutorImage, Architecture: "amd64",
-				WorkspaceDirectory: defaultWorkspace, WorkspaceSize: "1Gi",
-				WorkspaceStorage: &agentsv1alpha1.WorkspaceStorage{Type: sandbox.WorkspaceStorageEphemeral}}}}
-	Expect(k8sClient.Create(ctx, agent)).To(Succeed())
-	Expect(k8sClient.Create(ctx, environment)).To(Succeed())
-	for _, object := range []client.Object{environment, agent} {
-		DeferCleanup(func() {
-			current := object.DeepCopyObject().(client.Object)
-			if err := k8sClient.Get(ctx, client.ObjectKeyFromObject(object), current); apierrors.IsNotFound(err) {
-				return
-			} else {
-				Expect(err).NotTo(HaveOccurred())
-			}
-			current.SetFinalizers(nil)
-			Expect(k8sClient.Update(ctx, current)).To(Succeed())
-			Expect(client.IgnoreNotFound(k8sClient.Delete(ctx, current))).To(Succeed())
-		})
-	}
-	agents := &agentProviderStub{}
-	environments := &environmentProviderStub{}
-	agentController := &AgentReconciler{Client: k8sClient, APIReader: k8sClient, OpenAI: agents, OwnerScope: testAgentScope}
-	environmentController := &EnvironmentReconciler{Client: k8sClient, APIReader: k8sClient, OpenAI: environments,
-		OwnerScope: testAgentScope, ExecutorImages: []string{testExecutorImage}}
-	for _, value := range []struct {
-		reconciler reconcile.Reconciler
-		object     client.Object
-	}{{agentController, agent}, {environmentController, environment}} {
-		for range 3 {
-			_, err := value.reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(value.object)})
-			Expect(err).NotTo(HaveOccurred())
-		}
-	}
-	Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(agent), agent)).To(Succeed())
-	Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(environment), environment)).To(Succeed())
-	return &currentSessionDependencies{agent: agent, environment: environment, agents: agents, environments: environments}
+	agent       *agentsv1alpha1.Agent
+	environment *agentsv1alpha1.Environment
 }
 
 func currentSessionSpec(dependencies *currentSessionDependencies) agentsv1alpha1.SessionSpec {
@@ -271,7 +230,7 @@ var _ = Describe("Remote Session lifecycle", func() {
 		first := read()
 		Expect(first.Status.OpenAISessionID).To(Equal(provider.remote.ID))
 		Expect(first.Status.EnvironmentID).To(Equal("env_test"))
-		Expect(first.Status.Phase).To(Equal("Ready"))
+		Expect(meta.IsStatusConditionTrue(first.Status.Conditions, readyCondition)).To(BeTrue())
 		Expect(meta.FindStatusCondition(first.Status.Conditions, "Ready").Status).To(Equal(metav1.ConditionTrue))
 		for range 5 {
 			Expect(step()).To(Succeed())
@@ -309,7 +268,7 @@ var _ = Describe("Remote Session lifecycle", func() {
 			Expect(step()).To(Succeed())
 		}
 		Expect(read().Finalizers).To(ContainElement(sessionFinalizer))
-		Expect(read().Status.Phase).To(Equal("Terminating"))
+		Expect(read().DeletionTimestamp.IsZero()).To(BeFalse())
 		Expect(provider.creates).To(Equal(1))
 		Expect(provider.deletes).To(BeZero())
 		provider.hideDiscovery = false
@@ -383,6 +342,7 @@ var _ = Describe("Remote Session lifecycle", func() {
 		}}
 		Expect(step()).NotTo(Succeed())
 		Expect(read().Finalizers).To(ContainElement(sessionFinalizer))
+		Expect(meta.IsStatusConditionFalse(read().Status.Conditions, "RemoteSessionCreated")).To(BeTrue())
 		Expect(step()).To(Succeed())
 		Expect(provider.deletes).To(Equal(1))
 		Expect(read().Finalizers).To(ConsistOf(otherTestFinalizer))

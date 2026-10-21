@@ -78,7 +78,7 @@ def run(checks, api, base, report, replace_gateway, fixture_counts):
         print("Scenario passed:", identifier, flush=True)
 
     session_spec = {"agentRef": {"name": "later-agent"}, "environmentRef": {"name": "later-env"},
-                    "spendControl": {"mode": "unlimited"}}
+                    "spendControl": {"mode": "Unlimited"}}
     apply("Session", "late-session", session_spec)
     held = reason("Session", "late-session", "EnvironmentNotReady")
     ensure(not held.get("status", {}).get("creationAttempted") and counts()["creates"] == 0,
@@ -86,7 +86,7 @@ def run(checks, api, base, report, replace_gateway, fixture_counts):
     apply("Agent", "later-agent", {"model": "gpt-6-luna", "name": "original name", "instructions": "original instruction",
                                   "tools": [], "deletionPolicy": "Delete"})
     agent = ready("Agent", "later-agent")
-    apply("Environment", "later-env", {"mode": "none", "deletionPolicy": "Delete"})
+    apply("Environment", "later-env", {"mode": "None", "deletionPolicy": "Delete"})
     ready("Environment", "later-env")
     reason("Session", "late-session", "GatewayInputRequired")
     ensure(counts()["creates"] == 0, "None mode created without durable initial input")
@@ -169,7 +169,7 @@ def run(checks, api, base, report, replace_gateway, fixture_counts):
     vault = ready("Vault", "lifecycle-vault")
     checks.secret("codex-vault", {"test-token": "lifecycle-secret-v1"})
     apply("VaultCredential", "lifecycle-credential", {"vaultRef": {"name": "lifecycle-vault"}, "name": "Lifecycle credential",
-          "auth": {"type": "environment_variable", "environmentVariable": {"secretName": "LIFECYCLE_TOKEN",
+          "auth": {"type": "environment_variable", "environmentVariable": {"variableName": "LIFECYCLE_TOKEN",
                    "secretValueSecretRef": {"name": "codex-vault", "key": "test-token"},
                    "networking": {"type": "limited", "allowedHosts": ["example.com"]}}}, "deletionPolicy": "Delete"})
     credential = ready("VaultCredential", "lifecycle-credential")
@@ -194,7 +194,7 @@ def run(checks, api, base, report, replace_gateway, fixture_counts):
     checks.kubectl("delete", "vault/lifecycle-vault", "-n", NS, "--wait=true", "--timeout=120s")
     passed("external_vault_and_credential_delete", "Each original identity remains claimed; explicit CR cleanup completes")
 
-    apply("Environment", "hosted-template", {"mode": "openaiHosted", "deletionPolicy": "Delete",
+    apply("Environment", "hosted-template", {"mode": "OpenAIHosted", "deletionPolicy": "Delete",
           "openaiHosted": {"name": "scenario", "containerSize": "small", "network": {"access": "disabled"}}})
     hosted = ready("Environment", "hosted-template")
     tid = hosted["status"]["openaiTemplateID"]

@@ -1,4 +1,4 @@
-"""Deployed production CLI + private journal + HTTPS gateway + PostgreSQL journey."""
+"""Deployed production CLI + private journal + HTTP gateway + PostgreSQL journey."""
 
 import hashlib
 import json
@@ -8,28 +8,28 @@ import support
 NS, ensure = support.NS, support.ensure
 
 
-def private_paths(directory, token, text, certificate):
+def private_paths(directory, text, certificate):
     """Canonicalize owned evidence paths before the CLI rejects symlink ancestors."""
     private = (directory / "cli").resolve()
     private.mkdir(mode=0o700)
-    token_file, text_file, state = private / "gateway-token", private / "task.txt", private / "operations"
-    token_file.write_text(token + "\n")
-    token_file.chmod(0o600)
+    text_file, state = private / "task.txt", private / "operations"
     text_file.write_text(text)
     text_file.chmod(0o600)
-    return private, token_file, text_file, state, certificate.resolve()
+    return private, text_file, state, certificate.resolve() if certificate else None
 
 
-def run(checks, api, base, directory, token, certificate, report, evidence, run_id, replace_gateway, fixture_counts):
+def run(checks, api, base, directory, certificate, report, evidence, run_id, replace_gateway, fixture_counts):
     name = "cli-journey"
     route = {"id": name, "namespace": NS, "agent": "demo-investigator-v1", "environment": "demo-text-v1",
-             "spend_control": {"mode": "limited", "limitCents": 500}}
+             "spend_control": {"mode": "Limited", "limitCents": 500}}
     support.apply_profile(checks, route)
-    private, token_file, text_file, state, certificate = private_paths(
-        directory, token, "CLI_INITIAL_" + run_id + ": observe the supplied evidence.\n", certificate)
+    private, text_file, state, certificate = private_paths(
+        directory, "CLI_INITIAL_" + run_id + ": observe the supplied evidence.\n", certificate)
     binary = support.ROOT / "bin/gateway-client"
-    prefix = [str(binary), "--origin", api.base, "--namespace", NS, "--token-file", str(token_file),
-              "--ca-file", str(certificate), "--state-dir", str(state)]
+    prefix = [str(binary), "--origin", api.base, "--namespace", NS,
+              "--state-dir", str(state)]
+    if certificate:
+        prefix += ["--ca-file", str(certificate)]
 
     def invoke(*arguments, allowed=(0,)):
         raw = checks.run(["env", "KUBECONFIG=" + str(private / "no-kubernetes-credentials"), *prefix, *arguments],

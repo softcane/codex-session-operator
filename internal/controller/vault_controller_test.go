@@ -30,7 +30,7 @@ const (
 	testStaticBearerType   = "static_bearer"
 	testMetadataPreserved  = "preserved"
 	testMetadataOne        = "one"
-	testUnlimitedSpendMode = "unlimited"
+	testUnlimitedSpendMode = agentsv1alpha1.SessionSpendModeUnlimited
 	testLimitedMode        = "limited"
 	testEnvironmentOrigin  = "environment"
 )
@@ -539,7 +539,7 @@ var _ = Describe("Vault and protected credential lifecycle", func() {
 		Expect(k8sClient.Create(ctx, fresh)).To(Succeed())
 		var stored agentsv1alpha1.VaultCredential
 		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(fresh), &stored)).To(Succeed())
-		Expect(stored.Spec.DeletionPolicy).To(Equal(deletePolicy))
+		Expect(stored.Spec.DeletionPolicy).To(Equal(agentsv1alpha1.DeletionPolicyDelete))
 		Expect(stored.Status.OpenAICredentialID).To(BeEmpty())
 		stored.Status.OpenAICredentialID = "status-writer"
 		Expect(k8sClient.Status().Update(ctx, &stored)).To(Succeed())
@@ -563,7 +563,7 @@ var _ = Describe("Vault and protected credential lifecycle", func() {
 		credential := readCredential()
 		credential.Spec.Auth.Type = "environment_variable"
 		credential.Spec.Auth.StaticBearer = nil
-		credential.Spec.Auth.EnvironmentVariable = &agentsv1alpha1.VaultEnvironmentVariable{SecretName: "TEST_TOKEN", SecretValueSecretRef: agentsv1alpha1.CredentialSecretReference{Name: openaiapi.VaultSecretName, Key: testVaultTokenKey}, Networking: agentsv1alpha1.VaultCredentialNetworking{Type: "unrestricted"}}
+		credential.Spec.Auth.EnvironmentVariable = &agentsv1alpha1.VaultEnvironmentVariable{VariableName: "TEST_TOKEN", SecretValueSecretRef: agentsv1alpha1.CredentialSecretReference{Name: openaiapi.VaultSecretName, Key: testVaultTokenKey}, Networking: agentsv1alpha1.VaultCredentialNetworking{Type: "unrestricted"}}
 		Expect(k8sClient.Update(ctx, credential)).NotTo(Succeed())
 	})
 })

@@ -28,7 +28,7 @@ const (
 	_scenarioForeignRemote         = "foreign-remote"
 	_scenarioOperator              = "operator"
 	_scenarioOwnerScope            = "scope-a"
-	_scenarioLimited               = "limited"
+	_scenarioLimited               = agentsv1alpha1.SessionSpendModeLimited
 	_scenarioRemoteMissing         = "RemoteSessionMissing"
 )
 
@@ -76,7 +76,7 @@ func scenarioPendingAction() openaiapi.PendingAction {
 
 func scenarioRecover(t *testing.T, g *Gateway, store Storage, p *simulator) {
 	t.Helper()
-	if response := request(g, http.MethodGet, _scenarioSessionPath, _token, "", ""); response.Code != http.StatusOK {
+	if response := request(g, http.MethodGet, _scenarioSessionPath, "", ""); response.Code != http.StatusOK {
 		t.Fatalf("bind Session: %d %s", response.Code, response.Body.String())
 	}
 	if err := g.recover(t.Context(), _testUID, p.history, false); err != nil {
@@ -93,12 +93,12 @@ func scenarioRecover(t *testing.T, g *Gateway, store Storage, p *simulator) {
 func scenarioMutation(g *Gateway, kind string) *httptest.ResponseRecorder {
 	switch kind {
 	case _scenarioMessage:
-		return request(g, http.MethodPost, _testMessagePath, _token, "scenario-message", `{"text":"new input"}`)
+		return request(g, http.MethodPost, _testMessagePath, "scenario-message", `{"text":"new input"}`)
 	case _scenarioCancel:
-		return request(g, http.MethodPost, _scenarioSessionPath+"/cancel", _token, "scenario-cancel", `{"turn_id":"turn-1"}`)
+		return request(g, http.MethodPost, _scenarioSessionPath+"/cancel", "scenario-cancel", `{"turn_id":"turn-1"}`)
 	default:
 		return request(g, http.MethodPost, _scenarioSessionPath+"/actions/"+actionID(scenarioPendingAction()),
-			_token+"-approver", "", `{"decision":"approve"}`)
+			"", `{"decision":"approve"}`)
 	}
 }
 
@@ -159,7 +159,7 @@ func TestScenarioGatewayRejectsWritesToUnreadyRemoteSession(t *testing.T) {
 					if !reflect.DeepEqual(before.Submissions, after.Submissions) || !reflect.DeepEqual(before.Actions, after.Actions) || p.posts != 0 {
 						t.Fatal("rejected mutation changed durable input or actions")
 					}
-					if response := request(g, http.MethodGet, _scenarioSessionPath+"/history", _token, "", ""); response.Code != http.StatusOK {
+					if response := request(g, http.MethodGet, _scenarioSessionPath+"/history", "", ""); response.Code != http.StatusOK {
 						t.Fatal("unready Session lost saved history", response.Code)
 					}
 				})
@@ -212,7 +212,7 @@ func TestScenarioGatewayConsoleDeletionRetainsHistoryAndJoinsStream(t *testing.T
 			t.Fatal("known missing remote accepts", kind, response.Code)
 		}
 	}
-	if response := request(g, http.MethodGet, _scenarioSessionPath+"/history", _token, "", ""); response.Code != http.StatusOK || !strings.Contains(response.Body.String(), _testRemoteID) {
+	if response := request(g, http.MethodGet, _scenarioSessionPath+"/history", "", ""); response.Code != http.StatusOK || !strings.Contains(response.Body.String(), _testRemoteID) {
 		t.Fatal("console deletion made retained history unreadable", response.Code, response.Body.String())
 	}
 	if err := g.sync(t.Context(), _testUID); err != nil || provider.reads != 1 || p.commits != 1 {
@@ -273,7 +273,7 @@ func TestScenarioGatewayControllerFirstRemoteDeletionSealsConversation(t *testin
 			t.Fatal("sealed identity accepted mutation", kind, response.Code)
 		}
 	}
-	if response := request(g, http.MethodGet, _scenarioSessionPath+"/history", _token, "", ""); response.Code != http.StatusOK || !strings.Contains(response.Body.String(), _testRemoteID) {
+	if response := request(g, http.MethodGet, _scenarioSessionPath+"/history", "", ""); response.Code != http.StatusOK || !strings.Contains(response.Body.String(), _testRemoteID) {
 		t.Fatal("controller-first deletion lost historical reads", response.Code)
 	}
 	if err := g.sync(t.Context(), _testUID); err != nil || provider.reads != 0 {
@@ -326,7 +326,7 @@ func TestScenarioGatewayDeletingCRRetainsSavedHistory(t *testing.T) {
 	if err := g.sync(t.Context(), _testUID); err != nil {
 		t.Fatal(err)
 	}
-	if response := request(g, http.MethodGet, _scenarioSessionPath+"/history", _token, "", ""); response.Code != http.StatusOK || !strings.Contains(response.Body.String(), _testRemoteID) {
+	if response := request(g, http.MethodGet, _scenarioSessionPath+"/history", "", ""); response.Code != http.StatusOK || !strings.Contains(response.Body.String(), _testRemoteID) {
 		t.Fatal("deleting Session cannot read saved history", response.Code, response.Body.String())
 	}
 	if response := scenarioMutation(g, _scenarioMessage); response.Code != http.StatusGone {
@@ -419,7 +419,7 @@ func TestScenarioGatewayDefiniteUnsafeObservationPausesQueuedInputAndApprovedAct
 func TestScenarioGatewaySpendVerificationPausesTurnsAndAllowsTargetCancellation(t *testing.T) {
 	tests := []struct {
 		name   string
-		mode   string
+		mode   agentsv1alpha1.SessionSpendMode
 		reason string
 		digest string
 	}{

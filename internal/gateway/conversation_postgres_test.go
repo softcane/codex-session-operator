@@ -25,7 +25,7 @@ func reopenConversationStore(t *testing.T, dsn string) *PostgreSQLStore {
 	return store
 }
 
-func TestPostgreSQLConversationConcurrentAcceptanceAndSubjectScope(t *testing.T) {
+func TestPostgreSQLConversationConcurrentAcceptanceAndServiceReplayScope(t *testing.T) {
 	store, dsn := postgresForTest(t)
 	other := reopenConversationStore(t, dsn)
 	first, firstWriter, firstProvider := profileConversationGateway(t, store)
@@ -74,14 +74,15 @@ func TestPostgreSQLConversationConcurrentAcceptanceAndSubjectScope(t *testing.T)
 			t.Fatalf("changed creation identity got %d: %s", response.Code, response.Body.String())
 		}
 	}
-	response := request(second, http.MethodPost, _conversationPath, _token+"-approver", "create-once", _postgresConversationInput)
+	second.subject = "second-service"
+	response := request(second, http.MethodPost, _conversationPath, "create-once", _postgresConversationInput)
 	scoped := readConversationReceipt(t, response)
 	if scoped.ConversationID == original.ConversationID {
-		t.Fatal("creation key was shared across subjects")
+		t.Fatal("creation key was shared across service replay identities")
 	}
-	response = request(second, http.MethodGet, original.ConversationURL, _token+"-approver", "", "")
+	response = request(second, http.MethodGet, original.ConversationURL, "", "")
 	if response.Code != http.StatusOK {
-		t.Fatal("namespace-authorized subject could not read a conversation", response.Code)
+		t.Fatal("service client could not read a conversation", response.Code)
 	}
 	summaries, err := store.RecordSummaries(t.Context(), _testNamespace, "conversation")
 	if err != nil || len(summaries) != 2 || len(summaries[0].Work.Events) != 0 || len(summaries[1].Work.Events) != 0 {
@@ -430,12 +431,7 @@ func TestPostgreSQLConversationListPaginatesAttemptsWithinNamespace(t *testing.T
 			t.Fatal(err)
 		}
 	}
-	principals, err := copyPrincipals([]Principal{{Token: _token + "-other", Subject: _testConversationSubject, Namespace: _testWorkOther}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	g.principals = append(g.principals, principals...)
-	other := readConversationReceipt(t, request(g, http.MethodPost, "/v1/namespaces/other/conversations", _token+"-other", "other-page", `{"route_id":"payments","text":"Other namespace"}`))
+	other := readConversationReceipt(t, request(g, http.MethodPost, "/v1/namespaces/other/conversations", "other-page", `{"route_id":"payments","text":"Other namespace"}`))
 	page, err := store.ListConversationAttempts(t.Context(), _testNamespace, "", 2)
 	if err != nil || len(page) != 3 {
 		t.Fatal("first page did not return two entries and lookahead", err)

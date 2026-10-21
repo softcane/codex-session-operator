@@ -8,10 +8,10 @@ If private reporting is unavailable, open an issue asking for a private disclosu
 
 ## Deployment boundaries
 
-The operator controls provider resources and may launch executor Pods. Treat its Kubernetes permissions, approved image digests, storage classes, environment profiles and gateway routing policy as administrative configuration. Use a separate restricted executor credential. Keep credentials in Kubernetes Secrets or mounted secret files, and run the gateway over TLS with authenticated, namespace scoped principals.
+The controller manages provider identities and Session-owned SandboxClaims. Agent Sandbox creates executor Pods and workspace PVCs from administrator-approved templates and pools. Treat Kubernetes permissions, pool approval, immutable template configuration and gateway exposure as administrative configuration. Use a separate restricted executor credential and keep credentials in Kubernetes Secrets or mounted secret files. Deployment owners provide gateway access control and any required TLS termination; the gateway itself does not authenticate callers or enforce user roles.
 
-The gateway database contains conversation inputs, approvals, receipts and history. Restrict access, secure connections, and protect backups accordingly. A gateway principal's namespace permission allows access to conversations in that namespace; caller identity alone does not make a conversation private to one user.
+The gateway database contains conversation inputs, approvals, receipts and history. Restrict access, secure connections, and protect backups accordingly. All callers who can reach a namespace's gateway routes share access to its conversations. The gateway's service replay subject is not a user identity or isolation boundary.
 
-Redact secrets and private content before sharing logs or reports. Do not commit credential files, local kubeconfigs, generated demo credentials or database backups. The no-key demo uses simulated provider responses and generated local credentials; use it as a local playground.
+Redact secrets and private content before sharing logs or reports. Do not commit credential files, local kubeconfigs, generated demo credentials or database backups. The no-key demo uses simulated provider responses and isolated local infrastructure; use it as a local playground.
 
 CI runs dependency checksum verification, Go linting, race tests and reachable vulnerability scanning. Release manifests use immutable operator and executor image digests. These checks support review; deployment owners must also maintain their Kubernetes cluster, PostgreSQL, credentials and network policies.

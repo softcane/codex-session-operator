@@ -1,20 +1,16 @@
+# Install sandbox_template.yaml in the same namespace and approve codex-workspace-v1.
+# Both cleanup policies use persistent storage: Delete removes the Sandbox and
+# files on Session close; Retain leaves a suspended Sandbox and its files.
 apiVersion: agents.softcane.io/v1alpha1
 kind: Environment
 metadata:
   name: environment-local
 spec:
-  mode: selfHosted
+  mode: SelfHosted
   deletionPolicy: Delete
   selfHosted:
-    # Replace with an image approved through EXECUTOR_IMAGES.
-    image: registry.example/executor@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
-    architecture: arm64
-    workspaceDirectory: /workspace
-    workspaceSize: 1Gi
-    workspaceStorage:
-      type: Ephemeral
-    resources:
-      cpuRequest: 100m
-      cpuLimit: "1"
-      memoryRequest: 128Mi
-      memoryLimit: 512Mi
+    sandboxPoolRef:
+      name: codex-workspace-v1
+    workspace:
+      directory: /workspace
+      deletionPolicy: Delete

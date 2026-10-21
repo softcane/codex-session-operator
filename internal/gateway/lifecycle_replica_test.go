@@ -7,7 +7,6 @@ import (
 	"testing"
 
 	agentsv1alpha1 "github.com/softcane/codex-session-operator/api/v1alpha1"
-	"github.com/softcane/codex-session-operator/internal/sandbox"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
@@ -22,25 +21,20 @@ func TestConversationComputeReadinessDoesNotDependOnHTTPReplicaStreamOwnership(t
 	}
 	record := readWorkRecord(t, store, id)
 	current := workerWorkSession(t, writer, record)
-	prepared, preparedPod := executionSessionAndPod(t)
+	prepared, _ := executionSessionAndPod(t)
 	prepared.ObjectMeta = *current.ObjectMeta.DeepCopy()
 	prepared.Generation = 1
 	prepared.Spec = current.Spec
-	prepared.Status.PodName = sandbox.PodName(prepared)
 	prepared.Status.EnvironmentSnapshot.Name = _profileTestEnvironment
 	prepared.Status.EnvironmentSnapshot.UID = _profileTestEnvironmentUID
+	prepared, pod := prepareExecutionSession(t, prepared)
 	if err := writer.Update(t.Context(), prepared); err != nil {
 		t.Fatal(err)
 	}
-	pod, err := sandbox.Pod(prepared, "/workspace", prepared.Status.WorkspacePreparation.ConfigDigest)
-	if err != nil {
-		t.Fatal(err)
-	}
-	pod.UID = preparedPod.UID
-	pod.Status = preparedPod.Status
-	pod.OwnerReferences = currentOwner(prepared)
-	if err := writer.Client.Create(t.Context(), pod); err != nil {
-		t.Fatal(err)
+	for _, object := range executionObjects(t, prepared, pod)[1:] {
+		if err := writer.Client.Create(t.Context(), object); err != nil {
+			t.Fatal(err)
+		}
 	}
 	provider, ok := leader.provider.(*simulator)
 	if !ok {
@@ -50,8 +44,7 @@ func TestConversationComputeReadinessDoesNotDependOnHTTPReplicaStreamOwnership(t
 	if err := leader.sync(t.Context(), string(prepared.UID)); err != nil {
 		t.Fatal(err)
 	}
-	follower, err := New(store, writer, provider, []Principal{{Token: _token,
-		Subject: _testConversationSubject, Namespace: _testNamespace}}, nil)
+	follower, err := New(store, writer, provider, "writer", nil)
 	if err != nil || follower.EnableProfiles(writer) != nil {
 		t.Fatal(err)
 	}

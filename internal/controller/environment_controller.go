@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"reflect"
+	"slices"
 	"strings"
 	"time"
 
@@ -14,6 +15,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
+	sandboxextensions "sigs.k8s.io/agent-sandbox/extensions/api/v1beta1"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -26,7 +28,7 @@ import (
 const (
 	creationOutcomeUnknownReason = "CreationOutcomeUnknown"
 	invalidConfigurationReason   = "InvalidConfiguration"
-	openaiHostedMode             = "openaiHosted"
+	openaiHostedMode             = "OpenAIHosted"
 	environmentNotReadyReason    = "EnvironmentNotReady"
 	remoteFailedStatus           = "failed"
 	defaultWorkspace             = "/workspace"
@@ -53,20 +55,18 @@ var (
 type EnvironmentReconciler struct {
 	client.Client
 
-	APIReader                        client.Reader
-	OpenAI                           TemplateProvider
-	OwnerScope                       string
-	GatewayEnabled                   bool
-	ExecutorImages, CapabilityImages []string
-	WorkspaceStorageClasses          []string
-	RepositoryURLs                   []string
+	APIReader      client.Reader
+	OpenAI         TemplateProvider
+	OwnerScope     string
+	GatewayEnabled bool
+	SandboxPools   []string
 }
 
 // +kubebuilder:rbac:groups=agents.softcane.io,resources=environments,verbs=get;list;watch;patch
 // +kubebuilder:rbac:groups=agents.softcane.io,resources=environments/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=agents.softcane.io,resources=environments/finalizers,verbs=update;patch
 // +kubebuilder:rbac:groups="",resources=secrets,resourceNames=codex-environment,verbs=get;list;watch
-// +kubebuilder:rbac:groups="",resources=secrets,resourceNames=codex-repository,verbs=get;list;watch
+// +kubebuilder:rbac:groups=extensions.agents.x-k8s.io,resources=sandboxwarmpools;sandboxtemplates,verbs=get;list;watch
 
 func (r *EnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	var environment agentsv1alpha1.Environment
@@ -82,7 +82,7 @@ func (r *EnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		}
 		return r.finalizeEnvironment(ctx, &environment)
 	}
-	if environment.Spec.Mode == _noneMode && !r.GatewayEnabled {
+	if environment.Spec.Mode == agentsv1alpha1.EnvironmentModeNone && !r.GatewayEnabled {
 		return r.environmentProblem(ctx, &environment, "GatewayRequired", "None environments require initial gateway input", nil)
 	}
 	if environment.Status.OwnerScope != "" && environment.Status.OwnerScope != r.OwnerScope {
@@ -96,43 +96,30 @@ func (r *EnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		controllerutil.AddFinalizer(&environment, environmentFinalizer)
 		return ctrl.Result{RequeueAfter: time.Second}, r.Patch(ctx, &environment, environmentPatch(base))
 	}
-	if environment.Spec.Mode == _noneMode {
+	if environment.Spec.Mode == agentsv1alpha1.EnvironmentModeNone {
 		base := environment.DeepCopy()
 		environment.Status.OwnerScope = r.OwnerScope
 		environment.Status.ConfigurationDigest = openaiapi.EnvironmentDigest(environment.Spec, nil)
 		environmentCondition(&environment, metav1.ConditionTrue, "GatewayProfileValidated", "None mode waits for initial input in the durable gateway store")
 		return ctrl.Result{RequeueAfter: observationInterval}, r.patchEnvironmentStatus(ctx, &environment, base)
 	}
-	if environment.Spec.Mode == "selfHosted" {
-		if err := sandbox.ValidateProfile(environment.Spec.SelfHosted, r.ExecutorImages, r.CapabilityImages, r.WorkspaceStorageClasses); err != nil {
-			return r.environmentProblem(ctx, &environment, invalidConfigurationReason, err.Error(), nil)
+	if environment.Spec.Mode == "SelfHosted" {
+		if environment.Spec.SelfHosted == nil || !slices.Contains(r.SandboxPools, environment.Spec.SelfHosted.SandboxPoolRef.Name) {
+			return r.environmentProblem(ctx, &environment, invalidConfigurationReason, "Sandbox pool must be approved by the operator", nil)
 		}
-		if err := sandbox.ValidateRepositoryApproval(environment.Spec.SelfHosted.Repository, r.RepositoryURLs); err != nil {
-			return r.environmentProblem(ctx, &environment, invalidConfigurationReason, err.Error(), nil)
-		}
-		sourceVersion, err := readRepositorySource(ctx, r.reader(), environment.Namespace, environment.Spec.SelfHosted.Repository)
+		pool, err := sandbox.ResolvePool(ctx, r.reader(), environment.Namespace, environment.Spec.SelfHosted)
 		if err != nil {
-			return r.environmentProblem(ctx, &environment, "ProtectedSourceUnavailable", "Protected repository source is unavailable or invalid", err)
+			return r.environmentProblem(ctx, &environment, invalidConfigurationReason, "Sandbox pool or template is unavailable or invalid", err)
 		}
 		base := environment.DeepCopy()
 		environment.Status.OwnerScope = r.OwnerScope
-		environment.Status.SourceVersion = sourceVersion
-		environment.Status.ConfigurationDigest = openaiapi.EnvironmentDigest(environment.Spec, sourceVersion)
-		environmentCondition(&environment, metav1.ConditionTrue, "ProfileValidated", "Local profile is validated; each Session owns its compute")
+		environment.Status.SourceVersion = nil
+		environment.Status.SandboxPool = pool
+		environment.Status.ConfigurationDigest = openaiapi.SandboxEnvironmentDigest(environment.Spec, pool)
+		environmentCondition(&environment, metav1.ConditionTrue, "ProfileValidated", "Sandbox pool and template are validated; each Session requests its own Sandbox")
 		return ctrl.Result{RequeueAfter: observationInterval}, r.patchEnvironmentStatus(ctx, &environment, base)
 	}
 	return r.reconcileHostedEnvironment(ctx, &environment)
-}
-
-func readRepositorySource(ctx context.Context, reader client.Reader, namespace string, repository *agentsv1alpha1.RepositorySpec) (*agentsv1alpha1.EnvironmentSourceVersion, error) {
-	if repository == nil || repository.CredentialSecretRef == nil {
-		return nil, nil
-	}
-	var secret corev1.Secret
-	if err := reader.Get(ctx, client.ObjectKey{Namespace: namespace, Name: sandbox.RepositorySecretName}, &secret); err != nil {
-		return nil, errors.New("protected repository source could not be read")
-	}
-	return sandbox.RepositoryCredentialSource(repository, &secret)
 }
 
 func (r *EnvironmentReconciler) reconcileHostedEnvironment(ctx context.Context, environment *agentsv1alpha1.Environment) (ctrl.Result, error) {
@@ -340,15 +327,15 @@ func (r *EnvironmentReconciler) releaseEnvironment(ctx context.Context, environm
 }
 
 const protectedEnvironmentIndex = "spec.openaiHosted.protectedSource"
-const protectedRepositoryIndex = "spec.selfHosted.repositoryCredentialSource"
+const sandboxPoolIndex = "spec.selfHosted.sandboxPoolRef.name"
 
 func (r *EnvironmentReconciler) SetupWithManager(mgr ctrl.Manager) error {
-	if err := mgr.GetFieldIndexer().IndexField(context.Background(), &agentsv1alpha1.Environment{}, protectedRepositoryIndex, func(obj client.Object) []string {
+	if err := mgr.GetFieldIndexer().IndexField(context.Background(), &agentsv1alpha1.Environment{}, sandboxPoolIndex, func(obj client.Object) []string {
 		environment, ok := obj.(*agentsv1alpha1.Environment)
-		if !ok || environment.Spec.SelfHosted == nil || environment.Spec.SelfHosted.Repository == nil || environment.Spec.SelfHosted.Repository.CredentialSecretRef == nil {
+		if !ok || environment.Spec.SelfHosted == nil {
 			return nil
 		}
-		return []string{sandbox.RepositorySecretName}
+		return []string{environment.Spec.SelfHosted.SandboxPoolRef.Name}
 	}); err != nil {
 		return err
 	}
@@ -361,8 +348,6 @@ func (r *EnvironmentReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	}); err != nil {
 		return err
 	}
-	// Kubernetes field selectors have no OR for two Secret names. A separate
-	// manager-owned cache keeps both watches restricted to their respective names.
 	protectedCache, err := cache.New(mgr.GetConfig(), cache.Options{Scheme: mgr.GetScheme(), ReaderFailOnMissingInformer: true,
 		ByObject: map[client.Object]cache.ByObject{&corev1.Secret{}: {Field: fields.OneTermEqualSelector("metadata.name", openaiapi.EnvironmentSecretName)}}})
 	if err != nil {
@@ -371,29 +356,36 @@ func (r *EnvironmentReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	if err := mgr.Add(protectedCache); err != nil {
 		return err
 	}
-	repositoryCache, err := cache.New(mgr.GetConfig(), cache.Options{Scheme: mgr.GetScheme(), ReaderFailOnMissingInformer: true,
-		ByObject: map[client.Object]cache.ByObject{&corev1.Secret{}: {Field: fields.OneTermEqualSelector("metadata.name", sandbox.RepositorySecretName)}}})
-	if err != nil {
-		return err
-	}
-	if err := mgr.Add(repositoryCache); err != nil {
-		return err
-	}
 	return ctrl.NewControllerManagedBy(mgr).For(&agentsv1alpha1.Environment{}).
 		Watches(&agentsv1alpha1.Session{}, handler.EnqueueRequestsFromMapFunc(sessionEnvironmentRequests)).
 		WatchesRawSource(source.Kind(protectedCache, &corev1.Secret{}, handler.TypedEnqueueRequestsFromMapFunc(r.protectedEnvironmentRequests))).
-		WatchesRawSource(source.Kind(repositoryCache, &corev1.Secret{}, handler.TypedEnqueueRequestsFromMapFunc(r.protectedRepositoryRequests))).
+		Watches(&sandboxextensions.SandboxWarmPool{}, handler.EnqueueRequestsFromMapFunc(r.sandboxPoolRequests)).
+		Watches(&sandboxextensions.SandboxTemplate{}, handler.EnqueueRequestsFromMapFunc(r.sandboxTemplateRequests)).
 		Named("environment").Complete(r)
 }
 
-func (r *EnvironmentReconciler) protectedRepositoryRequests(ctx context.Context, secret *corev1.Secret) []reconcile.Request {
+func (r *EnvironmentReconciler) sandboxPoolRequests(ctx context.Context, pool client.Object) []reconcile.Request {
 	var environments agentsv1alpha1.EnvironmentList
-	if err := r.List(ctx, &environments, client.InNamespace(secret.Namespace), client.MatchingFields{protectedRepositoryIndex: sandbox.RepositorySecretName}); err != nil {
+	if err := r.List(ctx, &environments, client.InNamespace(pool.GetNamespace()), client.MatchingFields{sandboxPoolIndex: pool.GetName()}); err != nil {
 		return nil
 	}
 	requests := make([]reconcile.Request, 0, len(environments.Items))
 	for i := range environments.Items {
 		requests = append(requests, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(&environments.Items[i])})
+	}
+	return requests
+}
+
+func (r *EnvironmentReconciler) sandboxTemplateRequests(ctx context.Context, template client.Object) []reconcile.Request {
+	var pools sandboxextensions.SandboxWarmPoolList
+	if err := r.List(ctx, &pools, client.InNamespace(template.GetNamespace())); err != nil {
+		return nil
+	}
+	var requests []reconcile.Request
+	for i := range pools.Items {
+		if pools.Items[i].Spec.TemplateRef.Name == template.GetName() {
+			requests = append(requests, r.sandboxPoolRequests(ctx, &pools.Items[i])...)
+		}
 	}
 	return requests
 }

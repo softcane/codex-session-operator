@@ -7,9 +7,12 @@ import secrets
 import uuid
 
 import support
+import sandbox_resources
 
 NS, ensure = support.NS, support.ensure
 REPOSITORY_HOST = "repository-fixture." + NS + ".svc"
+POOL_NAMES = ("sandbox-delete", "sandbox-retain", "sandbox-missing-commit", "sandbox-rejected-auth",
+              "sandbox-interrupted-command", "sandbox-rejected-executor-grant", "sandbox-unreachable-git", "sandbox-denied-egress")
 PUBLIC_URL = "https://" + REPOSITORY_HOST + "/public.git"
 PRIVATE_URL = "https://" + REPOSITORY_HOST + "/private.git"
 UNREACHABLE_URL = "https://unreachable-repository-fixture." + NS + ".svc/public.git"
@@ -82,8 +85,7 @@ def install(checks, fixture, evidence):
     checks.run(["docker", "exec", checks.cluster + "-control-plane", "ctr", "-n", "k8s.io", "images", "tag",
                 "docker.io/library/" + fixture["executor"], image])
     architecture = checks.run(["docker", "image", "inspect", fixture["executor"], "--format", "{{.Architecture}}"])
-    checks.kubectl("set", "env", "deployment/" + support.DEPLOYMENT, "-n", NS, "EXECUTOR_IMAGES=" + image,
-                    "WORKSPACE_STORAGE_CLASSES=standard", "REPOSITORY_URLS=" + ",".join((PUBLIC_URL, PRIVATE_URL, UNREACHABLE_URL)))
+    checks.kubectl("set", "env", "deployment/" + support.DEPLOYMENT, "-n", NS, "SANDBOX_POOLS=" + ",".join(POOL_NAMES))
     checks.kubectl("rollout", "status", "deployment/" + support.DEPLOYMENT, "-n", NS, "--timeout=180s")
     return image, architecture, repository_request(checks, "/manifest")
 
@@ -94,28 +96,25 @@ def provider_control(checks, body):
 
 
 def profile(checks, name, image, architecture, commit, policy="Delete", private=False, repository_url=None):
-    repository = {"url": repository_url or (PRIVATE_URL if private else PUBLIC_URL), "commit": commit}
-    if private:
-        repository["credentialSecretRef"] = {"name": "codex-repository", "key": "token"}
-    storage = {"type": "Ephemeral"} if policy == "Ephemeral" else {
-        "type": "Persistent", "storageClassName": "standard", "claimDeletionPolicy": policy}
+    for resource in sandbox_resources.resources(name, NS, image, architecture,
+            repository_url or (PRIVATE_URL if private else PUBLIC_URL), commit,
+            private=private, fixture=True):
+        checks.apply(resource)
     checks.apply({"apiVersion": "agents.softcane.io/v1alpha1", "kind": "Environment", "metadata": {"name": name, "namespace": NS},
-                  "spec": {"mode": "selfHosted", "deletionPolicy": "Delete", "selfHosted": {"image": image,
-                    "architecture": architecture, "workspaceDirectory": "/workspace", "workspaceSize": "1Gi",
-                    "workspaceStorage": storage, "repository": repository}}})
+                  "spec": {"mode": "SelfHosted", "deletionPolicy": "Delete", "selfHosted": {
+                      "sandboxPoolRef": {"name": name}, "workspace": {"directory": "/workspace", "deletionPolicy": "Retain" if policy == "Retain" else "Delete"}}}})
     checks.wait("Environment/" + name + " current Ready", lambda: support.current_ready(checks.get("environment", name)), 180)
     support.apply_profile(checks, {"id": name, "namespace": NS, "agent": "demo-investigator-v1", "environment": name,
-                                  "spend_control": {"mode": "limited", "limitCents": 500}})
+                                  "spend_control": {"mode": "Limited", "limitCents": 500}})
 
 
-def binding(checks, detail, image, expected_commit, persistent=True):
+def binding(checks, detail, image, expected_commit):
     summary = detail["summary"]
     session = checks.get("session", summary["session_name"])
     ensure(session and session["metadata"]["uid"] == summary["session_uid"], "Conversation Session identity mismatch")
     pod = checks.get("pod", session["status"]["podName"])
     ensure(support.prepared_executor(detail, session, pod), "Executor eligibility proof does not match the current process instance")
-    ensure(pod and any(owner.get("controller") and owner["uid"] == summary["session_uid"]
-                      for owner in pod["metadata"].get("ownerReferences", [])), "Executor is not controlled by this Session UID")
+    support.sandbox_chain(checks, session, pod)
     spec, container = pod["spec"], pod["spec"]["containers"][0]
     ensure(container["image"] == image and spec["automountServiceAccountToken"] is False and
            spec["securityContext"]["runAsNonRoot"] and container["securityContext"]["readOnlyRootFilesystem"] and
@@ -130,10 +129,9 @@ def binding(checks, detail, image, expected_commit, persistent=True):
            "Executor project subtree is not isolated from preparation provenance")
     head = support.read_only_exec(checks, pod["metadata"]["name"], "git", "rev-parse", "HEAD")
     ensure(head == expected_commit, "Initial prepared repository commit differs")
-    claim = checks.get("pvc", "workspace-" + summary["session_uid"]) if persistent else None
-    if persistent:
-        ensure(claim and claim["metadata"]["uid"] == session["status"]["workspaceClaimUID"] and claim["status"]["phase"] == "Bound",
-               "Frozen workspace UID or binding differs")
+    claim = support.workspace_claim(checks, session, pod)
+    ensure(claim and claim["metadata"]["uid"] == session["status"]["workspaceClaimUID"] and claim["status"]["phase"] == "Bound",
+           "Frozen workspace UID or binding differs")
     return session, pod, claim
 
 
@@ -156,7 +154,7 @@ def run(checks, api, base, report, evidence, runtime, replace_gateway, fixture_c
         value = detail(path)
         return value if value and support.cleaned_up(value) else None
 
-    for policy, private in (("Delete", False), ("Retain", True), ("Ephemeral", False)):
+    for policy, private in (("Delete", False), ("Retain", True)):
         name = "sandbox-" + policy.lower()
         commit = commits["private" if private else "public"]
         profile(checks, name, image, architecture, commit, policy, private)
@@ -193,7 +191,7 @@ def run(checks, api, base, report, evidence, runtime, replace_gateway, fixture_c
         completed = checks.wait("saved simulated root and actual Pod command", lambda: value if
                                (value := detail(path)) and support.completed_history(value, 1) else None, 240)
         current_detail, _, _ = support.wait_executor(checks, lambda: detail(path), "current executor after completed root")
-        session, pod, claim = binding(checks, current_detail, image, commit, policy != "Ephemeral")
+        session, pod, claim = binding(checks, current_detail, image, commit)
         findings = json.loads(support.read_only_exec(checks, pod_name, "cat", "/workspace/fixture-report.json"))
         ensure(findings["nonce"] == nonce and findings["test_exit"] == 1 and "1099" in findings["output"] and "1000" in findings["output"],
                "Actual executor file/test output differs from the independent fixture oracle")
@@ -210,21 +208,16 @@ def run(checks, api, base, report, evidence, runtime, replace_gateway, fixture_c
                                                         timeout=180, different_uid=before_uid)
         ensure(current["metadata"]["uid"] == session["metadata"]["uid"] and current["status"]["openaiSessionID"] == remote_id,
                "Executor replacement changed the local or remote Session")
-        if policy == "Ephemeral":
-            support.read_only_exec(checks, pod_name, "test", "!", "-e", "/workspace/proof.txt")
-            ensure(support.read_only_exec(checks, pod_name, "git", "rev-parse", "HEAD") == commit,
-                   "Ephemeral replacement did not independently prepare the pinned commit")
-        else:
-            ensure(current["status"]["workspaceClaimUID"] == claim["metadata"]["uid"], "Replacement changed the PVC UID")
-            ensure(support.read_only_exec(checks, pod_name, "cat", "/workspace/proof.txt") == nonce and
-                   support.read_only_exec(checks, pod_name, "git", "rev-parse", "HEAD") == later_commit and
-                   support.read_only_exec(checks, pod_name, "cat", "/workspace/dirty.txt") == "dirty-change",
-                   "Preparation overwrote persistent nonce, later commit, or dirty work")
-            support.read_only_exec(checks, pod_name, "test", "!", "-e", "/workspace/README.md")
-            ensure(api.request(path + "/messages", "POST", {"text": "SANDBOX_PROOF: continue after replacement"}, name + "-followup")[0] == 202,
-                   "Follow-up was not accepted")
-            checks.wait("new saved root after executor replacement", lambda: value if
-                        (value := detail(path)) and support.completed_history(value, 2) else None, 240)
+        ensure(current["status"]["workspaceClaimUID"] == claim["metadata"]["uid"], "Replacement changed the PVC UID")
+        ensure(support.read_only_exec(checks, pod_name, "cat", "/workspace/proof.txt") == nonce and
+               support.read_only_exec(checks, pod_name, "git", "rev-parse", "HEAD") == later_commit and
+               support.read_only_exec(checks, pod_name, "cat", "/workspace/dirty.txt") == "dirty-change",
+               "Preparation overwrote persistent nonce, later commit, or dirty work")
+        support.read_only_exec(checks, pod_name, "test", "!", "-e", "/workspace/README.md")
+        ensure(api.request(path + "/messages", "POST", {"text": "SANDBOX_PROOF: continue after replacement"}, name + "-followup")[0] == 202,
+               "Follow-up was not accepted")
+        checks.wait("new saved root after executor replacement", lambda: value if
+                    (value := detail(path)) and support.completed_history(value, 2) else None, 240)
         ensure(api.request(path + "/close", "POST", {}, name + "-close")[0] == 202, "Sandbox close was not accepted")
         checks.wait("sandbox closed and cleaned", lambda: closed(path), 240)
         ensure(checks.get("session", session_name) is None and checks.get("pod", pod_name) is None and
@@ -233,35 +226,33 @@ def run(checks, api, base, report, evidence, runtime, replace_gateway, fixture_c
             ensure(checks.get("pvc", claim["metadata"]["name"]) is None, "Delete policy left its workspace PVC")
         if policy == "Retain":
             retained = checks.get("pvc", claim["metadata"]["name"])
-            ensure(retained and retained["metadata"]["uid"] == claim["metadata"]["uid"] and not retained["metadata"].get("ownerReferences"),
-                   "Retain policy did not preserve its ownerless PVC")
+            ensure(retained and retained["metadata"]["uid"] == claim["metadata"]["uid"] and retained["metadata"].get("ownerReferences"),
+                   "Retain policy did not preserve its Sandbox-owned PVC")
+            support.retained_sandbox(checks, session)
             probe = read_only_probe(checks, image, claim["metadata"]["name"])
             ensure(support.read_only_exec(checks, probe, "cat", "/workspace/proof.txt", container="reader") == nonce,
                    "Independent read-only Pod could not recover retained files")
             checks.kubectl("delete", "pod", probe, "-n", NS, "--wait=true", "--timeout=90s")
-        if policy != "Ephemeral":
-            status, fresh = api.request(path + "/restart", "POST", {"text": "SANDBOX_PROOF: fresh workspace"}, name + "-fresh")
-            ensure(status == 202 and fresh["conversation_id"] != receipt["conversation_id"], "Start fresh reused conversation identity")
-            # Stop queued execution before seeding; this separately proves cleanup while input is queued.
-            fresh_path = fresh["conversation_url"]
-            mapping = checks.wait("fresh Session has independent mapping", lambda: value if
-                (value := detail(fresh_path)) and value["summary"].get("session_uid") else None)
-            fresh_session = checks.get("session", mapping["summary"]["session_name"])
-            ensure(fresh_session["metadata"]["uid"] != session["metadata"]["uid"], "Start fresh reused Session UID")
-            _, obj, _ = support.wait_executor(checks, lambda: detail(fresh_path), "fresh current prepared executor instance")
-            ensure(obj["status"]["openaiSessionID"] != remote_id and obj["status"]["workspaceClaimUID"] != claim["metadata"]["uid"],
-                   "Start fresh adopted a prior remote Session or PVC")
-            support.read_only_exec(checks, obj["status"]["podName"], "test", "!", "-e", "/workspace/dirty.txt")
-            ensure(support.read_only_exec(checks, obj["status"]["podName"], "git", "rev-parse", "HEAD") == commit,
-                   "Start fresh did not independently prepare its pinned repository")
-            ensure(api.request(fresh_path + "/close", "POST", {}, name + "-fresh-close")[0] == 202, "Fresh close failed")
-            checks.wait("fresh attempt cleaned", lambda: closed(fresh_path), 240)
-            if policy == "Retain":
-                for uid in (session["metadata"]["uid"], fresh_session["metadata"]["uid"]):
-                    owned = checks.get("pvc", "workspace-" + uid)
-                    ensure(owned and owned["metadata"].get("labels", {}).get("agents.softcane.io/session-uid") == uid,
-                           "Harness retained-claim cleanup refused a foreign UID")
-                    checks.kubectl("delete", "pvc", owned["metadata"]["name"], "-n", NS, "--wait=true", "--timeout=90s")
+        status, fresh = api.request(path + "/restart", "POST", {"text": "SANDBOX_PROOF: fresh workspace"}, name + "-fresh")
+        ensure(status == 202 and fresh["conversation_id"] != receipt["conversation_id"], "Start fresh reused conversation identity")
+        # Stop queued execution before seeding; this separately proves cleanup while input is queued.
+        fresh_path = fresh["conversation_url"]
+        mapping = checks.wait("fresh Session has independent mapping", lambda: value if
+            (value := detail(fresh_path)) and value["summary"].get("session_uid") else None)
+        fresh_session = checks.get("session", mapping["summary"]["session_name"])
+        ensure(fresh_session["metadata"]["uid"] != session["metadata"]["uid"], "Start fresh reused Session UID")
+        _, obj, _ = support.wait_executor(checks, lambda: detail(fresh_path), "fresh current prepared executor instance")
+        ensure(obj["status"]["openaiSessionID"] != remote_id and obj["status"]["workspaceClaimUID"] != claim["metadata"]["uid"],
+               "Start fresh adopted a prior remote Session or PVC")
+        support.read_only_exec(checks, obj["status"]["podName"], "test", "!", "-e", "/workspace/dirty.txt")
+        ensure(support.read_only_exec(checks, obj["status"]["podName"], "git", "rev-parse", "HEAD") == commit,
+               "Start fresh did not independently prepare its pinned repository")
+        ensure(api.request(fresh_path + "/close", "POST", {}, name + "-fresh-close")[0] == 202, "Fresh close failed")
+        checks.wait("fresh attempt cleaned", lambda: closed(fresh_path), 240)
+        if policy == "Retain":
+            for retained_session in (session, obj):
+                owned = support.retained_sandbox(checks, retained_session)
+                checks.kubectl("delete", "sandbox", owned["metadata"]["name"], "-n", NS, "--wait=true", "--timeout=90s")
         evidence.write(name + "-runtime-identities.json", {"sessionUID": session["metadata"]["uid"], "remoteID": remote_id,
             "oldPodUID": before_uid, "newPodUID": replacement["metadata"]["uid"], "pvcUID": claim["metadata"]["uid"] if claim else None,
             "initialCommit": commit, "laterCommit": later_commit, "reportSHA256": hashlib.sha256(json.dumps(findings, sort_keys=True).encode()).hexdigest()})

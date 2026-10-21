@@ -10,6 +10,7 @@ import (
 	. "github.com/onsi/gomega"
 	agentsv1alpha1 "github.com/softcane/codex-session-operator/api/v1alpha1"
 	"github.com/softcane/codex-session-operator/internal/openaiapi"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -44,7 +45,6 @@ func (p *configuredSessionStub) CreateConfiguredSession(_ context.Context, uid, 
 	remote.AgentConfiguration = openaiapi.EffectiveSessionAgent(map[string]any{agentModelField: openaiapi.SessionModel}, agent)
 	remote.Metadata, _ = openaiapi.VaultMetadata(metadata, nil, nil, uid, scope)
 	remote.Model, _ = remote.AgentConfiguration["model"].(string)
-	remote.AgentConfigurationDigest = openaiapi.AgentConfigurationDigest(remote.AgentConfiguration)
 	if spend != nil {
 		remote.SpendLimitCents = spend.LimitCents
 		remote.SpendControlObserved = spend.Mode == spendModeLimited
@@ -153,6 +153,23 @@ var _ = Describe("Session overrides and later-turn updates", func() {
 		Expect(lifecycle.remote.Metadata[testExternalMetadataKey]).To(Equal(testExternalMetadataValue))
 		Expect(lifecycle.remote.Metadata["owner_scope"]).To(Equal(testAgentScope))
 		Expect(meta.FindStatusCondition(read().Status.Conditions, "ConfigurationCurrent").Status).To(Equal(metav1.ConditionTrue))
+	})
+	It("refreshes remote existence after an outage even while supported updates fail", func() {
+		Expect(step()).To(Succeed())
+		Expect(step()).To(Succeed())
+		lifecycle.getFailure = errors.New("temporary provider observation outage")
+		Expect(step()).NotTo(Succeed())
+		Expect(meta.FindStatusCondition(read().Status.Conditions, "RemoteSessionCreated").Status).To(Equal(metav1.ConditionUnknown))
+		lifecycle.getFailure = nil
+		current := read()
+		current.Spec.SpendControl = &agentsv1alpha1.SessionSpendControl{Mode: spendModeLimited, LimitCents: new(int64(500))}
+		Expect(k8sClient.Update(ctx, current)).To(Succeed())
+		configured.rejectSpendUpdate = true
+		Expect(step()).NotTo(Succeed())
+		Expect(meta.IsStatusConditionTrue(read().Status.Conditions, "RemoteSessionCreated")).To(BeTrue())
+		Expect(step()).To(Succeed())
+		Expect(meta.IsStatusConditionTrue(read().Status.Conditions, "RemoteSessionCreated")).To(BeTrue())
+		Expect(lifecycle.creates).To(Equal(1))
 	})
 	It("observes committed mutable updates after lost response before retrying", func() {
 		Expect(step()).To(Succeed())
@@ -289,16 +306,16 @@ var _ = Describe("Session overrides and later-turn updates", func() {
 		Expect(configured.updates).To(Equal(1))
 		Expect(meta.FindStatusCondition(read().Status.Conditions, readyCondition).Reason).To(Equal(spendUnavailableReason))
 	})
-	It("reports creation-only edits explicitly and never replaces or updates those fields", func() {
+	It("rejects creation-only edits after claiming and retains the remote Session", func() {
 		Expect(step()).To(Succeed())
 		Expect(step()).To(Succeed())
 		frozen := read().Status.CreationAgentDigest
 		instructions := "changed instructions"
 		current := read()
 		current.Spec.Agent.Instructions = &instructions
-		Expect(k8sClient.Update(ctx, current)).To(Succeed())
+		Expect(apierrors.IsInvalid(k8sClient.Update(ctx, current))).To(BeTrue())
 		Expect(step()).To(Succeed())
-		Expect(meta.FindStatusCondition(read().Status.Conditions, "ConfigurationCurrent").Reason).To(Equal("RequiresNewSession"))
+		Expect(meta.IsStatusConditionTrue(read().Status.Conditions, "ConfigurationCurrent")).To(BeTrue())
 		Expect(read().Status.CreationAgentDigest).To(Equal(frozen))
 		Expect(configured.updates).To(BeZero())
 		Expect(lifecycle.creates).To(Equal(1))
@@ -315,7 +332,7 @@ var _ = Describe("Session overrides and later-turn updates", func() {
 		Expect(meta.FindStatusCondition(read().Status.Conditions, readyCondition).Reason).To(Equal("VaultNotReady"))
 	})
 	It("freezes resolved Ready Vault identities and source versions before POST", func() {
-		v := &agentsv1alpha1.Vault{ObjectMeta: metav1.ObjectMeta{GenerateName: "session-vault-", Namespace: s.Namespace}, Spec: agentsv1alpha1.VaultSpec{DeletionPolicy: "Delete"}}
+		v := &agentsv1alpha1.Vault{ObjectMeta: metav1.ObjectMeta{GenerateName: "session-vault-", Namespace: s.Namespace}, Spec: agentsv1alpha1.VaultSpec{DeletionPolicy: deletePolicy}}
 		Expect(k8sClient.Create(ctx, v)).To(Succeed())
 		p := &vaultProviderStub{}
 		vr := &VaultReconciler{Client: k8sClient, APIReader: k8sClient, OpenAI: p, OwnerScope: testAgentScope}
@@ -334,7 +351,7 @@ var _ = Describe("Session overrides and later-turn updates", func() {
 		frozen := read().Status.VaultSnapshots
 		current = read()
 		current.Spec.VaultRefs = nil
-		Expect(k8sClient.Update(ctx, current)).To(Succeed())
+		Expect(apierrors.IsInvalid(k8sClient.Update(ctx, current))).To(BeTrue())
 		Expect(step()).To(Succeed())
 		Expect(reflect.DeepEqual(frozen, read().Status.VaultSnapshots)).To(BeTrue())
 		Expect(lifecycle.creates).To(Equal(1))

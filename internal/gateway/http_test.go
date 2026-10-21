@@ -63,10 +63,7 @@ func TestGatewayListenersOnlyNegotiateHTTP1(t *testing.T) {
 			if name == "public" {
 				start = (&Server{Gateway: g, Address: address, CertFile: certFile, KeyFile: keyFile}).Start
 			} else {
-				handler, err := g.InternalHandler(_internalToken)
-				if err != nil {
-					t.Fatal(err)
-				}
+				handler := g.InternalHandler()
 				start = (&InternalServer{Handler: handler, Address: address, CertFile: certFile, KeyFile: keyFile}).Start
 				path, wantStatus = internalPath+"readyz", http.StatusNoContent
 			}
@@ -181,7 +178,7 @@ func TestOrdinaryResponseWriteDeadlineReleasesCapacity(t *testing.T) {
 	if err := clientSide.SetWriteDeadline(time.Now().Add(time.Second)); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := io.WriteString(clientSide, "GET /v1/namespaces/team/sessions/work HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer "+_token+"\r\n\r\n"); err != nil {
+	if _, err := io.WriteString(clientSide, "GET /v1/namespaces/team/sessions/work HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer "+_testAuthorizationValue+"\r\n\r\n"); err != nil {
 		t.Fatal(err)
 	}
 	// The client deliberately never reads its multi-megabyte response.
@@ -207,12 +204,12 @@ func (w *streamProbe) Write(data []byte) (int, error) {
 }
 func (w *streamProbe) Flush() { w.once.Do(func() { close(w.ready) }) }
 
-func openTestEvents(t *testing.T, g *Gateway, token string) (int, func()) {
+func openTestEvents(t *testing.T, g *Gateway, authorization string) (int, func()) {
 	t.Helper()
 	ctx, cancel := context.WithCancel(t.Context())
 	request := httptest.NewRequestWithContext(ctx, http.MethodGet,
 		"/v1/namespaces/team/sessions/work/events", nil)
-	request.Header.Set("Authorization", "Bearer "+token)
+	request.Header.Set("Authorization", "Bearer "+authorization)
 	w := &streamProbe{header: make(http.Header), ready: make(chan struct{})}
 	done := make(chan struct{})
 	go func() {
@@ -242,7 +239,7 @@ func TestEventStreamsLeaveMessageCapacity(t *testing.T) {
 	g, _ := testGateway(t, testStore(t), simulatorForTest(), testSession())
 	accepted := 0
 	for range 64 {
-		code, _ := openTestEvents(t, g, _token)
+		code, _ := openTestEvents(t, g, _testAuthorizationValue)
 		switch code {
 		case http.StatusOK:
 			accepted++
@@ -255,26 +252,20 @@ func TestEventStreamsLeaveMessageCapacity(t *testing.T) {
 	if accepted == 0 {
 		t.Fatal("no event stream was admitted")
 	}
-	if response := request(g, http.MethodPost, _testMessagePath, _token,
-		"streams-still-allow-messages", _testFirstMessageBody); response.Code != http.StatusAccepted {
+	if response := request(g, http.MethodPost, _testMessagePath, "streams-still-allow-messages", _testFirstMessageBody); response.Code != http.StatusAccepted {
 		t.Fatalf("event streams prevented a normal message: HTTP %d", response.Code)
 	}
-	if response := request(g, http.MethodGet, "/v1/namespaces/team/catalog", _token, "", ""); response.Code != http.StatusOK {
+	if response := request(g, http.MethodGet, "/v1/namespaces/team/catalog", "", ""); response.Code != http.StatusOK {
 		t.Fatalf("event streams prevented reading the catalog: HTTP %d", response.Code)
 	}
 }
 
-func TestEventStreamQuotaSharesRotatedTokensAndReleasesOnCancel(t *testing.T) {
+func TestEventStreamQuotaIsPerNamespaceAndReleasesOnCancel(t *testing.T) {
 	g, _ := testGateway(t, testStore(t), simulatorForTest(), testSession())
-	rotatedToken := _token + "-rotated"
-	rotated, err := copyPrincipals([]Principal{{Token: rotatedToken, Subject: "writer", Namespace: _testNamespace}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	g.principals = append(g.principals, rotated...)
+	changedAuthorization := _testAuthorizationValue + "-rotated"
 	var stopFirst func()
 	for i := range 4 {
-		code, stop := openTestEvents(t, g, _token)
+		code, stop := openTestEvents(t, g, _testAuthorizationValue)
 		if code != http.StatusOK {
 			t.Fatalf("stream %d rejected before its quota: HTTP %d", i, code)
 		}
@@ -282,14 +273,14 @@ func TestEventStreamQuotaSharesRotatedTokensAndReleasesOnCancel(t *testing.T) {
 			stopFirst = stop
 		}
 	}
-	if code, _ := openTestEvents(t, g, rotatedToken); code != http.StatusServiceUnavailable {
-		t.Fatalf("rotated token bypassed its principal quota: HTTP %d", code)
+	if code, _ := openTestEvents(t, g, changedAuthorization); code != http.StatusServiceUnavailable {
+		t.Fatalf("changed Authorization header bypassed its namespace quota: HTTP %d", code)
 	}
-	if code, _ := openTestEvents(t, g, _token+"-approver"); code != http.StatusOK {
-		t.Fatalf("one principal exhausted another principal's streams: HTTP %d", code)
+	if code, _ := openTestEvents(t, g, _testAuthorizationValue+"-different-header"); code != http.StatusServiceUnavailable {
+		t.Fatalf("headers bypassed namespace stream quota: HTTP %d", code)
 	}
 	stopFirst()
-	if code, _ := openTestEvents(t, g, rotatedToken); code != http.StatusOK {
+	if code, _ := openTestEvents(t, g, changedAuthorization); code != http.StatusOK {
 		t.Fatalf("canceled stream retained its quota: HTTP %d", code)
 	}
 }
@@ -302,7 +293,7 @@ func TestRemovedWorkAndIssueIngressRoutesAreNotServed(t *testing.T) {
 		"/v1/namespaces/team/work/old-id",
 		"/v1/issue-events/github/old-route",
 	} {
-		response := request(g, http.MethodPost, path, _token, "removed-route", `{}`)
+		response := request(g, http.MethodPost, path, "removed-route", `{}`)
 		if response.Code != http.StatusNotFound {
 			t.Fatalf("removed route %s returned %d", path, response.Code)
 		}

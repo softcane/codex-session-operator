@@ -1,289 +1,332 @@
 package controller
 
 import (
-	"strings"
+	"context"
+	"slices"
+	"testing"
 
-	. "github.com/onsi/ginkgo/v2"
-	. "github.com/onsi/gomega"
 	agentsv1alpha1 "github.com/softcane/codex-session-operator/api/v1alpha1"
-	"github.com/softcane/codex-session-operator/internal/openaiapi"
 	"github.com/softcane/codex-session-operator/internal/sandbox"
+	"github.com/softcane/codex-session-operator/internal/testutil"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	k8sruntime "k8s.io/apimachinery/pkg/runtime"
+	sandboxv1beta1 "sigs.k8s.io/agent-sandbox/api/v1beta1"
+	extensionsv1beta1 "sigs.k8s.io/agent-sandbox/extensions/api/v1beta1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
 
 const (
-	workspaceTestSize      = "2Gi"
-	workspaceTestSessionID = "sess_test"
-	workspaceTestArch      = "amd64"
-	workspaceTestClass     = "approved"
+	_workspaceLifecycleNamespace  = "workspace-lifecycle"
+	_workspaceLifecycleSession    = "session"
+	_workspaceLifecycleUID        = "session-uid"
+	_workspaceLifecycleConfig     = "source-config"
+	_workspaceLifecycleForeignUID = "foreign-uid"
 )
 
-var _ = Describe("Persistent Session workspaces (real Kubernetes API)", func() {
-	var session *agentsv1alpha1.Session
-	var reconciler *SessionReconciler
-	var provider *sessionProviderStub
-	var namespace string
+type workspaceLifecycleFixture struct {
+	reconciler *SessionReconciler
+	writer     *workspaceLifecycleClient
+	session    *agentsv1alpha1.Session
+	claim      *extensionsv1beta1.SandboxClaim
+	sandbox    *sandboxv1beta1.Sandbox
+	pod        *corev1.Pod
+	workspace  *corev1.PersistentVolumeClaim
+	template   *extensionsv1beta1.SandboxTemplate
+}
 
-	readSession := func() *agentsv1alpha1.Session {
-		current := &agentsv1alpha1.Session{}
-		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(session), current)).To(Succeed())
-		return current
+type workspaceLifecycleClient struct {
+	client.Client
+	deletions []client.DeleteOptions
+}
+
+func (c *workspaceLifecycleClient) Delete(ctx context.Context, object client.Object, options ...client.DeleteOption) error {
+	var applied client.DeleteOptions
+	for _, option := range options {
+		option.ApplyToDelete(&applied)
 	}
-	readClaim := func() *corev1.PersistentVolumeClaim {
-		claim := &corev1.PersistentVolumeClaim{}
-		Expect(k8sClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: sandbox.WorkspaceClaimNameForUID(string(session.UID))}, claim)).To(Succeed())
-		return claim
+	c.deletions = append(c.deletions, applied)
+	return c.Client.Delete(ctx, object, options...)
+}
+
+func newWorkspaceLifecycleFixture(t *testing.T, policy string) *workspaceLifecycleFixture {
+	t.Helper()
+	scheme := k8sruntime.NewScheme()
+	for _, register := range []func(*k8sruntime.Scheme) error{corev1.AddToScheme, agentsv1alpha1.AddToScheme, sandboxv1beta1.AddToScheme, extensionsv1beta1.AddToScheme} {
+		if err := register(scheme); err != nil {
+			t.Fatal(err)
+		}
 	}
-	makeSession := func(policy string) {
-		ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{GenerateName: "workspace-test-"}}
-		Expect(k8sClient.Create(ctx, ns)).To(Succeed())
-		namespace = ns.Name
-		session = &agentsv1alpha1.Session{ObjectMeta: metav1.ObjectMeta{Name: "workspace", Namespace: namespace, Finalizers: []string{sessionFinalizer}},
-			Spec: agentsv1alpha1.SessionSpec{AgentRef: &agentsv1alpha1.AgentReference{Name: "saved-agent"}, EnvironmentRef: &agentsv1alpha1.AgentReference{Name: "saved-environment"},
-				SpendControl: &agentsv1alpha1.SessionSpendControl{Mode: spendModeUnlimited}}}
-		Expect(k8sClient.Create(ctx, session)).To(Succeed())
-		agentConfiguration := map[string]any{agentModelField: openaiapi.SessionModel}
-		session.Status.EnvironmentSnapshot = &agentsv1alpha1.SessionEnvironmentSnapshot{Profile: agentsv1alpha1.EnvironmentSpec{Mode: testSelfHostedMode, DeletionPolicy: deletePolicy, SelfHosted: &agentsv1alpha1.SelfHostedEnvironment{
-			Image: testExecutorImage, Architecture: workspaceTestArch, WorkspaceDirectory: defaultWorkspace, WorkspaceSize: workspaceTestSize,
-			WorkspaceStorage: &agentsv1alpha1.WorkspaceStorage{Type: sandbox.WorkspaceStoragePersistent, StorageClassName: workspaceTestClass, ClaimDeletionPolicy: policy}}}}
-		session.Status.AgentSnapshot = &agentsv1alpha1.SessionAgentSnapshot{OpenAIAgentID: testAgentID,
-			Model: openaiapi.SessionModel, ConfigurationDigest: openaiapi.AgentConfigurationDigest(agentConfiguration)}
-		session.Status.CreationOnlyDigest = openaiapi.SessionCreationOnlyDigest(nil)
-		session.Status.CreationAgentDigest = openaiapi.SessionImmutableAgentDigest(agentConfiguration)
-		session.Status.OpenAISessionID = workspaceTestSessionID
-		session.Status.OwnerScope = testAgentScope
-		Expect(k8sClient.Status().Update(ctx, session)).To(Succeed())
-		session = readSession()
-		provider = &sessionProviderStub{remote: openaiapi.Session{ID: workspaceTestSessionID, OwnerUID: string(session.UID), OwnerScope: testAgentScope}}
-		reconciler = &SessionReconciler{Client: k8sClient, APIReader: k8sClient, Scheme: k8sClient.Scheme(), OpenAI: provider, WorkspaceStorageClasses: []string{workspaceTestClass}}
+	pool, template := testutil.NewSandboxPool(_workspaceLifecycleNamespace)
+	profile := &agentsv1alpha1.SelfHostedEnvironment{SandboxPoolRef: agentsv1alpha1.AgentReference{Name: pool.Name}, Workspace: agentsv1alpha1.SelfHostedWorkspace{Directory: defaultWorkspace, DeletionPolicy: agentsv1alpha1.DeletionPolicy(policy)}}
+	writer := &workspaceLifecycleClient{Client: fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&agentsv1alpha1.Session{}).WithObjects(pool, template).Build()}
+	poolSnapshot, err := sandbox.ResolvePool(t.Context(), writer, _workspaceLifecycleNamespace, profile)
+	if err != nil {
+		t.Fatal(err)
 	}
-	BeforeEach(func() { makeSession(retainPolicy) })
-	AfterEach(func() {
-		claim := &corev1.PersistentVolumeClaim{}
-		if err := k8sClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: sandbox.WorkspaceClaimNameForUID(string(session.UID))}, claim); err == nil {
-			claim.Finalizers = nil
-			Expect(k8sClient.Update(ctx, claim)).To(Succeed())
-			Expect(client.IgnoreNotFound(k8sClient.Delete(ctx, claim))).To(Succeed())
-		} else {
-			Expect(apierrors.IsNotFound(err)).To(BeTrue())
+	session := &agentsv1alpha1.Session{ObjectMeta: metav1.ObjectMeta{Name: _workspaceLifecycleSession, Namespace: _workspaceLifecycleNamespace, UID: _workspaceLifecycleUID}, Status: agentsv1alpha1.SessionStatus{
+		EnvironmentID: "environment-1", RemoteURL: "wss://example.test/executor", ExecutorConfigDigest: _workspaceLifecycleConfig,
+		EnvironmentSnapshot: &agentsv1alpha1.SessionEnvironmentSnapshot{Profile: agentsv1alpha1.EnvironmentSpec{Mode: testSelfHostedMode, SelfHosted: profile}, SandboxPool: poolSnapshot}}}
+	claim, err := sandbox.Claim(session, template, _workspaceLifecycleConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim.UID = "claim-uid"
+	claim.Status.SandboxStatus.Name = claim.Name
+	runtime := &sandboxv1beta1.Sandbox{ObjectMeta: metav1.ObjectMeta{Name: claim.Name, Namespace: session.Namespace, UID: "sandbox-uid",
+		OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(claim, extensionsv1beta1.GroupVersion.WithKind("SandboxClaim"))}},
+		Spec: sandboxv1beta1.SandboxSpec{OperatingMode: sandboxv1beta1.SandboxOperatingModeRunning, SandboxBlueprint: *sandbox.ExpectedBlueprint(template, claim)}}
+	pod, err := sandbox.ExpectedPod(runtime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pod.UID = "pod-uid"
+	pod.OwnerReferences = []metav1.OwnerReference{*metav1.NewControllerRef(runtime, sandboxv1beta1.GroupVersion.WithKind("Sandbox"))}
+	workspace := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: sandbox.WorkspaceClaimName(runtime), Namespace: session.Namespace, UID: "workspace-uid",
+		OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(runtime, sandboxv1beta1.GroupVersion.WithKind("Sandbox"))}}, Spec: *runtime.Spec.VolumeClaimTemplates[0].Spec.DeepCopy()}
+	session.Status.SandboxClaimName, session.Status.SandboxClaimUID = claim.Name, string(claim.UID)
+	session.Status.SandboxName, session.Status.SandboxUID = runtime.Name, string(runtime.UID)
+	session.Status.PodName, session.Status.ExecutorPodUID = pod.Name, string(pod.UID)
+	session.Status.WorkspaceClaimUID = string(workspace.UID)
+	for _, object := range []client.Object{session, claim, runtime, pod, workspace} {
+		if err := writer.Create(t.Context(), object); err != nil {
+			t.Fatal(err)
 		}
-		current := &agentsv1alpha1.Session{}
-		if err := k8sClient.Get(ctx, client.ObjectKeyFromObject(session), current); err == nil {
-			current.Finalizers = nil
-			Expect(k8sClient.Update(ctx, current)).To(Succeed())
-			Expect(client.IgnoreNotFound(k8sClient.Delete(ctx, current))).To(Succeed())
-		} else {
-			Expect(apierrors.IsNotFound(err)).To(BeTrue())
+	}
+	return &workspaceLifecycleFixture{reconciler: &SessionReconciler{Client: writer, APIReader: writer, Scheme: scheme}, writer: writer, session: session, claim: claim, sandbox: runtime, pod: pod, workspace: workspace, template: template}
+}
+
+func TestRetainedWorkspaceOrphansOnlyStoppedSandboxAndDeletesClaim(t *testing.T) {
+	fixture := newWorkspaceLifecycleFixture(t, sandbox.WorkspaceClaimRetain)
+	for range 2 {
+		pending, err := fixture.reconciler.finalizeWorkspaceClaim(t.Context(), fixture.session)
+		if err != nil || !pending {
+			t.Fatal("retention failed to wait for compute shutdown", pending, err)
 		}
-	})
-
-	It("freezes a claim UID before Pod creation and blocks silent workspace replacement", func() {
-		ready, committed, err := reconciler.reconcileWorkspaceClaim(ctx, session)
-		Expect(err).NotTo(HaveOccurred())
-		Expect(ready).To(BeFalse())
-		Expect(committed).To(BeTrue())
-		claim := readClaim()
-		Expect(claim.OwnerReferences).To(BeEmpty())
-		Expect(claim.Spec.StorageClassName).To(HaveValue(Equal(workspaceTestClass)))
-		Expect(claim.Spec.Resources.Requests.Storage().String()).To(Equal(workspaceTestSize))
-		Expect(session.Status.WorkspaceClaimUID).To(Equal(string(claim.UID)))
-		session = readSession()
-		ready, committed, err = reconciler.reconcileWorkspaceClaim(ctx, session)
-		Expect(err).NotTo(HaveOccurred())
-		Expect(ready).To(BeTrue()) // WaitForFirstConsumer classes bind after Pod scheduling.
-		Expect(committed).To(BeFalse())
-		// envtest does not run the PVC protection controller that would clear this finalizer.
-		claim.Finalizers = nil
-		Expect(k8sClient.Update(ctx, claim)).To(Succeed())
-		Expect(k8sClient.Delete(ctx, claim)).To(Succeed())
-		ready, committed, err = reconciler.reconcileWorkspaceClaim(ctx, session)
-		Expect(err).NotTo(HaveOccurred())
-		Expect(ready).To(BeFalse())
-		Expect(committed).To(BeFalse())
-		Expect(meta.FindStatusCondition(session.Status.Conditions, readyCondition).Reason).To(Equal("WorkspaceClaimMissing"))
-		Expect(apierrors.IsNotFound(k8sClient.Get(ctx, client.ObjectKeyFromObject(claim), &corev1.PersistentVolumeClaim{}))).To(BeTrue())
-	})
-
-	It("persists a recovered remote identity before a Retain workspace commits status", func() {
-		session.Status.OpenAISessionID = ""
-		session.Status.ExecutorImage = testExecutorImage
-		Expect(k8sClient.Status().Update(ctx, session)).To(Succeed())
-		secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: sandbox.ExecutorSecretName, Namespace: namespace},
-			Data: map[string][]byte{sandbox.ExecutorSecretKey: []byte("test-only-placeholder")}}
-		Expect(k8sClient.Create(ctx, secret)).To(Succeed())
-		reconciler.Connections = &connectionStub{state: openaiapi.Connection{Subscribed: true, Epoch: "recovered-stream"}}
-		remote := openaiapi.Session{
-			ID: workspaceTestSessionID, OwnerUID: string(session.UID), EnvironmentID: "env_test",
-			RemoteURL: "https://api.openai.com/v1/agents/api", WorkspaceDirectory: defaultWorkspace,
-			Model: openaiapi.SessionModel, SelfHosted: true, OwnerScope: testAgentScope, AgentID: testAgentID,
-			AgentConfiguration: map[string]any{agentModelField: openaiapi.SessionModel}, EnvironmentType: executorRuntimeSelfHostedType,
+		if err := fixture.writer.Get(t.Context(), client.ObjectKeyFromObject(fixture.sandbox), fixture.sandbox); err != nil {
+			t.Fatal(err)
 		}
-		_, err := reconciler.track(ctx, readSession(), remote)
-		Expect(err).NotTo(HaveOccurred())
-		stored := readSession()
-		Expect(stored.Status.WorkspaceClaimUID).To(Equal(string(readClaim().UID)))
-		Expect(stored.Status.OpenAISessionID).To(Equal(remote.ID))
-		Expect(stored.Status.EnvironmentID).To(Equal(remote.EnvironmentID))
-		Expect(stored.Status.RemoteURL).To(Equal(remote.RemoteURL))
-	})
-
-	It("admits only complete persistent and explicit ephemeral workspace settings", func() {
-		settings := []struct {
-			name    string
-			storage *agentsv1alpha1.WorkspaceStorage
-			valid   bool
-		}{
-			{name: "omitted-ephemeral", valid: true},
-			{name: "explicit-ephemeral", storage: &agentsv1alpha1.WorkspaceStorage{Type: sandbox.WorkspaceStorageEphemeral}, valid: true},
-			{name: "persistent", storage: &agentsv1alpha1.WorkspaceStorage{Type: sandbox.WorkspaceStoragePersistent, StorageClassName: workspaceTestClass, ClaimDeletionPolicy: retainPolicy}, valid: true},
-			{name: "missing-policy", storage: &agentsv1alpha1.WorkspaceStorage{Type: sandbox.WorkspaceStoragePersistent, StorageClassName: workspaceTestClass}},
-			{name: "ephemeral-with-class", storage: &agentsv1alpha1.WorkspaceStorage{Type: sandbox.WorkspaceStorageEphemeral, StorageClassName: workspaceTestClass}},
+		if fixture.sandbox.Spec.OperatingMode != sandboxv1beta1.SandboxOperatingModeSuspended || !metav1.IsControlledBy(fixture.sandbox, fixture.claim) {
+			t.Fatal("retention detached a sandbox while its Pod still exists")
 		}
-		for _, tt := range settings {
-			environment := &agentsv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{Name: tt.name, Namespace: namespace},
-				Spec: agentsv1alpha1.EnvironmentSpec{Mode: testSelfHostedMode, DeletionPolicy: deletePolicy, SelfHosted: &agentsv1alpha1.SelfHostedEnvironment{
-					Image: testExecutorImage, Architecture: workspaceTestArch, WorkspaceStorage: tt.storage}}}
-			err := k8sClient.Create(ctx, environment)
-			Expect(err == nil).To(Equal(tt.valid), tt.name)
+	}
+	if err := fixture.writer.Client.Delete(t.Context(), fixture.pod); err != nil {
+		t.Fatal(err)
+	}
+	pending, err := fixture.reconciler.finalizeWorkspaceClaim(t.Context(), fixture.session)
+	if err != nil || !pending {
+		t.Fatal("retention did not persist orphaning before claim deletion", err)
+	}
+	if err := fixture.writer.Get(t.Context(), client.ObjectKeyFromObject(fixture.sandbox), fixture.sandbox); err != nil {
+		t.Fatal(err)
+	}
+	if len(fixture.sandbox.OwnerReferences) != 0 || fixture.sandbox.Annotations[sandbox.WorkspaceRetainedAnnotation] != string(fixture.session.UID) {
+		t.Fatal("stopped sandbox was not durably retained")
+	}
+	if len(fixture.writer.deletions) != 0 {
+		t.Fatal("claim deleted before retained runtime was detached")
+	}
+	pending, err = fixture.reconciler.finalizeWorkspaceClaim(t.Context(), fixture.session)
+	if err != nil || !pending {
+		t.Fatal("claim cleanup was not requested", err)
+	}
+	assertWorkspaceClaimDeletion(t, fixture)
+	if err := fixture.writer.Get(t.Context(), client.ObjectKeyFromObject(fixture.claim), &extensionsv1beta1.SandboxClaim{}); !apierrors.IsNotFound(err) {
+		t.Fatal("live claim can recreate retained compute", err)
+	}
+	pending, err = fixture.reconciler.finalizeWorkspaceClaim(t.Context(), fixture.session)
+	if err != nil || pending {
+		t.Fatal("retained workspace cleanup never completed", err)
+	}
+	if err := fixture.writer.Get(t.Context(), client.ObjectKeyFromObject(fixture.workspace), fixture.workspace); err != nil {
+		t.Fatal("retained files were removed", err)
+	}
+	if !metav1.IsControlledBy(fixture.workspace, fixture.sandbox) {
+		t.Fatal("workspace lost its stopped sandbox owner")
+	}
+	if err := fixture.writer.Get(t.Context(), client.ObjectKeyFromObject(fixture.sandbox), fixture.sandbox); err != nil || fixture.sandbox.Spec.OperatingMode != sandboxv1beta1.SandboxOperatingModeSuspended {
+		t.Fatal("retained runtime disappeared or resumed", err)
+	}
+}
+
+func TestDeleteWorkspaceRequestsForegroundCascadeAndWaitsForAbsence(t *testing.T) {
+	fixture := newWorkspaceLifecycleFixture(t, sandbox.WorkspaceClaimDelete)
+	fixture.claim.Finalizers = []string{"test/foreground-cleanup"}
+	if err := fixture.writer.Update(t.Context(), fixture.claim); err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		pending, err := fixture.reconciler.finalizeWorkspaceClaim(t.Context(), fixture.session)
+		if err != nil || !pending {
+			t.Fatal("cleanup stopped waiting for foreground deletion", pending, err)
 		}
-	})
-
-	It("rejects a trailing hyphen capability name at Kubernetes admission", func() {
-		environment := &agentsv1alpha1.Environment{
-			ObjectMeta: metav1.ObjectMeta{Name: "capability-admission", Namespace: namespace},
-			Spec: agentsv1alpha1.EnvironmentSpec{Mode: testSelfHostedMode, DeletionPolicy: deletePolicy,
-				SelfHosted: &agentsv1alpha1.SelfHostedEnvironment{
-					Image: testExecutorImage, Architecture: workspaceTestArch,
-					WorkspaceStorage: &agentsv1alpha1.WorkspaceStorage{Type: sandbox.WorkspaceStorageEphemeral},
-					Capabilities:     []agentsv1alpha1.LocalCapability{{Name: "helper", Image: testExecutorImage, Path: "/capabilities/helper", Type: "skills"}},
-				},
-			},
+	}
+	assertWorkspaceClaimDeletion(t, fixture)
+	if len(fixture.writer.deletions) != 1 {
+		t.Fatal("repeated cleanup issued a second delete")
+	}
+	if err := fixture.writer.Get(t.Context(), client.ObjectKeyFromObject(fixture.claim), fixture.claim); err != nil || fixture.claim.DeletionTimestamp.IsZero() {
+		t.Fatal("claim was not held during cascade", err)
+	}
+	for _, object := range []client.Object{fixture.pod, fixture.workspace, fixture.sandbox} {
+		if err := fixture.writer.Client.Delete(t.Context(), object); err != nil {
+			t.Fatal(err)
 		}
-		Expect(k8sClient.Create(ctx, environment)).To(Succeed())
-		environment.Spec.SelfHosted.Capabilities[0].Name = "helper-"
-		environment.Spec.SelfHosted.Capabilities[0].Path = "/capabilities/helper-"
-		Expect(apierrors.IsInvalid(k8sClient.Update(ctx, environment))).To(BeTrue())
-	})
+	}
+	fixture.claim.Finalizers = nil
+	if err := fixture.writer.Update(t.Context(), fixture.claim); err != nil {
+		t.Fatal(err)
+	}
+	pending, err := fixture.reconciler.finalizeWorkspaceClaim(t.Context(), fixture.session)
+	if err != nil || pending {
+		t.Fatal("physically absent runtime kept cleanup pending", err)
+	}
+}
 
-	It("accepts the current omitted-ephemeral profile in a frozen Session snapshot", func() {
-		current := &agentsv1alpha1.Session{ObjectMeta: metav1.ObjectMeta{Name: "ephemeral-snapshot", Namespace: namespace}, Spec: agentsv1alpha1.SessionSpec{
-			AgentRef: &agentsv1alpha1.AgentReference{Name: "saved-agent"}, EnvironmentRef: &agentsv1alpha1.AgentReference{Name: "saved-environment"},
-			SpendControl: &agentsv1alpha1.SessionSpendControl{Mode: spendModeUnlimited}}}
-		Expect(k8sClient.Create(ctx, current)).To(Succeed())
-		current.Status.EnvironmentSnapshot = &agentsv1alpha1.SessionEnvironmentSnapshot{Profile: agentsv1alpha1.EnvironmentSpec{
-			Mode: testSelfHostedMode, DeletionPolicy: deletePolicy,
-			SelfHosted: &agentsv1alpha1.SelfHostedEnvironment{Image: testExecutorImage, Architecture: workspaceTestArch, WorkspaceDirectory: defaultWorkspace}}}
-		Expect(k8sClient.Status().Update(ctx, current)).To(Succeed())
-		Expect(k8sClient.Delete(ctx, current)).To(Succeed())
-	})
+func assertWorkspaceClaimDeletion(t *testing.T, fixture *workspaceLifecycleFixture) {
+	t.Helper()
+	if len(fixture.writer.deletions) != 1 {
+		t.Fatal("expected one native claim deletion")
+	}
+	options := fixture.writer.deletions[0]
+	if options.PropagationPolicy == nil || *options.PropagationPolicy != metav1.DeletePropagationForeground || options.Preconditions == nil || options.Preconditions.UID == nil || *options.Preconditions.UID != fixture.claim.UID {
+		t.Fatal("claim deletion lacks foreground propagation or frozen UID")
+	}
+}
 
-	It("marks an unowned Retain PVC only after remote cleanup", func() {
-		claim, err := sandbox.WorkspaceClaim(session)
-		Expect(err).NotTo(HaveOccurred())
-		Expect(k8sClient.Create(ctx, claim)).To(Succeed())
-		claim = readClaim()
-		session.Status.WorkspaceClaimCreationAttempted = true
-		session.Status.WorkspaceClaimUID = string(claim.UID)
-		Expect(k8sClient.Status().Update(ctx, session)).To(Succeed())
-		Expect(k8sClient.Delete(ctx, readSession())).To(Succeed())
-		provider.deleteFailure = true
-		_, err = reconciler.finalize(ctx, readSession())
-		Expect(err).To(HaveOccurred())
-		Expect(readClaim().OwnerReferences).To(BeEmpty())
-		provider.deleteFailure = false
-		_, err = reconciler.finalize(ctx, readSession())
-		Expect(err).NotTo(HaveOccurred())
-		claim = readClaim()
-		Expect(claim.OwnerReferences).To(BeEmpty())
-		Expect(claim.Annotations[sandbox.WorkspaceRetainedAnnotation]).To(Equal(string(session.UID)))
-		_, err = reconciler.finalize(ctx, readSession())
-		Expect(err).NotTo(HaveOccurred())
-		Expect(apierrors.IsNotFound(k8sClient.Get(ctx, client.ObjectKeyFromObject(session), &agentsv1alpha1.Session{}))).To(BeTrue())
-		Expect(readClaim()).NotTo(BeNil())
-	})
+func TestWorkspaceObservationRejectsReplacedOrForeignStorage(t *testing.T) {
+	for _, name := range []string{"replaced UID", "foreign workspace owner", "changed storage"} {
+		t.Run(name, func(t *testing.T) {
+			fixture := newWorkspaceLifecycleFixture(t, sandbox.WorkspaceClaimRetain)
+			switch name {
+			case "replaced UID":
+				if err := fixture.writer.Client.Delete(t.Context(), fixture.workspace); err != nil {
+					t.Fatal(err)
+				}
+				fixture.workspace.UID, fixture.workspace.ResourceVersion = _workspaceLifecycleForeignUID, ""
+				if err := fixture.writer.Create(t.Context(), fixture.workspace); err != nil {
+					t.Fatal(err)
+				}
+			case "foreign workspace owner":
+				fixture.workspace.OwnerReferences[0].UID = _workspaceLifecycleForeignUID
+			case "changed storage":
+				fixture.workspace.Spec.StorageClassName = new("foreign-storage")
+			}
+			if err := fixture.writer.Update(t.Context(), fixture.workspace); err != nil {
+				t.Fatal(err)
+			}
+			if err := fixture.reconciler.observeWorkspace(t.Context(), fixture.session, fixture.sandbox, fixture.pod); err == nil {
+				t.Fatal("unverified workspace was adopted")
+			}
+			proof := &agentsv1alpha1.SessionWorkspacePreparationStatus{SandboxUID: string(fixture.sandbox.UID), ClaimUID: fixture.session.Status.WorkspaceClaimUID}
+			if fixture.reconciler.revalidatePreparedClaim(t.Context(), fixture.session, proof) {
+				t.Fatal("revalidation accepted a changed workspace after preparation")
+			}
+		})
+	}
+}
 
-	It("blocks Retain creation outcomes lost before and after PVC creation", func() {
-		session.Status.WorkspaceClaimCreationAttempted = true
-		Expect(k8sClient.Status().Update(ctx, session)).To(Succeed())
-		session = readSession()
-		ready, committed, err := reconciler.reconcileWorkspaceClaim(ctx, session)
-		Expect(err).NotTo(HaveOccurred())
-		Expect(ready).To(BeFalse())
-		Expect(committed).To(BeFalse())
-		Expect(meta.FindStatusCondition(session.Status.Conditions, readyCondition).Reason).To(Equal("WorkspaceClaimOutcomeUnknown"))
-		claim, err := sandbox.WorkspaceClaim(session)
-		Expect(err).NotTo(HaveOccurred())
-		Expect(k8sClient.Create(ctx, claim)).To(Succeed())
-		ready, committed, err = reconciler.reconcileWorkspaceClaim(ctx, session)
-		Expect(err).NotTo(HaveOccurred())
-		Expect(ready).To(BeFalse())
-		Expect(committed).To(BeFalse())
-		Expect(session.Status.WorkspaceClaimUID).To(BeEmpty())
-		Expect(meta.FindStatusCondition(session.Status.Conditions, readyCondition).Reason).To(Equal("WorkspaceClaimOutcomeUnknown"))
-	})
+func TestRetainRejectsChangedWorkspaceBeforeOrphaning(t *testing.T) {
+	fixture := newWorkspaceLifecycleFixture(t, sandbox.WorkspaceClaimRetain)
+	fixture.sandbox.Spec.OperatingMode = sandboxv1beta1.SandboxOperatingModeSuspended
+	if err := fixture.writer.Update(t.Context(), fixture.sandbox); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.writer.Client.Delete(t.Context(), fixture.pod); err != nil {
+		t.Fatal(err)
+	}
+	fixture.session.Status.WorkspaceClaimUID = _workspaceLifecycleForeignUID
+	pending, err := fixture.reconciler.finalizeWorkspaceClaim(t.Context(), fixture.session)
+	if err == nil || !pending {
+		t.Fatal("retention adopted a replacement workspace")
+	}
+	if len(fixture.writer.deletions) != 0 {
+		t.Fatal("failed retention deleted the native claim")
+	}
+	if err := fixture.writer.Get(t.Context(), client.ObjectKeyFromObject(fixture.sandbox), fixture.sandbox); err != nil {
+		t.Fatal(err)
+	}
+	if !metav1.IsControlledBy(fixture.sandbox, fixture.claim) {
+		t.Fatal("failed retention orphaned unverified storage")
+	}
+}
 
-	It("does not adopt an unclaimed same-name Retain PVC", func() {
-		claim, err := sandbox.WorkspaceClaim(session)
-		Expect(err).NotTo(HaveOccurred())
-		Expect(k8sClient.Create(ctx, claim)).To(Succeed())
-		ready, committed, err := reconciler.reconcileWorkspaceClaim(ctx, session)
-		Expect(err).NotTo(HaveOccurred())
-		Expect(ready).To(BeFalse())
-		Expect(committed).To(BeFalse())
-		Expect(session.Status.WorkspaceClaimUID).To(BeEmpty())
-		Expect(meta.FindStatusCondition(session.Status.Conditions, readyCondition).Reason).To(Equal("WorkspaceOwnershipMismatch"))
-		session.Status.WorkspaceClaimUID = string(readClaim().UID)
-		ready, committed, err = reconciler.reconcileWorkspaceClaim(ctx, session)
-		Expect(err).NotTo(HaveOccurred())
-		Expect(ready).To(BeFalse())
-		Expect(committed).To(BeFalse())
-		Expect(meta.FindStatusCondition(session.Status.Conditions, readyCondition).Reason).To(Equal("WorkspaceOwnershipMismatch"))
-	})
+func TestSessionFinalizeRetainsWorkspaceAndReleasesFinalizer(t *testing.T) {
+	for _, earlyClose := range []bool{false, true} {
+		t.Run(map[bool]string{false: "observed allocation", true: "close before allocation observation"}[earlyClose], func(t *testing.T) {
+			fixture := newWorkspaceLifecycleFixture(t, sandbox.WorkspaceClaimRetain)
+			if earlyClose {
+				fixture.session.Status.SandboxName, fixture.session.Status.SandboxUID, fixture.session.Status.PodName = "", "", ""
+				fixture.session.Status.WorkspaceClaimUID, fixture.session.Status.ExecutorPodUID = "", ""
+				if err := fixture.writer.Status().Update(t.Context(), fixture.session); err != nil {
+					t.Fatal(err)
+				}
+				fixture.claim.Status.SandboxStatus.Name = ""
+				if err := fixture.writer.Update(t.Context(), fixture.claim); err != nil {
+					t.Fatal(err)
+				}
+			}
+			fixture.session.Finalizers = []string{sessionFinalizer}
+			if err := fixture.writer.Update(t.Context(), fixture.session); err != nil {
+				t.Fatal(err)
+			}
+			completed := false
+			for range 10 {
+				if err := fixture.writer.Get(t.Context(), client.ObjectKeyFromObject(fixture.session), fixture.session); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := fixture.reconciler.finalize(t.Context(), fixture.session); err != nil {
+					t.Fatal("full Retain finalization blocked", err)
+				}
+				if err := fixture.writer.Get(t.Context(), client.ObjectKeyFromObject(fixture.sandbox), fixture.sandbox); err != nil {
+					t.Fatal("retained Sandbox disappeared", err)
+				}
+				if fixture.sandbox.Spec.OperatingMode != sandboxv1beta1.SandboxOperatingModeSuspended {
+					t.Fatal("finalization left compute running")
+				}
+				// Emulate the upstream controller honoring suspension, independently of us.
+				if err := fixture.writer.Client.Delete(t.Context(), fixture.pod); err != nil && !apierrors.IsNotFound(err) {
+					t.Fatal(err)
+				}
+				if !slices.Contains(fixture.session.Finalizers, sessionFinalizer) {
+					completed = true
+					break
+				}
+			}
+			if !completed {
+				t.Fatal("retained allocation kept Session finalizer indefinitely")
+			}
+			if err := fixture.writer.Get(t.Context(), client.ObjectKeyFromObject(fixture.claim), &extensionsv1beta1.SandboxClaim{}); !apierrors.IsNotFound(err) {
+				t.Fatal("finalizer released while recreating Claim remains", err)
+			}
+			if len(fixture.sandbox.OwnerReferences) != 0 || fixture.sandbox.Annotations[sandbox.WorkspaceRetainedAnnotation] != string(fixture.session.UID) {
+				t.Fatal("retained Sandbox was not safely detached")
+			}
+			if err := fixture.writer.Get(t.Context(), client.ObjectKeyFromObject(fixture.workspace), fixture.workspace); err != nil || string(fixture.workspace.UID) != fixture.session.Status.WorkspaceClaimUID {
+				t.Fatal("retention lost or failed to freeze the original files", err)
+			}
+		})
+	}
+}
 
-	It("does not delete a different claim UID during Session cleanup", func() {
-		claim, err := sandbox.WorkspaceClaim(session)
-		Expect(err).NotTo(HaveOccurred())
-		Expect(k8sClient.Create(ctx, claim)).To(Succeed())
-		session.Status.WorkspaceClaimCreationAttempted = true
-		session.Status.WorkspaceClaimUID = "different-uid"
-		Expect(k8sClient.Status().Update(ctx, session)).To(Succeed())
-		provider.remote = openaiapi.Session{}
-		_, err = reconciler.finalize(ctx, readSession())
-		Expect(err).To(HaveOccurred())
-		Expect(strings.Contains(err.Error(), "workspace claim UID")).To(BeTrue())
-		Expect(readClaim().OwnerReferences).To(BeEmpty())
-	})
-
-	It("deletes the owned claim only after remote cleanup", func() {
-		session.Status.EnvironmentSnapshot.Profile.SelfHosted.WorkspaceStorage.ClaimDeletionPolicy = deletePolicy
-		Expect(k8sClient.Status().Update(ctx, session)).To(Succeed())
-		session = readSession()
-		claim, err := sandbox.WorkspaceClaim(session)
-		Expect(err).NotTo(HaveOccurred())
-		Expect(controllerutil.SetControllerReference(session, claim, k8sClient.Scheme())).To(Succeed())
-		Expect(k8sClient.Create(ctx, claim)).To(Succeed())
-		claim = readClaim()
-		session.Status.WorkspaceClaimUID = string(claim.UID)
-		Expect(k8sClient.Status().Update(ctx, session)).To(Succeed())
-		Expect(k8sClient.Delete(ctx, readSession())).To(Succeed())
-		provider.deleteFailure = true
-		_, err = reconciler.finalize(ctx, readSession())
-		Expect(err).To(HaveOccurred())
-		Expect(readClaim()).NotTo(BeNil())
-		claim = readClaim()
-		claim.Finalizers = nil // envtest has no PVC protection controller.
-		Expect(k8sClient.Update(ctx, claim)).To(Succeed())
-		provider.deleteFailure = false
-		_, err = reconciler.finalize(ctx, readSession())
-		Expect(err).NotTo(HaveOccurred())
-		_, err = reconciler.finalize(ctx, readSession())
-		Expect(err).NotTo(HaveOccurred())
-		Expect(apierrors.IsNotFound(k8sClient.Get(ctx, client.ObjectKeyFromObject(claim), &corev1.PersistentVolumeClaim{}))).To(BeTrue())
-		Expect(apierrors.IsNotFound(k8sClient.Get(ctx, client.ObjectKeyFromObject(session), &agentsv1alpha1.Session{}))).To(BeTrue())
-	})
-})
+func TestEarlyRetainCloseDeletesUnallocatedClaim(t *testing.T) {
+	fixture := newWorkspaceLifecycleFixture(t, sandbox.WorkspaceClaimRetain)
+	for _, object := range []client.Object{fixture.pod, fixture.workspace, fixture.sandbox} {
+		if err := fixture.writer.Client.Delete(t.Context(), object); err != nil {
+			t.Fatal(err)
+		}
+	}
+	fixture.session.Status.SandboxName, fixture.session.Status.SandboxUID, fixture.session.Status.PodName, fixture.session.Status.WorkspaceClaimUID = "", "", "", ""
+	fixture.claim.Status.SandboxStatus.Name = ""
+	if err := fixture.writer.Update(t.Context(), fixture.claim); err != nil {
+		t.Fatal(err)
+	}
+	if pending, err := fixture.reconciler.finalizeWorkspaceClaim(t.Context(), fixture.session); err != nil || !pending {
+		t.Fatal("unallocated Claim was not deleted", pending, err)
+	}
+	if err := fixture.writer.Get(t.Context(), client.ObjectKeyFromObject(fixture.claim), &extensionsv1beta1.SandboxClaim{}); !apierrors.IsNotFound(err) {
+		t.Fatal("early close leaked an unallocated Claim", err)
+	}
+}

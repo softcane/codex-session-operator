@@ -63,7 +63,7 @@ type WorkAttempt struct {
 }
 
 // ConversationOrigin binds first-message retries independently of route changes.
-// Subject scopes creation keys; namespace authorization governs later access.
+// Subject scopes creation keys; URL namespace selection scopes later access.
 type ConversationOrigin struct {
 	Subject string `json:"subject"`
 	Key     string `json:"key"`

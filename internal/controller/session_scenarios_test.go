@@ -14,6 +14,9 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	sandboxv1 "sigs.k8s.io/agent-sandbox/api/v1beta1"
+	extensions "sigs.k8s.io/agent-sandbox/extensions/api/v1beta1"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
@@ -80,7 +83,6 @@ func (p *scenarioSessionProvider) CreateConfiguredSession(ctx context.Context, u
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.remote.AgentConfiguration = openaiapi.EffectiveSessionAgent(p.agents.remote.Config, agent)
-	p.remote.AgentConfigurationDigest = openaiapi.AgentConfigurationDigest(p.remote.AgentConfiguration)
 	p.remote.EnvironmentType = executorRuntimeSelfHostedType
 	return p.remote, err
 }
@@ -112,24 +114,27 @@ var _ = Describe("Session lifecycle scenarios with the shipped CRD", func() {
 		return &current
 	}
 	step := func() error {
+		if err := reconcileTestSandboxInfrastructure(ctx, shippedK8sClient, session.Namespace); err != nil {
+			return err
+		}
 		_, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: client.ObjectKeyFromObject(session)})
-		return err
+		return errors.Join(err, reconcileTestSandboxInfrastructure(ctx, shippedK8sClient, session.Namespace))
 	}
 	readPod := func() *corev1.Pod {
 		var pod corev1.Pod
-		Expect(shippedK8sClient.Get(ctx, client.ObjectKey{Namespace: session.Namespace, Name: sandbox.PodName(session)}, &pod)).To(Succeed())
+		Expect(shippedK8sClient.Get(ctx, client.ObjectKey{Namespace: session.Namespace, Name: sandbox.ClaimName(session)}, &pod)).To(Succeed())
 		return &pod
 	}
 	expectComputeStopped := func() {
 		var pod corev1.Pod
-		err := shippedK8sClient.Get(ctx, client.ObjectKey{Namespace: session.Namespace, Name: sandbox.PodName(session)}, &pod)
+		err := shippedK8sClient.Get(ctx, client.ObjectKey{Namespace: session.Namespace, Name: sandbox.ClaimName(session)}, &pod)
 		if !apierrors.IsNotFound(err) {
 			Expect(err).NotTo(HaveOccurred())
 			Expect(pod.DeletionTimestamp.IsZero()).To(BeFalse(), "unsafe executor must have a deletion request")
 		}
 	}
 	provision := func() {
-		for range 5 {
+		for range 8 {
 			Expect(step()).To(Succeed())
 		}
 		pod := readPod()
@@ -155,7 +160,7 @@ var _ = Describe("Session lifecycle scenarios with the shipped CRD", func() {
 		Expect(client.IgnoreNotFound(shippedK8sClient.Delete(ctx, current, client.GracePeriodSeconds(0)))).To(Succeed())
 	}
 	removePod := func() {
-		removeObject(&corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: session.Namespace, Name: sandbox.PodName(session)}})
+		removeObject(&corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: session.Namespace, Name: sandbox.ClaimName(session)}})
 	}
 	BeforeEach(func() {
 		namespace := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{GenerateName: "session-scenario-"}}
@@ -169,13 +174,15 @@ var _ = Describe("Session lifecycle scenarios with the shipped CRD", func() {
 			_, err := agentController.Reconcile(ctx, ctrl.Request{NamespacedName: client.ObjectKeyFromObject(agent)})
 			Expect(err).NotTo(HaveOccurred())
 		}
+		pool, err := createTestSandboxPool(ctx, shippedK8sClient, namespace.Name)
+		Expect(err).NotTo(HaveOccurred())
 		environment = &agentsv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{Name: "environment", Namespace: namespace.Name},
 			Spec: agentsv1alpha1.EnvironmentSpec{Mode: testSelfHostedMode, DeletionPolicy: deletePolicy, SelfHosted: &agentsv1alpha1.SelfHostedEnvironment{
-				Image: testExecutorImage, Architecture: workspaceTestArch, WorkspaceStorage: &agentsv1alpha1.WorkspaceStorage{Type: sandbox.WorkspaceStorageEphemeral}}}}
+				SandboxPoolRef: agentsv1alpha1.AgentReference{Name: pool.Name}, Workspace: agentsv1alpha1.SelfHostedWorkspace{Directory: defaultWorkspace, DeletionPolicy: deletePolicy}}}}
 		Expect(shippedK8sClient.Create(ctx, environment)).To(Succeed())
 		environmentProvider := &environmentProviderStub{}
 		environmentController := &EnvironmentReconciler{Client: shippedK8sClient, APIReader: shippedK8sClient, OpenAI: environmentProvider,
-			OwnerScope: testAgentScope, ExecutorImages: []string{testExecutorImage}}
+			OwnerScope: testAgentScope, SandboxPools: []string{pool.Name}}
 		for range 3 {
 			_, err := environmentController.Reconcile(ctx, ctrl.Request{NamespacedName: client.ObjectKeyFromObject(environment)})
 			Expect(err).NotTo(HaveOccurred())
@@ -195,7 +202,7 @@ var _ = Describe("Session lifecycle scenarios with the shipped CRD", func() {
 		connections = &scenarioConnections{connectionStub: connectionStub{state: openaiapi.Connection{Subscribed: true, Epoch: "scenario-stream"}}}
 		r = &SessionReconciler{Client: shippedK8sClient, APIReader: shippedK8sClient, Scheme: shippedK8sClient.Scheme(), OpenAI: provider,
 			Agents: agents, Environments: environmentProvider, Configuration: provider, AgentOwnerScope: testAgentScope,
-			Connections: connections, ExecutorImages: []string{testExecutorImage}}
+			Connections: connections, SandboxPools: []string{pool.Name}}
 	})
 	AfterEach(func() {
 		var pods corev1.PodList
@@ -221,7 +228,10 @@ var _ = Describe("Session lifecycle scenarios with the shipped CRD", func() {
 		Expect(first.Status.AgentSnapshot.UID).To(Equal(string(agent.UID)))
 		Expect(first.Status.EnvironmentSnapshot.UID).To(Equal(string(environment.UID)))
 		Expect(first.Status.OwnerScope).To(Equal(testAgentScope))
-		Expect(metav1.IsControlledBy(pod, first)).To(BeTrue())
+		var runtime sandboxv1.Sandbox
+		Expect(shippedK8sClient.Get(ctx, client.ObjectKey{Namespace: session.Namespace, Name: first.Status.SandboxName}, &runtime)).To(Succeed())
+		Expect(metav1.IsControlledBy(pod, &runtime)).To(BeTrue())
+		Expect(runtime.UID).To(Equal(types.UID(first.Status.SandboxUID)))
 		for range 4 {
 			Expect(step()).To(Succeed())
 		}
@@ -319,26 +329,24 @@ var _ = Describe("Session lifecycle scenarios with the shipped CRD", func() {
 		func(change func(*openaiapi.Session), reason string) {
 			var updated agentsv1alpha1.Environment
 			Expect(shippedK8sClient.Get(ctx, client.ObjectKeyFromObject(environment), &updated)).To(Succeed())
-			updated.Spec.SelfHosted.WorkspaceStorage = &agentsv1alpha1.WorkspaceStorage{
-				Type: sandbox.WorkspaceStoragePersistent, StorageClassName: workspaceTestClass, ClaimDeletionPolicy: deletePolicy}
+			updated.Spec.SelfHosted.Workspace.DeletionPolicy = deletePolicy
 			Expect(shippedK8sClient.Update(ctx, &updated)).To(Succeed())
 			environmentController := &EnvironmentReconciler{Client: shippedK8sClient, APIReader: shippedK8sClient, OpenAI: &environmentProviderStub{},
-				OwnerScope: testAgentScope, ExecutorImages: []string{testExecutorImage}, WorkspaceStorageClasses: []string{workspaceTestClass}}
+				OwnerScope: testAgentScope, SandboxPools: []string{environment.Spec.SelfHosted.SandboxPoolRef.Name}}
 			for range 2 {
 				_, err := environmentController.Reconcile(ctx, ctrl.Request{NamespacedName: client.ObjectKeyFromObject(environment)})
 				Expect(err).NotTo(HaveOccurred())
 			}
-			r.WorkspaceStorageClasses = []string{workspaceTestClass}
 			provision()
 			original := read()
-			claimKey := client.ObjectKey{Namespace: session.Namespace, Name: sandbox.WorkspaceClaimNameForUID(string(session.UID))}
+			claimKey := client.ObjectKey{Namespace: session.Namespace, Name: "workspace-" + sandbox.ClaimName(session)}
 			var claim corev1.PersistentVolumeClaim
 			Expect(shippedK8sClient.Get(ctx, claimKey, &claim)).To(Succeed())
 			claimUID := claim.UID
 			current := read()
 			effort, cents := testSessionUpdatedEffort, int64(300)
 			current.Spec.Agent.Reasoning.Effort = &effort
-			metadata := map[string]string{scenarioMutableMetadataKey: "pending"}
+			metadata := map[string]string{scenarioMutableMetadataKey: "awaiting-update"}
 			current.Spec.Metadata = &metadata
 			current.Spec.SpendControl = &agentsv1alpha1.SessionSpendControl{Mode: spendModeLimited, LimitCents: &cents}
 			Expect(shippedK8sClient.Update(ctx, current)).To(Succeed())
@@ -346,7 +354,7 @@ var _ = Describe("Session lifecycle scenarios with the shipped CRD", func() {
 			Expect(step()).To(Succeed())
 			failed := read()
 			Expect(meta.FindStatusCondition(failed.Status.Conditions, readyCondition).Reason).To(Equal(reason))
-			Expect(failed.Status.Phase).To(Equal("Failed"))
+			Expect(meta.IsStatusConditionTrue(failed.Status.Conditions, readyCondition)).To(BeFalse())
 			expectComputeStopped()
 			Expect(connections.forgotten).To(ContainElement(original.Status.OpenAISessionID))
 			Expect(provider.configuration.updates).To(BeZero())
@@ -437,12 +445,15 @@ var _ = Describe("Session lifecycle scenarios with the shipped CRD", func() {
 		expectComputeStopped()
 		// envtest has no kubelet to complete graceful termination of a running Pod.
 		var pod corev1.Pod
-		if err := shippedK8sClient.Get(ctx, client.ObjectKey{Namespace: session.Namespace, Name: sandbox.PodName(session)}, &pod); err == nil {
+		if err := shippedK8sClient.Get(ctx, client.ObjectKey{Namespace: session.Namespace, Name: sandbox.ClaimName(session)}, &pod); err == nil {
 			Expect(shippedK8sClient.Delete(ctx, &pod, client.GracePeriodSeconds(0))).To(Succeed())
 		} else {
 			Expect(apierrors.IsNotFound(err)).To(BeTrue())
 		}
 		Expect(step()).To(Succeed())
+		for range 5 {
+			Expect(step()).To(Succeed())
+		}
 		Expect(read().Finalizers).To(ConsistOf(otherTestFinalizer))
 		Expect(provider.deletes).To(BeZero())
 		Expect(provider.creates).To(Equal(1))
@@ -459,6 +470,9 @@ var _ = Describe("Session lifecycle scenarios with the shipped CRD", func() {
 		provider.getErr = nil
 		removePod()
 		Expect(step()).To(Succeed())
+		for range 5 {
+			Expect(step()).To(Succeed())
+		}
 		Expect(read().Finalizers).To(ConsistOf(otherTestFinalizer))
 		Expect(provider.deletes).To(Equal(1))
 	})
@@ -473,6 +487,9 @@ var _ = Describe("Session lifecycle scenarios with the shipped CRD", func() {
 		provider.remote = openaiapi.Session{}
 		removePod()
 		Expect(step()).To(Succeed())
+		for range 5 {
+			Expect(step()).To(Succeed())
+		}
 		Expect(read().Finalizers).To(ConsistOf(otherTestFinalizer))
 		Expect(provider.deletes).To(Equal(1))
 	})
@@ -485,6 +502,9 @@ var _ = Describe("Session lifecycle scenarios with the shipped CRD", func() {
 		expectComputeStopped()
 		removePod()
 		Expect(step()).To(Succeed())
+		for range 5 {
+			Expect(step()).To(Succeed())
+		}
 		Expect(read().Finalizers).To(ConsistOf(otherTestFinalizer))
 		Expect(provider.deletes).To(Equal(1))
 	})
@@ -525,6 +545,9 @@ var _ = Describe("Session lifecycle scenarios with the shipped CRD", func() {
 		provider.findErr = nil
 		Expect(step()).To(Succeed())
 		Expect(step()).To(Succeed())
+		for range 5 {
+			Expect(step()).To(Succeed())
+		}
 		Expect(read().Finalizers).To(ConsistOf(otherTestFinalizer))
 		Expect(provider.deletes).To(Equal(1))
 	})
@@ -533,19 +556,16 @@ var _ = Describe("Session lifecycle scenarios with the shipped CRD", func() {
 		func(policy string) {
 			var updated agentsv1alpha1.Environment
 			Expect(shippedK8sClient.Get(ctx, client.ObjectKeyFromObject(environment), &updated)).To(Succeed())
-			updated.Spec.SelfHosted.WorkspaceSize = workspaceTestSize
-			updated.Spec.SelfHosted.WorkspaceStorage = &agentsv1alpha1.WorkspaceStorage{
-				Type: sandbox.WorkspaceStoragePersistent, StorageClassName: workspaceTestClass, ClaimDeletionPolicy: policy}
+			updated.Spec.SelfHosted.Workspace.DeletionPolicy = agentsv1alpha1.DeletionPolicy(policy)
 			Expect(shippedK8sClient.Update(ctx, &updated)).To(Succeed())
 			environmentController := &EnvironmentReconciler{Client: shippedK8sClient, APIReader: shippedK8sClient, OpenAI: &environmentProviderStub{},
-				OwnerScope: testAgentScope, ExecutorImages: []string{testExecutorImage}, WorkspaceStorageClasses: []string{workspaceTestClass}}
+				OwnerScope: testAgentScope, SandboxPools: []string{environment.Spec.SelfHosted.SandboxPoolRef.Name}}
 			for range 2 {
 				_, err := environmentController.Reconcile(ctx, ctrl.Request{NamespacedName: client.ObjectKeyFromObject(environment)})
 				Expect(err).NotTo(HaveOccurred())
 			}
-			r.WorkspaceStorageClasses = []string{workspaceTestClass}
 			provision()
-			claimKey := client.ObjectKey{Namespace: session.Namespace, Name: sandbox.WorkspaceClaimNameForUID(string(session.UID))}
+			claimKey := client.ObjectKey{Namespace: session.Namespace, Name: "workspace-" + sandbox.ClaimName(session)}
 			var claim corev1.PersistentVolumeClaim
 			Expect(shippedK8sClient.Get(ctx, claimKey, &claim)).To(Succeed())
 			claimUID := claim.UID
@@ -558,24 +578,24 @@ var _ = Describe("Session lifecycle scenarios with the shipped CRD", func() {
 			Expect(claim.DeletionTimestamp.IsZero()).To(BeTrue())
 			Expect(claim.Annotations[sandbox.WorkspaceRetainedAnnotation]).To(BeEmpty())
 			Expect(shippedK8sClient.Delete(ctx, read())).To(Succeed())
-			removePod()
-			Expect(step()).To(Succeed())
-			Expect(read().Finalizers).To(ContainElement(sessionFinalizer))
-			Expect(shippedK8sClient.Get(ctx, claimKey, &claim)).To(Succeed())
-			if policy == deletePolicy {
-				Expect(claim.DeletionTimestamp.IsZero()).To(BeFalse())
-				// envtest does not run PVC protection to release its finalizer.
-				removeObject(&claim)
-			} else {
-				Expect(claim.DeletionTimestamp.IsZero()).To(BeTrue())
-				Expect(claim.OwnerReferences).To(BeEmpty())
-				Expect(claim.Annotations[sandbox.WorkspaceRetainedAnnotation]).To(Equal(string(session.UID)))
+			for range 8 {
+				Expect(step()).To(Succeed())
 			}
-			Expect(step()).To(Succeed())
+			for range 5 {
+				Expect(step()).To(Succeed())
+			}
 			Expect(read().Finalizers).To(ConsistOf(otherTestFinalizer))
+			var allocation extensions.SandboxClaim
+			Expect(apierrors.IsNotFound(shippedK8sClient.Get(ctx, client.ObjectKey{Namespace: session.Namespace, Name: sandbox.ClaimName(session)}, &allocation))).To(BeTrue())
 			if policy == retainPolicy {
 				Expect(shippedK8sClient.Get(ctx, claimKey, &claim)).To(Succeed())
 				Expect(claim.UID).To(Equal(claimUID))
+				var retained sandboxv1.Sandbox
+				Expect(shippedK8sClient.Get(ctx, client.ObjectKey{Namespace: session.Namespace, Name: read().Status.SandboxName}, &retained)).To(Succeed())
+				Expect(retained.OwnerReferences).To(BeEmpty())
+				Expect(retained.Spec.OperatingMode).To(Equal(sandboxv1.SandboxOperatingModeSuspended))
+				Expect(retained.Annotations[sandbox.WorkspaceRetainedAnnotation]).To(Equal(string(session.UID)))
+				Expect(metav1.IsControlledBy(&claim, &retained)).To(BeTrue())
 			} else {
 				Expect(apierrors.IsNotFound(shippedK8sClient.Get(ctx, claimKey, &claim))).To(BeTrue())
 			}
@@ -677,6 +697,9 @@ var _ = Describe("Session lifecycle scenarios with the shipped CRD", func() {
 		for range 3 {
 			Expect(step()).To(Succeed())
 		}
+		for range 5 {
+			Expect(step()).To(Succeed())
+		}
 		Expect(read().Finalizers).To(ConsistOf(otherTestFinalizer))
 		Expect(provider.creates).To(Equal(1))
 		Expect(provider.deletes).To(Equal(1))
@@ -686,6 +709,9 @@ var _ = Describe("Session lifecycle scenarios with the shipped CRD", func() {
 		Expect(step()).To(Succeed())
 		Expect(shippedK8sClient.Delete(ctx, read())).To(Succeed())
 		Expect(step()).To(Succeed())
+		for range 5 {
+			Expect(step()).To(Succeed())
+		}
 		Expect(read().Finalizers).To(ConsistOf(otherTestFinalizer))
 		Expect(provider.creates).To(BeZero())
 		Expect(provider.deletes).To(BeZero())
@@ -735,6 +761,9 @@ var _ = Describe("Session lifecycle scenarios with the shipped CRD", func() {
 		provider.hideDiscovery = false
 		Expect(step()).To(Succeed())
 		Expect(step()).To(Succeed())
+		for range 5 {
+			Expect(step()).To(Succeed())
+		}
 		Expect(read().Finalizers).To(ConsistOf(otherTestFinalizer))
 		Expect(provider.deletes).To(Equal(1))
 	})
@@ -780,7 +809,7 @@ func (p *scenarioMissingIDProvider) CreateConfiguredSession(ctx context.Context,
 
 func configureScenarioNone(f *dependencyScenarioFixture, s *agentsv1alpha1.Session, returnEmptyID bool) {
 	environment := &agentsv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{Name: "none-environment", Namespace: f.namespace},
-		Spec: agentsv1alpha1.EnvironmentSpec{Mode: _noneMode, DeletionPolicy: deletePolicy}}
+		Spec: agentsv1alpha1.EnvironmentSpec{Mode: agentsv1alpha1.EnvironmentModeNone, DeletionPolicy: deletePolicy}}
 	Expect(f.client.Create(ctx, environment)).To(Succeed())
 	f.cleanup(environment)
 	er := &EnvironmentReconciler{Client: f.client, APIReader: f.client, OwnerScope: testAgentScope, GatewayEnabled: true}
@@ -817,7 +846,7 @@ var _ = Describe("Hosted and none immutable validation with shipped CRDs", func(
 			for range 2 {
 				f.sessionStep(s)
 			}
-			Expect(s.Status.Phase).To(Equal("Ready"))
+			Expect(meta.IsStatusConditionTrue(s.Status.Conditions, readyCondition)).To(BeTrue())
 			Expect(s.Status.OpenAISessionID).NotTo(BeEmpty())
 			Expect(f.sessions.creates).To(Equal(1))
 		}, Entry("hosted creation", openaiHostedMode), Entry("none creation", _noneMode))
@@ -835,18 +864,18 @@ var _ = Describe("Hosted and none immutable validation with shipped CRDs", func(
 			for range 3 {
 				f.sessionStep(s)
 			}
-			Expect(s.Status.Phase).To(Equal("Ready"))
+			Expect(meta.IsStatusConditionTrue(s.Status.Conditions, readyCondition)).To(BeTrue())
 			original := s.DeepCopy()
 			effort, cents := testSessionUpdatedEffort, int64(300)
 			s.Spec.Agent = &agentsv1alpha1.SessionAgentOverrides{Reasoning: &agentsv1alpha1.AgentReasoning{Effort: &effort}}
-			metadata := map[string]string{scenarioMutableMetadataKey: "pending"}
+			metadata := map[string]string{scenarioMutableMetadataKey: "awaiting-update"}
 			s.Spec.Metadata = &metadata
 			s.Spec.SpendControl = &agentsv1alpha1.SessionSpendControl{Mode: spendModeLimited, LimitCents: &cents}
 			Expect(f.client.Update(ctx, s)).To(Succeed())
 			change(&f.sessions.remote)
 			f.sessionStep(s)
 			Expect(meta.FindStatusCondition(s.Status.Conditions, readyCondition).Reason).To(Equal(wantReason))
-			Expect(s.Status.Phase).To(Equal("Failed"))
+			Expect(meta.IsStatusConditionTrue(s.Status.Conditions, readyCondition)).To(BeFalse())
 			Expect(f.configuration.updates).To(BeZero())
 			Expect(f.sessions.creates).To(Equal(1))
 			Expect(f.sessions.deletes).To(BeZero())

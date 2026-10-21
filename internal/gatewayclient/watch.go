@@ -66,7 +66,7 @@ func (r *runner) loadWatchBaseline(ctx context.Context, options watchOptions) (w
 		return baseline, _exitFailure, err
 	}
 	if op.Origin != r.client.origin || op.Namespace != r.client.namespace || op.Subject != subject {
-		return baseline, _exitFailure, errors.New("observation baseline differs from origin, namespace or authenticated subject")
+		return baseline, _exitFailure, errors.New("observation baseline differs from origin, namespace or service replay subject")
 	}
 	accepted, err := j.loadReceipt(op.ID)
 	if err != nil {

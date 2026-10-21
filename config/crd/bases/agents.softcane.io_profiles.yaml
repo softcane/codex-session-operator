@@ -49,7 +49,7 @@ spec:
                   name:
                     maxLength: 253
                     minLength: 1
-                    pattern: ^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$
+                    pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
                     type: string
                 required:
                 - name
@@ -60,7 +60,7 @@ spec:
                   name:
                     maxLength: 253
                     minLength: 1
-                    pattern: ^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$
+                    pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
                     type: string
                 required:
                 - name
@@ -78,9 +78,11 @@ spec:
                     minimum: 1
                     type: integer
                   mode:
+                    description: SessionSpendMode requires an explicit monetary policy
+                      independently of token limits.
                     enum:
-                    - limited
-                    - unlimited
+                    - Limited
+                    - Unlimited
                     type: string
                 required:
                 - mode
@@ -88,7 +90,7 @@ spec:
                 x-kubernetes-validations:
                 - message: limited spending requires limitCents; unlimited spending
                     forbids it
-                  rule: (self.mode == 'limited') == has(self.limitCents)
+                  rule: (self.mode == 'Limited') == has(self.limitCents)
               vaultRefs:
                 items:
                   description: AgentReference cannot address another namespace.
@@ -96,7 +98,7 @@ spec:
                     name:
                       maxLength: 253
                       minLength: 1
-                      pattern: ^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$
+                      pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
                       type: string
                   required:
                   - name
@@ -187,6 +189,7 @@ spec:
                   - status
                   - type
                   type: object
+                maxItems: 16
                 type: array
                 x-kubernetes-list-map-keys:
                 - type

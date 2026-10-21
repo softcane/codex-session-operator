@@ -17,8 +17,8 @@ import (
 const _readyCondition = "Ready"
 
 // EnableSessionManagement is called once during startup with the Kubernetes
-// client used by the gateway service. Requests are scoped to the authenticated
-// principal's namespace because the gateway service account spans namespaces.
+// client used by the gateway service. Requests use the URL-selected namespace
+// because the gateway service account spans namespaces.
 func (g *Gateway) EnableSessionManagement(writer client.Client) error {
 	if writer == nil {
 		return errors.New("session management requires a Kubernetes writer")
@@ -37,9 +37,32 @@ type sessionSummary struct {
 	SpendControl *agentsv1alpha1.SessionSpendControl `json:"spend_control,omitempty"`
 }
 
+// sessionDisplayPhase is a gateway presentation summary only. Authorization and
+// delivery use current-generation conditions and verified execution identities.
+func sessionDisplayPhase(session *agentsv1alpha1.Session) string {
+	if !session.DeletionTimestamp.IsZero() {
+		return "Terminating"
+	}
+	if condition := meta.FindStatusCondition(session.Status.Conditions, _readyCondition); condition != nil && condition.ObservedGeneration == session.Generation {
+		if condition.Status == metav1.ConditionTrue {
+			return "Ready"
+		}
+		if condition.Reason == "UpdatingSession" || condition.Reason == "UpdateOutcomeUnknown" {
+			return "Updating"
+		}
+	}
+	if session.Status.OpenAISessionID != "" {
+		return "Connecting"
+	}
+	if session.Status.CreationAttempted {
+		return "CreatingSession"
+	}
+	return "Pending"
+}
+
 func summarizeSession(session *agentsv1alpha1.Session) sessionSummary {
-	result := sessionSummary{Name: session.Name, UID: string(session.UID), Phase: session.Status.Phase,
-		Ready: meta.IsStatusConditionTrue(session.Status.Conditions, _readyCondition), SpendControl: session.Spec.SpendControl}
+	result := sessionSummary{Name: session.Name, UID: string(session.UID), Phase: sessionDisplayPhase(session),
+		Ready: catalogReady(session, session.Status.Conditions), SpendControl: session.Spec.SpendControl}
 	if session.Spec.AgentRef != nil {
 		result.Agent = session.Spec.AgentRef.Name
 	}
@@ -49,7 +72,7 @@ func summarizeSession(session *agentsv1alpha1.Session) sessionSummary {
 	return result
 }
 
-func (g *Gateway) handleSessionCollection(w http.ResponseWriter, r *http.Request, principal Principal) {
+func (g *Gateway) handleSessionCollection(w http.ResponseWriter, r *http.Request, scope requestScope) {
 	if g.sessionWriter == nil {
 		http.Error(w, "Session management unavailable", http.StatusServiceUnavailable)
 		return
@@ -57,7 +80,7 @@ func (g *Gateway) handleSessionCollection(w http.ResponseWriter, r *http.Request
 	switch r.Method {
 	case http.MethodGet:
 		var sessions agentsv1alpha1.SessionList
-		if err := g.reader.List(r.Context(), &sessions, client.InNamespace(principal.Namespace), client.Limit(101)); err != nil {
+		if err := g.reader.List(r.Context(), &sessions, client.InNamespace(scope.Namespace), client.Limit(101)); err != nil {
 			writeError(w, err)
 			return
 		}
@@ -81,7 +104,7 @@ func (g *Gateway) handleSessionCollection(w http.ResponseWriter, r *http.Request
 			http.Error(w, "Invalid spend choice", http.StatusBadRequest)
 			return
 		}
-		session := &agentsv1alpha1.Session{ObjectMeta: metav1.ObjectMeta{Name: input.Name, Namespace: principal.Namespace}, Spec: input.Spec}
+		session := &agentsv1alpha1.Session{ObjectMeta: metav1.ObjectMeta{Name: input.Name, Namespace: scope.Namespace}, Spec: input.Spec}
 		if err := g.sessionWriter.Create(r.Context(), session); err != nil {
 			if apierrors.IsAlreadyExists(err) {
 				http.Error(w, "Session name already exists; inspect the existing Session before retrying", http.StatusConflict)
@@ -94,14 +117,14 @@ func (g *Gateway) handleSessionCollection(w http.ResponseWriter, r *http.Request
 			writeError(w, err)
 			return
 		}
-		w.Header().Set("Location", "/v1/namespaces/"+principal.Namespace+"/sessions/"+input.Name)
+		w.Header().Set("Location", "/v1/namespaces/"+scope.Namespace+"/sessions/"+input.Name)
 		writeJSON(w, http.StatusCreated, summarizeSession(session))
 	default:
 		methodError(w)
 	}
 }
 
-func (g *Gateway) handleCatalog(w http.ResponseWriter, r *http.Request, principal Principal) {
+func (g *Gateway) handleCatalog(w http.ResponseWriter, r *http.Request, scope requestScope) {
 	if r.Method != http.MethodGet {
 		methodError(w)
 		return
@@ -112,7 +135,7 @@ func (g *Gateway) handleCatalog(w http.ResponseWriter, r *http.Request, principa
 	var environments agentsv1alpha1.EnvironmentList
 	var vaults agentsv1alpha1.VaultList
 	for _, object := range []client.ObjectList{&agents, &environments, &vaults} {
-		if err := g.reader.List(ctx, object, client.InNamespace(principal.Namespace), client.Limit(101)); err != nil {
+		if err := g.reader.List(ctx, object, client.InNamespace(scope.Namespace), client.Limit(101)); err != nil {
 			writeError(w, err)
 			return
 		}
@@ -130,19 +153,19 @@ func (g *Gateway) handleCatalog(w http.ResponseWriter, r *http.Request, principa
 	environmentItems := make([]catalogItem, 0, len(environments.Items))
 	for i := range environments.Items {
 		e := &environments.Items[i]
-		environmentItems = append(environmentItems, catalogItem{Name: e.Name, Ready: catalogReady(e, e.Status.Conditions), Mode: e.Spec.Mode})
+		environmentItems = append(environmentItems, catalogItem{Name: e.Name, Ready: catalogReady(e, e.Status.Conditions), Mode: string(e.Spec.Mode)})
 	}
 	vaultItems := make([]catalogItem, 0, len(vaults.Items))
 	for i := range vaults.Items {
 		v := &vaults.Items[i]
 		vaultItems = append(vaultItems, catalogItem{Name: v.Name, Ready: catalogReady(v, v.Status.Conditions)})
 	}
-	profiles, nextProfile, err := g.profileSummaries(ctx, principal.Namespace, "", 100)
+	profiles, nextProfile, err := g.profileSummaries(ctx, scope.Namespace, "", 100)
 	if err != nil {
 		writeConversationError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{_callerSubjectField: principal.Subject,
+	writeJSON(w, http.StatusOK, map[string]any{_callerSubjectField: scope.Subject,
 		"profiles_source": g.profileSource(),
 		"profiles":        profiles, "profiles_more": nextProfile != "", "profiles_next_cursor": nextProfile,
 		"agents": agentItems, "environments": environmentItems, "vaults": vaultItems,

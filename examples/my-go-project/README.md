@@ -12,8 +12,8 @@ The example keeps each concern in a separate artifact:
 | `.agents/skills/` | Project procedures used by the Agent. |
 | `sandbox/Dockerfile.executor` | Application executor layered on the shared Codex executor; it adds Go, Make, a C compiler, and GitHub CLI. |
 | `sandbox/Dockerfile.skills` | Immutable skills bundle registered through the Environment. |
-| `automation/k8s/` | Agent, Environment, and Profile templates. |
+| `automation/k8s/` | Agent, Environment and Profile declarations, plus the administrator SandboxTemplate and pool. |
 
-Applying those three custom resources declares a reusable recipe. It creates no Session, executor Pod, or workspace. The gateway creates those resources only after it durably accepts a task from the Profile.
+Administrators install the SandboxTemplate and its zero-spare pool. The Environment selects that pool; the Profile selects the Environment and Agent. After accepting a task, the gateway creates a Session and our controller creates its SandboxClaim. Agent Sandbox creates and manages the Sandbox, executor Pod and workspace PVC.
 
 See the complete [my-go-project walkthrough](../../docs/my-go-project.md) for image builds, installation, task submission, recovery, and cleanup.

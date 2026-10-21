@@ -99,7 +99,7 @@ var _ = Describe("Published Profile readiness with shipped CRDs", func() {
 		agent = &agentsv1alpha1.Agent{ObjectMeta: metav1.ObjectMeta{Name: _profileAgentName, Namespace: namespace.Name},
 			Spec: agentsv1alpha1.AgentSpec{Model: _profileModel, DeletionPolicy: deletePolicy}}
 		environment = &agentsv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{Name: _profileEnvironment, Namespace: namespace.Name},
-			Spec: agentsv1alpha1.EnvironmentSpec{Mode: _noneMode, DeletionPolicy: deletePolicy}}
+			Spec: agentsv1alpha1.EnvironmentSpec{Mode: agentsv1alpha1.EnvironmentModeNone, DeletionPolicy: deletePolicy}}
 		vault = &agentsv1alpha1.Vault{ObjectMeta: metav1.ObjectMeta{Name: dependencyScenarioVaultName, Namespace: namespace.Name},
 			Spec: agentsv1alpha1.VaultSpec{DeletionPolicy: deletePolicy}}
 		for _, object := range []client.Object{agent, environment, vault} {
@@ -314,7 +314,7 @@ func TestProfilePolicyDigestIsCanonicalAndCopiesAreIndependent(t *testing.T) {
 	profile := &agentsv1alpha1.Profile{Spec: spec, Status: agentsv1alpha1.ProfileStatus{
 		Agent:  &agentsv1alpha1.ProfileDependencyStatus{Name: _profileAgentName, UID: "safe-uid", Generation: 1},
 		Vaults: []agentsv1alpha1.ProfileDependencyStatus{{Name: "a", UID: "safe-vault", Generation: 1}}}}
-	if got := agentsv1alpha1.ProfilePolicyDigest(profile.Spec); got != "bef3533dc7eb40266b1c75d03ae8cf49cb04637cf1284c4a53a1d887ec9acbbd" {
+	if got := agentsv1alpha1.ProfilePolicyDigest(profile.Spec); got != "c1888ab67d0e857458a74b1a736e39d4f36c013da9f64ee5b433d1324a84bfe4" {
 		t.Fatalf("durable policy digest encoding changed: %s", got)
 	}
 	copy := profile.DeepCopy()
@@ -326,8 +326,8 @@ func TestProfilePolicyDigestIsCanonicalAndCopiesAreIndependent(t *testing.T) {
 		t.Fatal("canonicalization changed caller-owned policy")
 	}
 	*copy.Spec.SpendControl.LimitCents = 200
-	copy.Status.Agent.UID = "changed"
-	copy.Status.Vaults[0].UID = "changed"
+	copy.Status.Agent.UID = _changedIdentityUID
+	copy.Status.Vaults[0].UID = _changedIdentityUID
 	if *profile.Spec.SpendControl.LimitCents != 100 || profile.Status.Agent.UID != "safe-uid" || profile.Status.Vaults[0].UID != "safe-vault" {
 		t.Fatal("Profile DeepCopy aliased mutable policy or status")
 	}

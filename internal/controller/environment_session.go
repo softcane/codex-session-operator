@@ -49,14 +49,14 @@ func (r *SessionReconciler) resolveEnvironment(ctx context.Context, s *agentsv1a
 	profile := environment.Spec.DeepCopy()
 	snapshot := &agentsv1alpha1.SessionEnvironmentSnapshot{Name: environment.Name, UID: string(environment.UID), Generation: environment.Generation,
 		OpenAITemplateID: environment.Status.OpenAITemplateID, ConfigurationDigest: environment.Status.ConfigurationDigest, Profile: *profile}
-	if profile.Mode == "selfHosted" {
+	if profile.Mode == "SelfHosted" {
 		fields, reason, message, err := r.resolveSelfHostedEnvironment(ctx, s, reader, &environment, profile, snapshot)
 		if reason != "" || err != nil {
 			return nil, nil, reason, message, err
 		}
 		return snapshot, fields, "", "", nil
 	}
-	if profile.Mode == _noneMode && r.Gateway != nil {
+	if profile.Mode == agentsv1alpha1.EnvironmentModeNone && r.Gateway != nil {
 		if openaiapi.EnvironmentDigest(*profile, nil) != environment.Status.ConfigurationDigest {
 			return nil, nil, environmentNotReadyReason, "None profile digest is stale", nil
 		}
@@ -95,25 +95,20 @@ func (r *SessionReconciler) resolveEnvironment(ctx context.Context, s *agentsv1a
 func (r *SessionReconciler) resolveSelfHostedEnvironment(ctx context.Context, s *agentsv1alpha1.Session,
 	reader client.Reader, environment *agentsv1alpha1.Environment, profile *agentsv1alpha1.EnvironmentSpec,
 	snapshot *agentsv1alpha1.SessionEnvironmentSnapshot) (map[string]any, string, string, error) {
-	if err := sandbox.ValidateProfile(profile.SelfHosted, r.ExecutorImages, r.CapabilityImages, r.WorkspaceStorageClasses); err != nil {
-		return nil, invalidConfigurationReason, err.Error(), nil
+	if profile.SelfHosted == nil || !slices.Contains(r.SandboxPools, profile.SelfHosted.SandboxPoolRef.Name) {
+		return nil, invalidConfigurationReason, "Sandbox pool must be approved by the operator", nil
 	}
-	if err := sandbox.ValidateRepositoryApproval(profile.SelfHosted.Repository, r.RepositoryURLs); err != nil {
-		return nil, invalidConfigurationReason, err.Error(), nil
-	}
-	source, err := readRepositorySource(ctx, reader, s.Namespace, profile.SelfHosted.Repository)
+	pool, err := sandbox.ResolvePool(ctx, reader, s.Namespace, profile.SelfHosted)
 	if err != nil {
-		return nil, "ProtectedSourceUnavailable", "Could not resolve protected repository source", err
+		return nil, invalidConfigurationReason, "Sandbox pool or template is unavailable or invalid", err
 	}
-	if openaiapi.EnvironmentDigest(*profile, source) != environment.Status.ConfigurationDigest || !reflect.DeepEqual(source, environment.Status.SourceVersion) {
-		return nil, environmentNotReadyReason, "Local profile digest is stale", nil
+	if openaiapi.SandboxEnvironmentDigest(*profile, pool) != environment.Status.ConfigurationDigest ||
+		!reflect.DeepEqual(pool, environment.Status.SandboxPool) {
+		return nil, environmentNotReadyReason, "Sandbox pool or template has changed; wait for Environment reconciliation", nil
 	}
-	snapshot.SourceVersion = source
-	paths := make([]string, 0, len(profile.SelfHosted.Capabilities))
-	for _, capability := range profile.SelfHosted.Capabilities {
-		paths = append(paths, capability.Path)
-	}
-	return map[string]any{_wireType: "self_hosted", "workspace_directory": profile.SelfHosted.WorkspaceDirectory, "capability_directories": paths}, "", "", nil
+	snapshot.SandboxPool = pool
+	paths := append([]string{}, profile.SelfHosted.CapabilityDirectories...)
+	return map[string]any{_wireType: "self_hosted", "workspace_directory": profile.SelfHosted.Workspace.Directory, "capability_directories": paths}, "", "", nil
 }
 
 func (r *SessionReconciler) trackHosted(ctx context.Context, s *agentsv1alpha1.Session, remote openaiapi.Session, base *agentsv1alpha1.Session) (ctrl.Result, error) {
@@ -132,16 +127,16 @@ func (r *SessionReconciler) trackHosted(ctx context.Context, s *agentsv1alpha1.S
 	}
 	runtime, err := r.Environments.GetHostedRuntime(ctx, remote.EnvironmentID)
 	if err != nil {
-		setState(s, "Connecting", metav1.ConditionTrue, "EnvironmentObservationFailed", "Could not observe hosted runtime setup")
+		setState(s, metav1.ConditionTrue, "EnvironmentObservationFailed", "Could not observe hosted runtime setup")
 		return wait, errors.Join(err, r.patchStatus(ctx, s, base))
 	}
-	setState(s, "Connecting", metav1.ConditionTrue, "HostedProvisioning", "OpenAI-hosted setup is pending")
+	setState(s, metav1.ConditionTrue, "HostedProvisioning", "OpenAI-hosted setup is pending")
 	if runtime.ID != remote.EnvironmentID {
-		setState(s, "Failed", metav1.ConditionFalse, configurationMismatchReason, "Observed runtime identity does not match")
+		setState(s, metav1.ConditionFalse, configurationMismatchReason, "Observed runtime identity does not match")
 	} else if runtime.Status == remoteFailedStatus || remote.Status == remoteFailedStatus {
-		setState(s, "Failed", metav1.ConditionFalse, "HostedSetupFailed", "OpenAI reports hosted setup failure; provider details are withheld")
+		setState(s, metav1.ConditionFalse, "HostedSetupFailed", "OpenAI reports hosted setup failure; provider details are withheld")
 	} else if runtime.Status == "connected" {
-		s.Status.Phase = "Ready"
+
 		for _, kind := range []string{readyCondition, connectedCondition} {
 			meta.SetStatusCondition(&s.Status.Conditions, metav1.Condition{Type: kind, Status: metav1.ConditionTrue, Reason: "HostedEnvironmentConnected", Message: "OpenAI reports hosted setup complete and environment connected", ObservedGeneration: s.Generation})
 		}
@@ -193,19 +188,10 @@ func sessionEnvironmentMatches(s *agentsv1alpha1.Session, remote openaiapi.Sessi
 	if profile == nil {
 		return false
 	}
-	paths := make([]string, 0, len(profile.Capabilities))
-	for _, capability := range profile.Capabilities {
-		paths = append(paths, capability.Path)
-	}
+	paths := append([]string{}, profile.CapabilityDirectories...)
 	return reflect.DeepEqual(paths, append([]string{}, remote.CapabilityDirectories...))
 }
 
-func sessionAgentBlock(remote openaiapi.Session, environment *agentsv1alpha1.SessionEnvironmentSnapshot) (string, string) {
-	if remote.AgentConfiguration == nil {
-		return remote.AgentBlockReason, remote.AgentBlockMessage
-	}
-	return agentEnvironmentBlock(remote.AgentConfiguration, environment)
-}
 func agentEnvironmentBlock(fields map[string]any, environment *agentsv1alpha1.SessionEnvironmentSnapshot) (string, string) {
 	var profile *agentsv1alpha1.EnvironmentSpec
 	if environment != nil {

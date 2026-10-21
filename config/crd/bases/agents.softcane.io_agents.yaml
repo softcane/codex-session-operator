@@ -42,6 +42,8 @@ spec:
               clearName:
                 type: boolean
               deletionPolicy:
+                description: DeletionPolicy selects deletion or administrative retention
+                  of owned resources.
                 enum:
                 - Delete
                 - Retain
@@ -58,8 +60,8 @@ spec:
                 type: object
                 x-kubernetes-validations:
                 - message: metadata exceeds limits or uses reserved ownership keys
-                  rule: self.all(k, size(k) <= 64 && size(self[k]) <= 512 && !(k in
-                    ['kubernetes_uid', 'operator', 'owner_scope']))
+                  rule: self.all(k, size(k) >= 1 && size(k) <= 64 && size(self[k])
+                    <= 512 && !(k in ['kubernetes_uid', 'operator', 'owner_scope']))
               model:
                 maxLength: 128
                 minLength: 1
@@ -181,9 +183,12 @@ spec:
                       properties:
                         allowedTools:
                           items:
+                            maxLength: 256
+                            minLength: 1
                             type: string
                           maxItems: 128
                           type: array
+                          x-kubernetes-list-type: atomic
                         connectionOrigin:
                           enum:
                           - service
@@ -244,25 +249,31 @@ spec:
                                   description: Args must contain non-secret arguments
                                     only.
                                   items:
+                                    maxLength: 4096
                                     type: string
                                   maxItems: 64
                                   type: array
+                                  x-kubernetes-list-type: atomic
                                 command:
                                   maxLength: 256
                                   minLength: 1
                                   type: string
-                                cwd:
-                                  maxLength: 4096
-                                  pattern: ^/
-                                  type: string
                                 envVars:
                                   items:
+                                    maxLength: 256
+                                    minLength: 1
+                                    pattern: ^[A-Za-z_][A-Za-z0-9_]{0,127}$
                                     type: string
                                   maxItems: 64
                                   type: array
+                                  x-kubernetes-list-type: atomic
+                                workingDirectory:
+                                  maxLength: 4096
+                                  pattern: ^/
+                                  type: string
                               required:
                               - command
-                              - cwd
+                              - workingDirectory
                               type: object
                             type:
                               enum:
@@ -309,9 +320,12 @@ spec:
                       properties:
                         allowedDomains:
                           items:
+                            maxLength: 256
+                            minLength: 1
                             type: string
                           maxItems: 128
                           type: array
+                          x-kubernetes-list-type: atomic
                         contextSize:
                           enum:
                           - low
@@ -426,6 +440,7 @@ spec:
                   - status
                   - type
                   type: object
+                maxItems: 16
                 type: array
                 x-kubernetes-list-map-keys:
                 - type
@@ -436,6 +451,8 @@ spec:
                 description: ManagedMetadataKeys tracks ownership of keys, never their
                   values.
                 items:
+                  maxLength: 256
+                  minLength: 1
                   type: string
                 maxItems: 26
                 type: array

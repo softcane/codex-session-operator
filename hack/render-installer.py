@@ -25,19 +25,19 @@ def image_override(logical_name, image):
     return {"name": logical_name, "newName": image}
 
 
-def render(kustomize, controller_image, gateway_image, executor_image=None):
+def render(kustomize, controller_image, gateway_image, sandbox_pools=None):
     specification = {"apiVersion": "kustomize.config.k8s.io/v1beta1", "kind": "Kustomization",
                      "resources": ["../default"], "images": [
                          image_override("controller", controller_image),
                          image_override("gateway", gateway_image),
                      ]}
-    if executor_image:
-        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/+:\-]*@sha256:[a-f0-9]{64}", executor_image):
-            raise ValueError("Executor image must be an immutable repository@sha256:digest")
+    if sandbox_pools:
+        if not re.fullmatch(r"[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?(?:,[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?)*", sandbox_pools):
+            raise ValueError("Sandbox pools must be comma-separated Kubernetes names")
         patch = {"apiVersion": "apps/v1", "kind": "Deployment",
                  "metadata": {"name": "controller-manager", "namespace": "system"},
                  "spec": {"template": {"spec": {"containers": [{"name": "manager", "env": [
-                     {"name": "EXECUTOR_IMAGES", "value": executor_image}]}]}}}}
+                     {"name": "SANDBOX_POOLS", "value": sandbox_pools}]}]}}}}
         specification["patches"] = [{"patch": json.dumps(patch)}]
     with tempfile.TemporaryDirectory(prefix=".installer-", dir=ROOT / "config") as temporary:
         directory = Path(temporary)
@@ -50,12 +50,12 @@ def main():
     parser.add_argument("--kustomize", required=True)
     parser.add_argument("--controller-image", required=True)
     parser.add_argument("--gateway-image", required=True)
-    parser.add_argument("--executor-image")
+    parser.add_argument("--sandbox-pools")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     try:
         manifest = render(args.kustomize, args.controller_image, args.gateway_image,
-                          args.executor_image)
+                          args.sandbox_pools)
     except ValueError as error:
         parser.error(str(error))
     args.output.parent.mkdir(parents=True, exist_ok=True)

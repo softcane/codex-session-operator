@@ -45,16 +45,15 @@ func TestScenarioGatewayTLSLifecycleFenceReturnsHTTPStatus(t *testing.T) {
 		{name: "sealed conversation", closed: true, wantStatus: http.StatusGone},
 	}
 	mutations := []struct {
-		name  string
-		path  string
-		body  string
-		token string
+		name string
+		path string
+		body string
 	}{
-		{name: _scenarioMessage, path: _testMessagePath, body: _testFirstMessageBody, token: _token},
+		{name: _scenarioMessage, path: _testMessagePath, body: _testFirstMessageBody},
 		{name: _scenarioCancel, path: _scenarioSessionPath + "/cancel",
-			body: string(mustJSON(t, map[string]string{"turn_id": _testTurnID})), token: _token},
+			body: string(mustJSON(t, map[string]string{"turn_id": _testTurnID}))},
 		{name: _scenarioApproval, path: _scenarioSessionPath + "/actions/" + actionID(scenarioPendingAction()),
-			body: string(mustJSON(t, map[string]string{"decision": _approve})), token: _token + "-approver"},
+			body: string(mustJSON(t, map[string]string{"decision": _approve}))},
 	}
 	for _, tt := range tests {
 		for _, mutation := range mutations {
@@ -92,7 +91,6 @@ func TestScenarioGatewayTLSLifecycleFenceReturnsHTTPStatus(t *testing.T) {
 				// urllib uses Connection: close and a known Content-Length for the
 				// short JSON POST that exposed the deployed acceptance failure.
 				request.Close = true
-				request.Header.Set("Authorization", "Bearer "+mutation.token)
 				request.Header.Set("Content-Type", "application/json")
 				request.Header.Set("Idempotency-Key", "tls-fenced-"+mutation.name)
 				response, err := caller.Do(request)
@@ -132,16 +130,15 @@ func TestScenarioGatewayTLSLifecycleFenceWaitsForShortBody(t *testing.T) {
 		{name: "remote disappears during body read", missingDuringRead: true, wantStatus: http.StatusServiceUnavailable},
 	}
 	mutations := []struct {
-		name  string
-		path  string
-		body  string
-		token string
+		name string
+		path string
+		body string
 	}{
-		{name: _scenarioMessage, path: _testMessagePath, body: _testFirstMessageBody, token: _token},
+		{name: _scenarioMessage, path: _testMessagePath, body: _testFirstMessageBody},
 		{name: _scenarioCancel, path: _scenarioSessionPath + "/cancel",
-			body: string(mustJSON(t, map[string]string{"turn_id": _testTurnID})), token: _token},
+			body: string(mustJSON(t, map[string]string{"turn_id": _testTurnID}))},
 		{name: _scenarioApproval, path: _scenarioSessionPath + "/actions/" + actionID(scenarioPendingAction()),
-			body: string(mustJSON(t, map[string]string{"decision": _approve})), token: _token + "-approver"},
+			body: string(mustJSON(t, map[string]string{"decision": _approve}))},
 	}
 	for _, tt := range tests {
 		for _, mutation := range mutations {
@@ -189,8 +186,8 @@ func TestScenarioGatewayTLSLifecycleFenceWaitsForShortBody(t *testing.T) {
 				if err := connection.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
 					t.Fatal(err)
 				}
-				_, err = fmt.Fprintf(connection, "POST %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\nContent-Type: application/json\r\nAuthorization: Bearer %s\r\nIdempotency-Key: tls-split-%s\r\nContent-Length: %d\r\n\r\n",
-					mutation.path, connection.RemoteAddr(), mutation.token, mutation.name, len(mutation.body))
+				_, err = fmt.Fprintf(connection, "POST %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\nContent-Type: application/json\r\nIdempotency-Key: tls-split-%s\r\nContent-Length: %d\r\n\r\n",
+					mutation.path, connection.RemoteAddr(), mutation.name, len(mutation.body))
 				if err != nil {
 					t.Fatal(err)
 				}

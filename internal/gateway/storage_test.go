@@ -15,7 +15,6 @@ func TestStorageCanceledRequestDoesNotAcceptConversation(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
 	request := httptest.NewRequest(http.MethodPost, _conversationPath, strings.NewReader(_profileTestBody)).WithContext(ctx)
-	request.Header.Set("Authorization", "Bearer "+_token)
 	request.Header.Set("Idempotency-Key", "canceled-http")
 	response := httptest.NewRecorder()
 	g.ServeHTTP(response, request)

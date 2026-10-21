@@ -28,21 +28,24 @@ class LocalSetupTests(unittest.TestCase):
             author = local_up.author_resources(args, image, "arm64")
         run.assert_not_called()
         profile = author["profile"]["spec"]
-        self.assertEqual(profile["spendControl"], {"mode": "limited", "limitCents": 500})
+        self.assertEqual(profile["spendControl"], {"mode": "Limited", "limitCents": 500})
         runtime = author["environment"]["spec"]["selfHosted"]
-        self.assertEqual(runtime["image"], image)
-        self.assertEqual(runtime["repository"], {"url": local_up.REPOSITORY_URL, "commit": local_up.REPOSITORY_COMMIT})
-        self.assertEqual(runtime["workspaceStorage"]["claimDeletionPolicy"], "Delete")
+        self.assertEqual(runtime["sandboxPoolRef"], {"name": "sandbox-v1"})
+        self.assertEqual(runtime["workspace"]["deletionPolicy"], "Delete")
+        template = author["sandbox-template"]["spec"]
+        self.assertEqual(template["podTemplate"]["spec"]["containers"][0]["image"], image)
+        self.assertEqual(template["envVarsInjectionPolicy"], "Allowed")
+        self.assertEqual(author["sandbox-pool"]["spec"]["replicas"], 0)
         self.assertNotIn("Session", [value["kind"] for value in author.values()])
 
     def test_text_author_declares_current_profile_without_creating_a_session(self):
         args = SimpleNamespace(model="gpt-6-luna")
         author = local_up.author_resources(args, None, None)
-        self.assertEqual(author["environment"]["spec"], {"mode": "none", "deletionPolicy": "Delete"})
+        self.assertEqual(author["environment"]["spec"], {"mode": "None", "deletionPolicy": "Delete"})
         self.assertEqual(author["profile"]["spec"], {
             "agentRef": {"name": "investigator"},
             "environmentRef": {"name": "text-only"},
-            "spendControl": {"mode": "limited", "limitCents": 500},
+            "spendControl": {"mode": "Limited", "limitCents": 500},
         })
         self.assertNotIn("Session", [value["kind"] for value in author.values()])
 
@@ -131,46 +134,21 @@ class LocalSetupTests(unittest.TestCase):
             self.assertNotIn(key, output.getvalue() + str(error.exception))
             self.assertNotIn(instance.protected[1], str(error.exception))
 
-    def test_tls_duration_rejects_nonpositive_or_noninteger_before_side_effects(self):
-        with tempfile.TemporaryDirectory() as directory:
-            for days in (0, -1, 1.5, True, "30"):
-                with self.subTest(days=days), patch.object(local_up.subprocess, "run") as run:
-                    with self.assertRaises(ValueError):
-                        local_up.gateway_tls.provision(local_up.Local(Path(directory), "unused"), Path(directory), days=days)
-                    run.assert_not_called()
-                    self.assertFalse((Path(directory) / "gateway.key").exists())
-
-    def test_tls_keeps_one_day_default_and_allows_thirty_day_local_certificate(self):
+    def test_readiness_checks_http_health_and_catalog_then_closes_tunnel(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory)
-            def create_certificate(args, **_options):
-                if args[0] != "openssl":
-                    return
-                Path(args[args.index("-keyout") + 1]).write_text("private-fixture")
-                Path(args[args.index("-out") + 1]).write_text("public-fixture")
-            for options, expected in (({}, "1"), ({"days": 30}, "30")):
-                with self.subTest(options=options), patch.object(local_up.Local, "run", side_effect=create_certificate) as run:
-                    local_up.gateway_tls.provision(local_up.Local(path, "unused"), path, **options)
-                    arguments = run.call_args_list[0].args[0]
-                    self.assertEqual(arguments[arguments.index("-days") + 1], expected)
-
-    def test_readiness_checks_private_ca_health_and_authenticated_catalog_then_closes_tunnel(self):
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory)
-            responses = [io.BytesIO(b"ok"), io.BytesIO(b'{"caller_subject":"local-user"}')]
+            responses = [io.BytesIO(b"ok"), io.BytesIO(b'{"caller_subject":"gateway"}')]
             for response in responses:
                 response.status = 200
-            with patch.object(local_up.ssl, "create_default_context") as ssl_context, \
-                    patch.object(local_up.subprocess, "Popen") as popen, \
+            with patch.object(local_up.subprocess, "Popen") as popen, \
                     patch.object(local_up.urllib.request, "urlopen", side_effect=responses) as urlopen:
                 popen.return_value.poll.return_value = None
-                local_up.check_gateway(local_up.Local(path, "unused"), path, 18082, "private-gateway-token")
-            ssl_context.assert_called_once_with(cafile=str(path / "gateway.crt"))
+                local_up.check_gateway(local_up.Local(path, "unused"), path, 18082)
             requests = [call.args[0] for call in urlopen.call_args_list]
-            self.assertEqual([request.full_url for request in requests], ["https://127.0.0.1:18082/readyz",
-                "https://127.0.0.1:18082/v1/namespaces/" + local_up.NS + "/catalog"])
-            self.assertTrue(all(request.get_header("Authorization") == "Bearer private-gateway-token" for request in requests))
-            self.assertTrue(all(call.kwargs["context"] is ssl_context.return_value for call in urlopen.call_args_list))
+            self.assertEqual([request.full_url for request in requests], ["http://127.0.0.1:18082/readyz",
+                "http://127.0.0.1:18082/v1/namespaces/" + local_up.NS + "/catalog"])
+            self.assertTrue(all(request.get_header("Authorization") is None for request in requests))
+            self.assertTrue(all("context" not in call.kwargs for call in urlopen.call_args_list))
             self.assertIn(local_up.CONTEXT, popen.call_args.args[0])
             self.assertEqual(popen.call_args.kwargs["env"]["KUBECONFIG"], str(path / "kubeconfig"))
             popen.return_value.terminate.assert_called_once()

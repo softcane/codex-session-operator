@@ -3,6 +3,7 @@ package openaiapi
 import (
 	"archive/zip"
 	"bytes"
+	"cmp"
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
@@ -14,12 +15,14 @@ import (
 	"io/fs"
 	"path"
 	"reflect"
+	"slices"
 	"strings"
 
 	openai "github.com/openai/openai-go/v3"
 	"github.com/openai/openai-go/v3/option"
 	agentsv1alpha1 "github.com/softcane/codex-session-operator/api/v1alpha1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/util/validation"
 )
 
 const capabilityDirectoriesField = "capability_directories"
@@ -68,9 +71,35 @@ func TemplateIdentity(uid, scope string) string {
 
 // EnvironmentDigest includes public intent and source versions, never secret values.
 func EnvironmentDigest(spec agentsv1alpha1.EnvironmentSpec, source *agentsv1alpha1.EnvironmentSourceVersion) string {
-	data, _ := json.Marshal([]any{spec, source})
+	data, _ := json.Marshal([]any{canonicalEnvironmentSpec(spec), source})
 	digest := sha256.Sum256(data)
 	return hex.EncodeToString(digest[:])
+}
+
+// SandboxEnvironmentDigest binds public environment intent to approved native source identities.
+func SandboxEnvironmentDigest(spec agentsv1alpha1.EnvironmentSpec, pool *agentsv1alpha1.SandboxPoolSnapshot) string {
+	data, _ := json.Marshal([]any{canonicalEnvironmentSpec(spec), pool})
+	digest := sha256.Sum256(data)
+	return hex.EncodeToString(digest[:])
+}
+
+// canonicalEnvironmentSpec copies cache-owned configuration before sorting only
+// collections declared as Kubernetes sets or maps. Ordered commands, packages,
+// skills and tools retain their order.
+func canonicalEnvironmentSpec(spec agentsv1alpha1.EnvironmentSpec) *agentsv1alpha1.EnvironmentSpec {
+	copySpec := spec.DeepCopy()
+	if h := copySpec.SelfHosted; h != nil {
+		slices.Sort(h.CapabilityDirectories)
+	}
+	if h := copySpec.OpenAIHosted; h != nil {
+		slices.Sort(h.CapabilityDirectories)
+		slices.Sort(h.Network.AllowedDomains)
+		slices.Sort(h.Network.BlockedDomains)
+		slices.SortFunc(h.Env, func(a, b agentsv1alpha1.HostedVariable) int { return cmp.Compare(a.Name, b.Name) })
+		slices.SortFunc(h.Files, func(a, b agentsv1alpha1.HostedFile) int { return cmp.Compare(a.Path, b.Path) })
+		slices.SortFunc(h.Plugins, func(a, b agentsv1alpha1.HostedInlineCapability) int { return cmp.Compare(a.Name, b.Name) })
+	}
+	return copySpec
 }
 
 // HostedNeedsSecret decides whether a fixed-name protected source is needed.
@@ -82,12 +111,12 @@ func HostedNeedsSecret(h *agentsv1alpha1.HostedEnvironment) bool {
 		return true
 	}
 	for _, file := range h.Files {
-		if file.Type == inlineType {
+		if file.Type == agentsv1alpha1.HostedFileTypeInline {
 			return true
 		}
 	}
 	for _, skill := range h.Skills {
-		if skill.Type == inlineType {
+		if skill.Type == agentsv1alpha1.HostedSkillTypeInline {
 			return true
 		}
 	}
@@ -119,7 +148,7 @@ func HostedConfiguration(h *agentsv1alpha1.HostedEnvironment, secret *corev1.Sec
 	files := make([]any, 0, len(h.Files))
 	for _, file := range h.Files {
 		item := map[string]any{typeField: fileIDField, pathField: file.Path, fileIDField: file.FileID}
-		if file.Type == inlineType {
+		if file.Type == agentsv1alpha1.HostedFileTypeInline {
 			data, err := value(file.SecretKey)
 			if err != nil {
 				return nil, err
@@ -134,7 +163,7 @@ func HostedConfiguration(h *agentsv1alpha1.HostedEnvironment, secret *corev1.Sec
 		if err != nil {
 			return nil, err
 		}
-		commands = append(commands, map[string]any{"command": string(data), "cwd": defaultString(command.Cwd, "/workspace")})
+		commands = append(commands, map[string]any{"command": string(data), "cwd": defaultString(command.WorkingDirectory, "/workspace")})
 	}
 	plugins := make([]any, 0, len(h.Plugins))
 	for _, plugin := range h.Plugins {
@@ -149,7 +178,7 @@ func HostedConfiguration(h *agentsv1alpha1.HostedEnvironment, secret *corev1.Sec
 	}
 	skills := make([]any, 0, len(h.Skills))
 	for _, skill := range h.Skills {
-		if skill.Type == "skillReference" {
+		if skill.Type == agentsv1alpha1.HostedSkillTypeSkillReference {
 			skills = append(skills, map[string]any{typeField: "skill_reference", skillIDField: skill.SkillID, versionField: skill.Version})
 			continue
 		}
@@ -198,13 +227,13 @@ func validateHosted(h *agentsv1alpha1.HostedEnvironment) error {
 		}
 	}
 	for _, file := range h.Files {
-		if !workspacePath(file.Path, false) || (file.Type != "fileID" && file.Type != inlineType) ||
-			(file.Type == "fileID" && (file.FileID == "" || file.SecretKey != "")) || (file.Type == inlineType && (file.SecretKey == "" || file.FileID != "")) {
+		if !workspacePath(file.Path, false) || (file.Type != agentsv1alpha1.HostedFileTypeFileID && file.Type != agentsv1alpha1.HostedFileTypeInline) ||
+			(file.Type == agentsv1alpha1.HostedFileTypeFileID && (file.FileID == "" || file.SecretKey != "")) || (file.Type == agentsv1alpha1.HostedFileTypeInline && (file.SecretKey == "" || file.FileID != "")) {
 			return errors.New("hosted file path or branch is invalid")
 		}
 	}
 	for _, command := range h.SetupCommands {
-		if !workspacePath(defaultString(command.Cwd, "/workspace"), true) {
+		if !workspacePath(defaultString(command.WorkingDirectory, "/workspace"), true) {
 			return errors.New("hosted setup cwd must stay inside workspace")
 		}
 	}
@@ -221,7 +250,7 @@ func validateHostedNetwork(network agentsv1alpha1.HostedNetwork) error {
 		return errors.New("hosted network domain lists conflict")
 	}
 	for _, domain := range append(nonNilStrings(n.AllowedDomains), n.BlockedDomains...) {
-		if strings.ContainsAny(domain, "/*:@?# \\") || strings.HasPrefix(domain, ".") || strings.HasSuffix(domain, ".") || strings.Contains(domain, "..") {
+		if len(validation.IsDNS1123Subdomain(strings.ToLower(domain))) != 0 {
 			return errors.New("network domains must be exact host names")
 		}
 	}
@@ -230,11 +259,11 @@ func validateHostedNetwork(network agentsv1alpha1.HostedNetwork) error {
 
 func validateHostedSkills(skills []agentsv1alpha1.HostedSkill) error {
 	for _, skill := range skills {
-		if skill.Type == "skillReference" {
+		if skill.Type == agentsv1alpha1.HostedSkillTypeSkillReference {
 			if skill.SkillID == "" || skill.Version == "" || strings.Trim(skill.Version, "0123456789") != "" || skill.Version[0] == '0' || skill.Inline != nil {
 				return errors.New("skill reference requires a positive pinned version")
 			}
-		} else if skill.Type != inlineType || skill.Inline == nil || skill.SkillID != "" || skill.Version != "" {
+		} else if skill.Type != agentsv1alpha1.HostedSkillTypeInline || skill.Inline == nil || skill.SkillID != "" || skill.Version != "" {
 			return errors.New("hosted skill branch is invalid")
 		}
 	}
@@ -346,10 +375,21 @@ func ObservableEnvironment(fields map[string]any, runtime bool) map[string]any {
 					}
 				}
 			}
+			if key == filesField || key == pluginsField {
+				identity := pathField
+				if key == pluginsField {
+					identity = nameField
+				}
+				slices.SortFunc(items, func(a, b any) int {
+					return cmp.Compare(defaultStringString(a.(map[string]any)[identity], ""), defaultStringString(b.(map[string]any)[identity], ""))
+				})
+			}
 			value = items
+		case capabilityDirectoriesField:
+			value = canonicalStringSet(value)
 		case networkField:
 			if object, ok := value.(map[string]any); ok {
-				value = map[string]any{"access": object["access"], allowedDomainsField: emptyList(object[allowedDomainsField]), "blocked_domains": emptyList(object["blocked_domains"])}
+				value = map[string]any{"access": object["access"], allowedDomainsField: canonicalStringSet(object[allowedDomainsField]), "blocked_domains": canonicalStringSet(object["blocked_domains"])}
 			}
 		}
 		if runtime && key == capabilityDirectoriesField {
@@ -364,11 +404,38 @@ func ObservableEnvironment(fields map[string]any, runtime bool) map[string]any {
 	}
 	return result
 }
-func emptyList(value any) any {
-	if value == nil {
-		return []any{}
+
+func canonicalStringSet(value any) any {
+	switch list := value.(type) {
+	case nil, []string:
+		return sortedStrings(value)
+	case []any:
+		for _, item := range list {
+			if _, ok := item.(string); !ok {
+				return value
+			}
+		}
+		return sortedStrings(value)
+	default:
+		return value
 	}
-	return value
+}
+
+// sortedStrings normalizes both request []string and decoded response []any.
+func sortedStrings(value any) []string {
+	result := []string{}
+	switch list := value.(type) {
+	case []string:
+		result = append(result, list...)
+	case []any:
+		for _, item := range list {
+			if text, ok := item.(string); ok {
+				result = append(result, text)
+			}
+		}
+	}
+	slices.Sort(result)
+	return result
 }
 func defaultStringString(value any, fallback string) string {
 	text, _ := value.(string)
@@ -550,7 +617,7 @@ func validatePluginNetwork(data []byte, networkAccess string) error {
 func TemplateConfigurationDigest(hosted *agentsv1alpha1.HostedEnvironment, source *agentsv1alpha1.EnvironmentSourceVersion) string {
 	copyHosted := hosted.DeepCopy()
 	copyHosted.ContainerSize = ""
-	return EnvironmentDigest(agentsv1alpha1.EnvironmentSpec{Mode: "openaiHosted", OpenAIHosted: copyHosted}, source)
+	return EnvironmentDigest(agentsv1alpha1.EnvironmentSpec{Mode: agentsv1alpha1.EnvironmentModeOpenAIHosted, OpenAIHosted: copyHosted}, source)
 }
 
 // ManagedTemplateName preserves the ownership marker even when the display prefix is cleared.

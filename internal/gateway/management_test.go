@@ -27,25 +27,16 @@ func TestSessionManagementRequiresExplicitChoicesAndNamespace(t *testing.T) {
 	endpoint := "/v1/namespaces/team/sessions"
 	for _, body := range []string{
 		`{"name":"investigation","spec":{"agentRef":{"name":"agent"},"environmentRef":{"name":"env"}}}`,
-		`{"name":"investigation","spec":{"environmentRef":{"name":"env"},"spendControl":{"mode":"unlimited"}}}`,
-		`{"name":"investigation","spec":{"agentRef":{"name":"agent"},"spendControl":{"mode":"unlimited"}}}`,
-		`{"name":"investigation","spec":{"agentRef":{"name":"agent"},"environmentRef":{"name":"env"},"spendControl":{"mode":"limited","limitCents":0}}}`,
+		`{"name":"investigation","spec":{"environmentRef":{"name":"env"},"spendControl":{"mode":"Unlimited"}}}`,
+		`{"name":"investigation","spec":{"agentRef":{"name":"agent"},"spendControl":{"mode":"Unlimited"}}}`,
+		`{"name":"investigation","spec":{"agentRef":{"name":"agent"},"environmentRef":{"name":"env"},"spendControl":{"mode":"Limited","limitCents":0}}}`,
 	} {
-		if got := request(g, http.MethodPost, endpoint, _token, "", body).Code; got != http.StatusBadRequest {
+		if got := request(g, http.MethodPost, endpoint, "", body).Code; got != http.StatusBadRequest {
 			t.Fatalf("invalid create returned %d for %s", got, body)
 		}
 	}
-	body := `{"name":"investigation","spec":{"agentRef":{"name":"agent"},"environmentRef":{"name":"env"},"spendControl":{"mode":"limited","limitCents":150}}}`
-	if got := request(g, http.MethodPost, endpoint, "invalid", "", body).Code; got != http.StatusUnauthorized {
-		t.Fatalf("unauthenticated create: %d", got)
-	}
-	if got := request(g, http.MethodPost, "/v1/namespaces/other/sessions", _token, "", body).Code; got != http.StatusNotFound {
-		t.Fatalf("cross-namespace create: %d", got)
-	}
-	if got := request(g, http.MethodGet, "/v1/namespaces/other/sessions", _token, "", "").Code; got != http.StatusNotFound {
-		t.Fatalf("cross-namespace list: %d", got)
-	}
-	response := request(g, http.MethodPost, endpoint, _token, "", body)
+	body := `{"name":"investigation","spec":{"agentRef":{"name":"agent"},"environmentRef":{"name":"env"},"spendControl":{"mode":"Limited","limitCents":150}}}`
+	response := request(g, http.MethodPost, endpoint, "", body)
 	if response.Code != http.StatusCreated || response.Header().Get("Location") != endpoint+"/investigation" {
 		t.Fatalf("create: %d %s", response.Code, response.Body.String())
 	}
@@ -56,10 +47,10 @@ func TestSessionManagementRequiresExplicitChoicesAndNamespace(t *testing.T) {
 	if saved.Spec.AgentRef.Name != _auditAgentName || saved.Spec.EnvironmentRef.Name != "env" || *saved.Spec.SpendControl.LimitCents != 150 {
 		t.Fatalf("unexpected saved Session: %+v", saved.Spec)
 	}
-	if got := request(g, http.MethodPost, endpoint, _token, "", body).Code; got != http.StatusConflict {
+	if got := request(g, http.MethodPost, endpoint, "", body).Code; got != http.StatusConflict {
 		t.Fatalf("duplicate create: %d", got)
 	}
-	response = request(g, http.MethodGet, endpoint, _token, "", "")
+	response = request(g, http.MethodGet, endpoint, "", "")
 	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"name":"investigation"`) || strings.Contains(response.Body.String(), "openaiSessionID") {
 		t.Fatalf("unsafe Session list: %d %s", response.Code, response.Body.String())
 	}
@@ -70,10 +61,10 @@ func TestCatalogExposesOnlyNamesReadinessAndMode(t *testing.T) {
 	agent := &agentsv1alpha1.Agent{ObjectMeta: metav1.ObjectMeta{Name: "private-agent", Namespace: _testNamespace}, Spec: agentsv1alpha1.AgentSpec{Model: "gpt-6-luna", DeletionPolicy: _testDeletePolicy}}
 	instructions := "confidential instructions"
 	agent.Spec.Instructions = &instructions
-	environment := &agentsv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{Name: "compute", Namespace: _testNamespace}, Spec: agentsv1alpha1.EnvironmentSpec{Mode: "none", DeletionPolicy: _testDeletePolicy}}
+	environment := &agentsv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{Name: "compute", Namespace: _testNamespace}, Spec: agentsv1alpha1.EnvironmentSpec{Mode: agentsv1alpha1.EnvironmentModeNone, DeletionPolicy: _testDeletePolicy}}
 	vault := &agentsv1alpha1.Vault{ObjectMeta: metav1.ObjectMeta{Name: "secrets", Namespace: _testNamespace}, Spec: agentsv1alpha1.VaultSpec{DeletionPolicy: _testDeletePolicy}}
 	g, _ := testGateway(t, store, simulatorForTest(), agent, environment, vault)
-	response := request(g, http.MethodGet, "/v1/namespaces/team/catalog", _token, "", "")
+	response := request(g, http.MethodGet, "/v1/namespaces/team/catalog", "", "")
 	if response.Code != http.StatusOK || strings.Contains(response.Body.String(), instructions) || strings.Contains(response.Body.String(), "spec") {
 		t.Fatalf("unsafe catalog: %d %s", response.Code, response.Body.String())
 	}
@@ -86,19 +77,22 @@ func TestCatalogExposesOnlyNamesReadinessAndMode(t *testing.T) {
 	}
 }
 
-func TestReadinessAndSessionListAuthentication(t *testing.T) {
+func TestReadinessAndSessionListWithoutAuthentication(t *testing.T) {
 	store := testStore(t)
-	g, _ := testGateway(t, store, simulatorForTest())
+	g, writer := testGateway(t, store, simulatorForTest())
+	if err := g.EnableSessionManagement(writer); err != nil {
+		t.Fatal(err)
+	}
 	for _, path := range []string{"/ui", "/ui/", "/ui/app.js", "/ui/style.css"} {
-		if got := request(g, http.MethodGet, path, _token, "", "").Code; got != http.StatusNotFound {
+		if got := request(g, http.MethodGet, path, "", "").Code; got != http.StatusNotFound {
 			t.Fatalf("removed interface path %s returned HTTP %d", path, got)
 		}
 	}
-	if got := request(g, http.MethodGet, "/readyz", "", "", "").Code; got != http.StatusOK {
+	if got := request(g, http.MethodGet, "/readyz", "", "").Code; got != http.StatusOK {
 		t.Fatalf("worker readiness: %d", got)
 	}
-	if got := request(g, http.MethodGet, "/v1/namespaces/team/sessions", "invalid", "", "").Code; got != http.StatusUnauthorized {
-		t.Fatalf("Session list requires auth: %d", got)
+	if got := request(g, http.MethodGet, "/v1/namespaces/team/sessions", "", "").Code; got != http.StatusOK {
+		t.Fatalf("Session list without credentials: %d", got)
 	}
 }
 
@@ -106,7 +100,7 @@ func TestUnsupportedMessageContentIsRejectedBeforePersistence(t *testing.T) {
 	store := testStore(t)
 	p := simulatorForTest()
 	g, _ := testGateway(t, store, p, testSession())
-	response := request(g, http.MethodPost, _testMessagePath, _token, "image-1", `{"content":[{"type":"input_image","image_url":"https://example.com/image.png"}]}`)
+	response := request(g, http.MethodPost, _testMessagePath, "image-1", `{"content":[{"type":"input_image","image_url":"https://example.com/image.png"}]}`)
 	if response.Code != http.StatusBadRequest {
 		t.Fatalf("unsupported input accepted: %d", response.Code)
 	}

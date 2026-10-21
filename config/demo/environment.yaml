@@ -5,5 +5,5 @@ metadata:
   name: demo-text-v1
   namespace: codex-session-operator-system
 spec:
-  mode: none
+  mode: None
   deletionPolicy: Delete

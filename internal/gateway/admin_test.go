@@ -19,11 +19,7 @@ func TestAdminClosedRecordPurgeRequiresAbsentSession(t *testing.T) {
 	store := testStore(t)
 	provider := simulatorForTest()
 	g, k8s := testGateway(t, store, provider, testSession())
-	approver := _token + "-approver"
-	if got := request(g, http.MethodGet, _recordsPath, approver, "", "").Code; got != http.StatusForbidden {
-		t.Fatalf("approval role inherited admin rights: %d", got)
-	}
-	g.principals[1].Admin = true
+
 	if err := store.Update(t.Context(), "uid-1", func(r *Record) error {
 		r.Namespace = _testNamespace
 		r.Name = _testSessionName
@@ -34,47 +30,41 @@ func TestAdminClosedRecordPurgeRequiresAbsentSession(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if got := request(g, http.MethodGet, _recordsPath, _token, "", "").Code; got != http.StatusForbidden {
-		t.Fatalf("ordinary caller listed audit records: %d", got)
-	}
-	admin := approver
-	if got := request(g, http.MethodGet, _recordsPath+"/uid-1", _token, "", "").Code; got != http.StatusForbidden {
-		t.Fatalf("ordinary caller read audit record: %d", got)
-	}
-	if got := request(g, http.MethodGet, _recordsPath+"/uid-1", admin, "", ""); got.Code != http.StatusOK ||
+
+	if got := request(g, http.MethodGet, _recordsPath+"/uid-1", "", ""); got.Code != http.StatusOK ||
 		!strings.Contains(got.Body.String(), "retained transcript") {
 		t.Fatalf("admin could not inspect retained record: %d", got.Code)
 	}
-	if got := request(g, http.MethodGet, _recordsPath, admin, "", ""); got.Code != http.StatusOK ||
+	if got := request(g, http.MethodGet, _recordsPath, "", ""); got.Code != http.StatusOK ||
 		!containsRecord(got.Body.String(), "uid-1") {
 		t.Fatalf("admin could not list closed record: %d", got.Code)
 	}
-	if got := request(g, http.MethodDelete, _recordsPath+"/uid-1", admin, "", "").Code; got != http.StatusConflict {
+	if got := request(g, http.MethodDelete, _recordsPath+"/uid-1", "", "").Code; got != http.StatusConflict {
 		t.Fatalf("purged a record while its Session UID exists: %d", got)
 	}
 	if err := k8s.Delete(context.Background(), testSession()); err != nil {
 		t.Fatal(err)
 	}
-	if got := request(g, http.MethodDelete, _recordsPath+"/uid-1", admin, "", "").Code; got != http.StatusConflict {
+	if got := request(g, http.MethodDelete, _recordsPath+"/uid-1", "", "").Code; got != http.StatusConflict {
 		t.Fatalf("remote Session still exists but purge returned %d", got)
 	}
 	provider.mu.Lock()
 	provider.purgeErr = errors.New("provider unavailable")
 	provider.mu.Unlock()
-	if got := request(g, http.MethodDelete, _recordsPath+"/uid-1", admin, "", "").Code; got != http.StatusServiceUnavailable {
+	if got := request(g, http.MethodDelete, _recordsPath+"/uid-1", "", "").Code; got != http.StatusServiceUnavailable {
 		t.Fatalf("provider outage did not block purge: %d", got)
 	}
 	provider.mu.Lock()
 	provider.purgeErr = nil
 	provider.remotePresent = false
 	provider.mu.Unlock()
-	if got := request(g, http.MethodDelete, _recordsPath+"/uid-1", admin, "", "").Code; got != http.StatusNoContent {
+	if got := request(g, http.MethodDelete, _recordsPath+"/uid-1", "", "").Code; got != http.StatusNoContent {
 		t.Fatalf("closed record purge returned %d", got)
 	}
 	if _, err := store.Get(t.Context(), "uid-1"); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("purged record remains: %v", err)
 	}
-	if got := request(g, http.MethodDelete, _recordsPath+"/uid-1", admin, "", "").Code; got != http.StatusNotFound {
+	if got := request(g, http.MethodDelete, _recordsPath+"/uid-1", "", "").Code; got != http.StatusNotFound {
 		t.Fatalf("repeat purge returned %d", got)
 	}
 }
@@ -83,7 +73,6 @@ func TestAdminPurgeWithoutSavedRemoteIDRequiresCompleteUIDDiscovery(t *testing.T
 	store := testStore(t)
 	provider := simulatorForTest()
 	g, _ := testGateway(t, store, provider)
-	g.principals[1].Admin = true
 	if err := store.Update(t.Context(), "uid-1", func(r *Record) error {
 		r.Namespace = _testNamespace
 		r.Name = _testSessionName
@@ -92,14 +81,14 @@ func TestAdminPurgeWithoutSavedRemoteIDRequiresCompleteUIDDiscovery(t *testing.T
 	}); err != nil {
 		t.Fatal(err)
 	}
-	admin := _token + "-approver"
-	if got := request(g, http.MethodDelete, _recordsPath+"/uid-1", admin, "", "").Code; got != http.StatusConflict {
+
+	if got := request(g, http.MethodDelete, _recordsPath+"/uid-1", "", "").Code; got != http.StatusConflict {
 		t.Fatalf("UID discovery found remote Session but purge returned %d", got)
 	}
 	provider.mu.Lock()
 	provider.remotePresent = false
 	provider.mu.Unlock()
-	if got := request(g, http.MethodDelete, _recordsPath+"/uid-1", admin, "", "").Code; got != http.StatusNoContent {
+	if got := request(g, http.MethodDelete, _recordsPath+"/uid-1", "", "").Code; got != http.StatusNoContent {
 		t.Fatalf("complete no-match discovery did not permit purge: %d", got)
 	}
 }
@@ -107,7 +96,6 @@ func TestAdminPurgeWithoutSavedRemoteIDRequiresCompleteUIDDiscovery(t *testing.T
 func TestAdminPurgeRejectsActiveAndOtherNamespace(t *testing.T) {
 	store := testStore(t)
 	g, _ := testGateway(t, store, simulatorForTest())
-	g.principals[1].Admin = true
 	for uid, namespace := range map[string]string{"active": _testNamespace, "other": "another-team"} {
 		if err := store.Update(t.Context(), uid, func(r *Record) error {
 			r.Namespace = namespace
@@ -118,14 +106,14 @@ func TestAdminPurgeRejectsActiveAndOtherNamespace(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	admin := _token + "-approver"
-	if got := request(g, http.MethodDelete, _recordsPath+"/active", admin, "", "").Code; got != http.StatusConflict {
+
+	if got := request(g, http.MethodDelete, _recordsPath+"/active", "", "").Code; got != http.StatusConflict {
 		t.Fatalf("active record purge returned %d", got)
 	}
-	if got := request(g, http.MethodDelete, _recordsPath+"/other", admin, "", "").Code; got != http.StatusNotFound {
+	if got := request(g, http.MethodDelete, _recordsPath+"/other", "", "").Code; got != http.StatusNotFound {
 		t.Fatalf("cross-namespace record purge returned %d", got)
 	}
-	if got := request(g, http.MethodGet, _recordsPath, admin, "", "").Body.String(); containsRecord(got, "other") {
+	if got := request(g, http.MethodGet, _recordsPath, "", "").Body.String(); containsRecord(got, "other") {
 		t.Fatal("cross-namespace record leaked in admin list")
 	}
 	if err := store.Purge(t.Context(), "active"); err == nil {

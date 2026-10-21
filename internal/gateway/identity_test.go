@@ -11,6 +11,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
+const _identityTestPath = "/v1/namespaces/team/identity"
+
 type unavailableMetadataReader struct{ calls atomic.Int64 }
 
 func (r *unavailableMetadataReader) Get(context.Context, client.ObjectKey, client.Object, ...client.GetOption) error {
@@ -34,7 +36,7 @@ func TestIdentityRemainsAvailableWithoutMetadataOrStorage(t *testing.T) {
 	if err := store.Close(); err != nil {
 		t.Fatal(err)
 	}
-	response := request(g, http.MethodGet, "/v1/namespaces/team/identity", _token, "", "")
+	response := request(g, http.MethodGet, _identityTestPath, "", "")
 	var identity map[string]string
 	if response.Code != http.StatusOK || json.Unmarshal(response.Body.Bytes(), &identity) != nil ||
 		identity[_callerSubjectField] != _testConversationSubject || identity["namespace"] != _testNamespace ||
@@ -42,15 +44,15 @@ func TestIdentityRemainsAvailableWithoutMetadataOrStorage(t *testing.T) {
 		t.Fatal("identity discovery depended on Kubernetes or durable storage", response.Code, response.Body.String())
 	}
 	for _, tt := range []struct {
-		path, token, method string
-		want                int
+		path, method string
+		want         int
 	}{
-		{path: "/v1/namespaces/team/identity", token: "invalid", method: http.MethodGet, want: http.StatusUnauthorized},
-		{path: "/v1/namespaces/other/identity", token: _token, method: http.MethodGet, want: http.StatusNotFound},
-		{path: "/v1/namespaces/team/identity", token: _token, method: http.MethodPost, want: http.StatusMethodNotAllowed},
+		{path: _identityTestPath, method: http.MethodGet, want: http.StatusOK},
+		{path: "/v1/namespaces/other/identity", method: http.MethodGet, want: http.StatusOK},
+		{path: _identityTestPath, method: http.MethodPost, want: http.StatusMethodNotAllowed},
 	} {
-		if response := request(g, tt.method, tt.path, tt.token, "", ""); response.Code != tt.want {
-			t.Fatal("identity auth/method/namespace boundary changed", response.Code, tt.want)
+		if response := request(g, tt.method, tt.path, "", ""); response.Code != tt.want {
+			t.Fatal("identity method/URL-namespace contract changed", response.Code, tt.want)
 		}
 	}
 }

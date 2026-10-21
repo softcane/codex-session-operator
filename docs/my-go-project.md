@@ -1,24 +1,24 @@
 # Run `my-go-project` with Codex Session Operator
 
-Run coding agents against your repositories in Kubernetes. Declare an agent, its tools and its execution environment in YAML, then submit an investigation or bug report through the Go CLI or HTTPS API.
+Run coding agents against your repositories in Kubernetes. Declare an agent, its tools and its execution environment in YAML, then submit an investigation or bug report through the Go CLI or HTTP API.
 
-With a self-hosted Environment, the gateway creates a Session for each conversation and the controller creates its executor Pod. OpenAI runs the model and managed agent loop; your Pod runs shell commands, edits files and executes tests through `codex exec-server`. You choose the container image, repository revision, skills and workspace storage.
+With a self-hosted Environment, the gateway creates a Session for each conversation and the controller requests a Sandbox through a claim. Agent Sandbox creates and maintains its executor Pod and storage. OpenAI runs the model and managed agent loop; your Pod runs shell commands, edits files and executes tests through `codex exec-server`. You choose the container image, repository revision, skills and workspace storage.
 
 A reusable Profile lets you start independent tasks with the same configuration. The gateway commits input to PostgreSQL before accepting it, retains conversation history and supports retries with stable identities. A persistent workspace keeps Git changes and local commits across executor Pod replacement.
 
-![Session flow: declare a profile, save input, create a Session and executor, retain history](assets/session-flow.gif)
+See the [architecture diagram](architecture.md) for the gateway, OpenAI and Sandbox ownership boundaries.
 
 ## The resources
 
 | Resource | What you declare |
 | --- | --- |
 | **Agent** | Model, instructions and optional tools or subagents. |
-| **Environment** | Executor image, repository, skills, compute limits and workspace storage. |
+| **Environment** | Approved sandbox pool, workspace/skills directories and cleanup policy. |
 | **Profile** | An Agent and Environment, optional Vaults and an explicit spending policy. |
 | **Session** | One conversation attempt. The gateway creates it when you start a task from a Profile. |
 | **Vault / VaultCredential** | Credential references for connected tools that need the provider's Vault. |
 
-An Environment is a recipe. Applying Agent, Environment and Profile creates no task Pod. A new self-hosted conversation selects that recipe and gets its own Session and workspace. Profile changes apply to future conversations. The API also supports OpenAI-hosted and text-only environments; this walkthrough uses self-hosted execution.
+An Environment selects an approved sandbox setup. Its administrator-maintained SandboxTemplate defines images, repository, resource limits and storage. Applying Agent, Environment and Profile creates no task Pod. A new self-hosted conversation selects that recipe and gets its own Session and workspace. Profile changes apply to future conversations. The API also supports OpenAI-hosted and text-only environments; this walkthrough uses self-hosted execution.
 
 Kubernetes stores safe configuration, identities and conditions. PostgreSQL stores task messages, receipts and history. The workspace PVC stores repository files. These are separate forms of persistence.
 
@@ -46,12 +46,13 @@ my-go-project/
 └── automation/k8s/
     ├── agent.yaml.tmpl
     ├── environment.yaml.tmpl
+    ├── sandbox.yaml.tmpl           # Administrator template and zero-spare pool
     └── profile.yaml.tmpl
 ```
 
 `AGENTS.md` explains the repository. Each `SKILL.md` describes a procedure the agent can follow. The Agent CR supplies its role and tells it to use those skills. These files are versioned source; they do not create Kubernetes resources by themselves.
 
-The shared Codex executor image supplies `codex exec-server`, Git, repository preparation, and basic runtime tools. The `my-go-project` application executor extends it with Go, Make, a C compiler, and GitHub CLI. The skills image copies `.agents/skills` into `/bundle/skills`. At Session startup, an init container installs that bundle at `/capabilities/my-go-project`; the controller registers the directory with the agent runtime. Repository checkout alone does not register skills.
+The shared Codex executor image supplies `codex exec-server`, Git, repository preparation, and basic runtime tools. The `my-go-project` application executor extends it with Go, Make, a C compiler, and GitHub CLI. The skills image copies `.agents/skills` into `/bundle/skills`. At Session startup, an init container installs that bundle at `/capabilities/my-go-project`; the Environment registers the directory with the agent runtime. Repository checkout alone does not register skills.
 
 ```mermaid
 flowchart LR
@@ -61,14 +62,17 @@ flowchart LR
     C --> G[Gateway]
     G <--> D[(PostgreSQL)]
     G --> S[New Session]
-    S --> X[Executor Pod + workspace PVC]
+    S --> SC[SandboxClaim]
+    T[Approved SandboxTemplate + pool] --> B[Agent Sandbox]
+    SC --> B
+    B --> X[Sandbox + executor Pod + PVC]
     S --> O
     O[OpenAI agent loop] <-->|commands and results| X
 ```
 
 ## Run my-go-project
 
-This walkthrough uses real OpenAI execution. Model calls incur charges. The example Profile declares `spendControl.mode: unlimited`; choose your spending policy before starting a task.
+This walkthrough uses real OpenAI execution. Model calls incur charges. The example Profile declares `spendControl.mode: Unlimited`; choose your spending policy before starting a task.
 
 You need:
 
@@ -175,9 +179,9 @@ SKILLS_IMAGE="$(pushed_image "$REGISTRY/my-go-skills")"
 export EXECUTOR_IMAGE SKILLS_IMAGE
 ```
 
-Use immutable digests in the declarations. The controller and gateway Deployments use their own images. The Environment selects the application executor; the shared executor was only its build base. Private-image pull credentials belong on the controller/gateway Pod specifications and the namespace's default ServiceAccount, which the executor uses. The remaining steps assume the nodes can pull these images.
+Use immutable digests in the declarations. The controller and gateway Deployments use their own images. The SandboxTemplate selects the application executor; the shared executor was only its build base. Controller and gateway Deployments can use registry pull credentials in their Pod specifications. Executor templates reject `imagePullSecrets`; configure registry access on the cluster nodes or use node-accessible images. The remaining steps assume the nodes can pull these images.
 
-### 3. Provision credentials and TLS
+### 3. Provision credentials
 
 Create the namespace if it does not already exist. Enter keys without placing them in shell history or command arguments.
 
@@ -199,32 +203,13 @@ k -n "$NAMESPACE" create secret generic codex-executor \
 k -n "$NAMESPACE" create secret generic codex-repository \
   --from-file="token=$PRIVATE_DIR/repository-token"
 
-openssl rand -hex 32 > "$PRIVATE_DIR/gateway-token"
-openssl rand -hex 32 > "$PRIVATE_DIR/internal-token"
-jq -n --rawfile token "$PRIVATE_DIR/gateway-token" --arg namespace "$NAMESPACE" \
-  '[{token:($token|rtrimstr("\n")),subject:"my-go-user",namespace:$namespace}]' \
-  > "$PRIVATE_DIR/principals.json"
-
-openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
-  -keyout "$PRIVATE_DIR/gateway.key" -out "$PRIVATE_DIR/gateway.crt" \
-  -subj /CN=codex-session-operator-gateway \
-  -addext "subjectAltName=DNS:codex-session-operator-gateway.$NAMESPACE.svc,IP:127.0.0.1"
-
-k -n "$NAMESPACE" create secret generic gateway-auth \
-  --from-file="principals.json=$PRIVATE_DIR/principals.json"
-k -n "$NAMESPACE" create secret generic gateway-internal \
-  --from-file="token=$PRIVATE_DIR/internal-token"
-k -n "$NAMESPACE" create secret generic gateway-tls \
-  --from-file="tls.crt=$PRIVATE_DIR/gateway.crt" \
-  --from-file="tls.key=$PRIVATE_DIR/gateway.key" \
-  --from-file="ca.crt=$PRIVATE_DIR/gateway.crt"
 ```
 
-The gateway serves HTTPS. The caller trusts `gateway.crt`; the controller uses that trust bundle and a separate internal token. Use your PKI certificates for an established deployment and renew them before expiry.
+The gateway serves HTTP. A loopback port-forward needs no gateway token or certificate. External deployments manage authentication and TLS at their ingress or proxy.
 
 ### 4. Provision PostgreSQL with authentication and TLS
 
-The [PostgreSQL manifest](../examples/platform/postgres.yaml.tmpl) creates one local database instance and a persistent volume. It enables TLS, password authentication and the durability settings the gateway requires. Skip this manifest when using an external service such as Amazon RDS; supply a gateway role that owns the target schema and can create and use its tables.
+PostgreSQL is a gateway dependency managed externally by your platform team in production. For demo and local development only, the [PostgreSQL manifest](../examples/platform/postgres.yaml.tmpl) creates one Kubernetes database instance and a persistent volume. It enables TLS, password authentication and the durability settings the gateway requires. Skip this manifest when using an external service such as Amazon RDS; supply a gateway role that owns the target schema and can create and use its tables.
 
 ```bash
 openssl rand -hex 32 | tr -d '\n' > "$PRIVATE_DIR/database-password"
@@ -261,10 +246,15 @@ For an external service, give the gateway role `CONNECT`, schema ownership with 
 
 ### 5. Install the controller and gateway
 
-Render the [Kustomize template](../examples/platform/operator.kustomization.yaml.tmpl). It selects the separate controller and gateway images, approves the exact application executor and skills images, repository URL and StorageClass, and selects live Profile CRDs.
+Install Agent Sandbox with its extensions first, then render the [Kustomize template](../examples/platform/operator.kustomization.yaml.tmpl). It selects the separate controller and gateway images, approves the `my-go-project-v1` sandbox pool, and selects live Profile CRDs.
 
 ```bash
-envsubst '${CONTROLLER_REPOSITORY} ${CONTROLLER_DIGEST} ${GATEWAY_REPOSITORY} ${GATEWAY_DIGEST} ${OWNER_SCOPE} ${EXECUTOR_IMAGE} ${SKILLS_IMAGE} ${STORAGE_CLASS} ${REPOSITORY_URL} ${ARCH}' \
+k apply --server-side -f https://github.com/kubernetes-sigs/agent-sandbox/releases/download/v1.0.7/sandbox-with-extensions.yaml
+k -n agent-sandbox-system rollout status deployment/agent-sandbox-controller --timeout=180s
+```
+
+```bash
+envsubst '${CONTROLLER_REPOSITORY} ${CONTROLLER_DIGEST} ${GATEWAY_REPOSITORY} ${GATEWAY_DIGEST} ${OWNER_SCOPE} ${ARCH}' \
   < examples/platform/operator.kustomization.yaml.tmpl \
   > "$PRIVATE_DIR/deploy/kustomization.yaml"
 ./bin/kustomize build "$PRIVATE_DIR/deploy" > "$PRIVATE_DIR/install.yaml"
@@ -284,7 +274,8 @@ If gateway startup cannot initialize or read the schema, inspect the Pod logs an
 Read the project templates before applying them:
 
 - [Agent](../examples/my-go-project/automation/k8s/agent.yaml.tmpl): `my-go-maintainer` reads repository rules and uses the investigate, fix and review skills.
-- [Environment](../examples/my-go-project/automation/k8s/environment.yaml.tmpl): `my-go-development` selects the pinned checkout and approved images, and requests a 4 GiB workspace PVC with `Retain` cleanup policy.
+- [Sandbox template and pool](../examples/my-go-project/automation/k8s/sandbox.yaml.tmpl): administrator configuration for the approved images, pinned repository, 4 GiB workspace, security, and on-demand allocation.
+- [Environment](../examples/my-go-project/automation/k8s/environment.yaml.tmpl): `my-go-development` selects the approved pool and uses `workspace.deletionPolicy: Retain`.
 - [Profile](../examples/my-go-project/automation/k8s/profile.yaml.tmpl): `my-go-project` ties the two together with an explicit spending policy.
 
 The Profile binding is:
@@ -296,24 +287,18 @@ spec:
   environmentRef:
     name: my-go-development
   spendControl:
-    mode: unlimited
+    mode: Unlimited
   vaultRefs: []
 ```
 
 Render outside the project Git repository. This pins an existing commit without trying to commit a manifest containing its own commit SHA.
 
 ```bash
-for name in agent environment profile; do
+for name in sandbox agent environment profile; do
   envsubst '${NAMESPACE} ${MODEL} ${EXECUTOR_IMAGE} ${ARCH} ${STORAGE_CLASS} ${REPOSITORY_URL} ${REPOSITORY_COMMIT} ${SKILLS_IMAGE}' \
     < "$PROJECT_DIR/automation/k8s/$name.yaml.tmpl" \
     > "$PRIVATE_DIR/author/$name.yaml"
 done
-
-# Add the private repository's protected checkout reference.
-k patch --local -f "$PRIVATE_DIR/author/environment.yaml" --type=merge \
-  -p '{"spec":{"selfHosted":{"repository":{"credentialSecretRef":{"name":"codex-repository","key":"token"},"mountCredentialsInExecutor":false}}}}' \
-  -o yaml > "$PRIVATE_DIR/environment-with-credentials.yaml"
-mv "$PRIVATE_DIR/environment-with-credentials.yaml" "$PRIVATE_DIR/author/environment.yaml"
 
 k apply --dry-run=server -f "$PRIVATE_DIR/author"
 k apply -f "$PRIVATE_DIR/author"
@@ -321,25 +306,25 @@ k -n "$NAMESPACE" wait --for=condition=Ready --timeout=240s \
   agent/my-go-maintainer environment/my-go-development profile/my-go-project
 ```
 
-For a public repository, omit the credential patch. Ready confirms that the declared dependencies and policy are available. The first task proves checkout and execution. For PR publication, enable runtime credentials before applying these declarations; see [publication](#allow-the-agent-to-publish-a-pr).
+The supplied SandboxTemplate mounts `codex-repository` in preparation. For a public repository, remove that Secret mount and its credential arguments from the template. Ready confirms that the declared dependencies and policy are available. The first task proves checkout and execution. For PR publication, enable runtime credentials before applying these declarations; see [publication](#allow-the-agent-to-publish-a-pr).
 
 ### 7. Submit the bug-fix task
 
-Forward the gateway's HTTPS service and configure the client. Keep this Bash session open while the background port-forward runs.
+Forward the gateway's HTTP service and configure the client. Keep this Bash session open while the background port-forward runs.
 
 ```bash
-export GATEWAY_PORT=18443
+export GATEWAY_PORT=18082
 k -n "$NAMESPACE" port-forward --address 127.0.0.1 \
   service/codex-session-operator-gateway "$GATEWAY_PORT:8082" \
   > "$PRIVATE_DIR/port-forward.log" 2>&1 &
 FORWARD_PID=$!
 curl --fail --silent --show-error --retry 30 --retry-delay 1 --retry-connrefused \
-  --cacert "$PRIVATE_DIR/gateway.crt" "https://127.0.0.1:$GATEWAY_PORT/readyz"
+  "http://127.0.0.1:$GATEWAY_PORT/readyz"
 
 client() {
-  "$OPERATOR_DIR/bin/gateway-client" --origin "https://127.0.0.1:$GATEWAY_PORT" \
-    --namespace "$NAMESPACE" --token-file "$PRIVATE_DIR/gateway-token" \
-    --ca-file "$PRIVATE_DIR/gateway.crt" --state-dir "$PRIVATE_DIR/operations" "$@"
+  "$OPERATOR_DIR/bin/gateway-client" --origin "http://127.0.0.1:$GATEWAY_PORT" \
+    --namespace "$NAMESPACE" \
+    --state-dir "$PRIVATE_DIR/operations" "$@"
 }
 client profiles show my-go-project
 
@@ -363,7 +348,7 @@ CONVERSATION_ID="$(jq -r .receipt.conversation_id "$PRIVATE_DIR/receipt.json")"
 client read "$CONVERSATION_ID" > "$PRIVATE_DIR/conversation.json"
 ```
 
-The gateway returns acceptance after committing the task. Its worker creates the Session; the controller freezes the selected configuration, creates the remote Session and provisions the executor/PVC. Init containers install skills and prepare the repository. The gateway waits for preparation and a current execution connection before delivering the task.
+The gateway returns acceptance after committing the task. Its worker creates the Session; the controller freezes the selected configuration, creates the remote Session and creates the SandboxClaim. Agent Sandbox provisions its executor/PVC from the template. Init containers install skills and prepare the repository. The gateway waits for preparation and a current execution connection before delivering the task.
 
 ### 8. Observe the actual outcome
 
@@ -422,7 +407,7 @@ make -C "$PROJECT_DIR" verify
 
 ### 10. Continue work and verify workspace recovery
 
-An open conversation keeps its Session and workspace. This optional check replaces only its owned executor Pod, then asks the resumed agent to verify its commit and files.
+An open conversation keeps its Session and workspace. This optional check replaces its Sandbox-owned executor Pod, then asks the resumed agent to verify its commit and files.
 
 ```bash
 PREVIOUS_ROOTS="$(jq '[.history.turns[]? | select(.subagent_id==null) | .id]' "$PRIVATE_DIR/conversation.json")"
@@ -441,7 +426,7 @@ client continue "$CONVERSATION_ID" --text-file "$PRIVATE_DIR/recovery.txt" \
 watch_new_root "$PREVIOUS_ROOTS"
 ```
 
-The replacement reuses the persistent workspace and remote Session. PostgreSQL retains the conversation. Losing an executor during a command can leave that command's outcome unknown; the agent must inspect state before repeating side effects.
+Agent Sandbox creates the replacement using the persistent workspace and the same OpenAI connection settings. PostgreSQL retains the conversation. Losing an executor during a command can leave that command's outcome unknown; the agent must inspect state before repeating side effects.
 
 For a separate investigation, start another conversation from the Profile with an investigation task. That conversation gets an independent workspace at the pinned repository commit.
 
@@ -461,13 +446,13 @@ jq -e '.summary.state=="closed" and .summary.cleaned==true' "$PRIVATE_DIR/conver
 kill "$FORWARD_PID"
 ```
 
-Close stops fresh input and removes the remote Session and executor. The example's `Retain` policy keeps the workspace PVC; saved history remains readable. A fresh attempt creates a new Session and workspace using the current Profile. A retained PVC does not attach to that new Session by itself.
+Close stops fresh input and removes the remote Session and executor. The example's `Retain` policy suspends and keeps the Sandbox and workspace PVC, then removes the claim; saved history remains readable. A fresh attempt creates a new Session and workspace using the current Profile. The retained Sandbox does not attach to that new Session.
 
-After exporting any work you need, remove the example declarations with `k -n "$NAMESPACE" delete profile/my-go-project environment/my-go-development agent/my-go-maintainer`. Delete its retained claim only after preserving the files you need. Keep PostgreSQL and the caller journal for retained history and replay; retire their credentials when the installation is no longer needed.
+After exporting any work you need, remove the example declarations with `k -n "$NAMESPACE" delete profile/my-go-project environment/my-go-development agent/my-go-maintainer`. Delete its retained Sandbox only after preserving the files you need; its PVC remains owned by that Sandbox until then. Keep PostgreSQL and the caller journal for retained history and replay; retire their credentials when the installation is no longer needed.
 
 ## Allow the agent to publish a PR
 
-Configure publication access **before starting the task**, so the new Session freezes that capability. In step 6's local Environment patch, set `mountCredentialsInExecutor` to `true` before applying the declarations. The selected Git credential needs branch-push and PR permissions. The executor image already contains GitHub CLI and a wrapper that reads the mounted token internally.
+Configure publication access **before starting the task**, so the new Session freezes that capability. In step 6's SandboxTemplate, add read-only repository credential mounts and the Git authentication helper configuration to the executor before applying the declarations. The selected Git credential needs branch-push and PR permissions. The executor image already contains GitHub CLI and a wrapper that reads the mounted token internally.
 
 Before step 7, replace the task's final authorization with permission to commit, push `softcane/fix-job-idempotency` and create one draft PR against `main`. Tell the agent to look for an existing PR from that branch before creating one, reuse it on retries and return its URL. Keep merges and deployment outside that task's authorization.
 

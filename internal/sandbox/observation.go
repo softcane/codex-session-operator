@@ -4,12 +4,12 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
-	"reflect"
+
 	"slices"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/utils/ptr"
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
 )
 
 const ExecutorInstanceAnnotation = "agents.softcane.io/executor-instance"
@@ -54,32 +54,118 @@ func executorIdentity(pod *corev1.Pod) *corev1.ContainerStatus {
 	return status
 }
 
-// ExecutorMatches compares every owned Pod field while tolerating API defaults.
+// ExecutorMatches checks the complete execution specification after known Kubernetes defaults.
+// Scheduling decisions and standard eviction tolerations are API observations, not drift.
 func ExecutorMatches(current, desired *corev1.Pod) bool {
-	if len(current.Spec.Containers) != 1 || len(current.Spec.InitContainers) != len(desired.Spec.InitContainers) || len(current.Spec.EphemeralContainers) != 0 {
+	if current == nil || desired == nil {
 		return false
 	}
-	container := current.Spec.Containers[0].DeepCopy()
-	container.TerminationMessagePath = ""
-	container.TerminationMessagePolicy = ""
-	desiredContainer := desired.Spec.Containers[0].DeepCopy()
-	desiredContainer.TerminationMessagePath = ""
-	desiredContainer.TerminationMessagePolicy = ""
-	for i := range current.Spec.InitContainers {
-		actual := current.Spec.InitContainers[i].DeepCopy()
-		expected := desired.Spec.InitContainers[i].DeepCopy()
-		actual.TerminationMessagePath, actual.TerminationMessagePolicy = "", ""
-		expected.TerminationMessagePath, expected.TerminationMessagePolicy = "", ""
-		if !reflect.DeepEqual(actual, expected) {
+	for key, value := range desired.Labels {
+		if current.Labels[key] != value {
 			return false
 		}
 	}
-	return reflect.DeepEqual(current.Spec.NodeSelector, desired.Spec.NodeSelector) && reflect.DeepEqual(*container, *desiredContainer) &&
-		reflect.DeepEqual(current.Spec.Volumes, desired.Spec.Volumes) &&
-		reflect.DeepEqual(current.Spec.SecurityContext, desired.Spec.SecurityContext) &&
-		!ptr.Deref(current.Spec.AutomountServiceAccountToken, true) &&
-		!current.Spec.HostNetwork && !current.Spec.HostPID && !current.Spec.HostIPC &&
-		!ptr.Deref(current.Spec.ShareProcessNamespace, false) && (current.Spec.ServiceAccountName == "default" || current.Spec.ServiceAccountName == "") &&
-		current.Spec.RestartPolicy == desired.Spec.RestartPolicy &&
-		reflect.DeepEqual(current.Spec.TerminationGracePeriodSeconds, desired.Spec.TerminationGracePeriodSeconds)
+	for key, value := range desired.Annotations {
+		if current.Annotations[key] != value {
+			return false
+		}
+	}
+	actual, expected := current.Spec.DeepCopy(), desired.Spec.DeepCopy()
+	normalizePod(actual)
+	normalizePod(expected)
+	return apiequality.Semantic.DeepEqual(actual, expected)
+}
+
+func normalizePod(pod *corev1.PodSpec) {
+	pod.NodeName = ""
+	if pod.ServiceAccountName == "default" {
+		pod.ServiceAccountName = ""
+	}
+	pod.DeprecatedServiceAccount = ""
+	if pod.DNSPolicy == "" {
+		pod.DNSPolicy = corev1.DNSClusterFirst
+	}
+	if pod.RestartPolicy == "" {
+		pod.RestartPolicy = corev1.RestartPolicyAlways
+	}
+	if pod.SchedulerName == "" {
+		pod.SchedulerName = "default-scheduler"
+	}
+	if pod.TerminationGracePeriodSeconds == nil {
+		pod.TerminationGracePeriodSeconds = new(int64(30))
+	}
+	if pod.EnableServiceLinks == nil {
+		pod.EnableServiceLinks = new(true)
+	}
+	if pod.PreemptionPolicy == nil {
+		policy := corev1.PreemptLowerPriority
+		pod.PreemptionPolicy = &policy
+	}
+	if pod.Priority != nil && *pod.Priority == 0 {
+		pod.Priority = nil
+	}
+	pod.Tolerations = slices.DeleteFunc(pod.Tolerations, func(t corev1.Toleration) bool {
+		return (t.Key == "node.kubernetes.io/not-ready" || t.Key == "node.kubernetes.io/unreachable") && t.Operator == corev1.TolerationOpExists && t.Effect == corev1.TaintEffectNoExecute && t.TolerationSeconds != nil && *t.TolerationSeconds == 300
+	})
+	for i := range pod.Containers {
+		normalizeContainer(&pod.Containers[i])
+	}
+	for i := range pod.InitContainers {
+		normalizeContainer(&pod.InitContainers[i])
+	}
+	for i := range pod.Volumes {
+		volume := &pod.Volumes[i]
+		if volume.Secret != nil && volume.Secret.DefaultMode == nil {
+			volume.Secret.DefaultMode = new(int32(0o644))
+		}
+		if volume.ConfigMap != nil && volume.ConfigMap.DefaultMode == nil {
+			volume.ConfigMap.DefaultMode = new(int32(0o644))
+		}
+		if volume.Projected != nil && volume.Projected.DefaultMode == nil {
+			volume.Projected.DefaultMode = new(int32(0o644))
+		}
+	}
+}
+
+func normalizeContainer(container *corev1.Container) {
+	if container.ImagePullPolicy == "" {
+		container.ImagePullPolicy = corev1.PullIfNotPresent
+	}
+	if container.TerminationMessagePath == "" {
+		container.TerminationMessagePath = "/dev/termination-log"
+	}
+	if container.TerminationMessagePolicy == "" {
+		container.TerminationMessagePolicy = corev1.TerminationMessageReadFile
+	}
+	for i := range container.Ports {
+		if container.Ports[i].Protocol == "" {
+			container.Ports[i].Protocol = corev1.ProtocolTCP
+		}
+	}
+	for i := range container.Env {
+		source := container.Env[i].ValueFrom
+		if source != nil && source.FieldRef != nil && source.FieldRef.APIVersion == "" {
+			source.FieldRef.APIVersion = "v1"
+		}
+	}
+	for _, probe := range []*corev1.Probe{container.ReadinessProbe, container.LivenessProbe, container.StartupProbe} {
+		if probe == nil {
+			continue
+		}
+		if probe.TimeoutSeconds == 0 {
+			probe.TimeoutSeconds = 1
+		}
+		if probe.PeriodSeconds == 0 {
+			probe.PeriodSeconds = 10
+		}
+		if probe.SuccessThreshold == 0 {
+			probe.SuccessThreshold = 1
+		}
+		if probe.FailureThreshold == 0 {
+			probe.FailureThreshold = 3
+		}
+		if probe.HTTPGet != nil && probe.HTTPGet.Scheme == "" {
+			probe.HTTPGet.Scheme = corev1.URISchemeHTTP
+		}
+	}
 }

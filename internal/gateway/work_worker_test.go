@@ -12,6 +12,9 @@ import (
 	"time"
 
 	agentsv1alpha1 "github.com/softcane/codex-session-operator/api/v1alpha1"
+	"github.com/softcane/codex-session-operator/internal/openaiapi"
+	"github.com/softcane/codex-session-operator/internal/sandbox"
+	"github.com/softcane/codex-session-operator/internal/testutil"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -74,22 +77,46 @@ func workerWorkRoute() profileRoute {
 		SpendControl: &agentsv1alpha1.SessionSpendControl{Mode: _workWorkerUnlimited}}
 }
 
+func workerPolicyEnvironment() *agentsv1alpha1.SessionEnvironmentSnapshot {
+	return &agentsv1alpha1.SessionEnvironmentSnapshot{Name: _workWorkerEnvironment, UID: _profileTestEnvironmentUID}
+}
+
 func workerWorkGateway(t *testing.T, store Storage, mode string) (*Gateway, *workWorkerWriter, string) {
 	t.Helper()
 	_, objects := readyProfileObjects(_testNamespace)
+	var selfHosted *agentsv1alpha1.Environment
 	for _, object := range objects {
 		if environment, ok := object.(*agentsv1alpha1.Environment); ok {
-			environment.Spec.Mode = mode
+			environment.Spec.Mode = agentsv1alpha1.EnvironmentMode(mode)
+			if mode == _selfHostedMode {
+				environment.Spec.SelfHosted = &agentsv1alpha1.SelfHostedEnvironment{SandboxPoolRef: agentsv1alpha1.AgentReference{Name: "codex-go-v1"}, Workspace: agentsv1alpha1.SelfHostedWorkspace{Directory: _executionTestWorkspace, DeletionPolicy: _testDeletePolicy}}
+				selfHosted = environment
+			}
 		}
+	}
+	if selfHosted != nil {
+		pool, template := testutil.NewSandboxPool(_testNamespace)
+		objects = append(objects, pool, template)
 	}
 	provider := simulatorForTest()
 	provider.remotePresent = false
 	g, k8s := testGateway(t, store, provider, objects...)
+	if selfHosted != nil {
+		snapshot, err := sandbox.ResolvePool(t.Context(), k8s, _testNamespace, selfHosted.Spec.SelfHosted)
+		if err != nil {
+			t.Fatal(err)
+		}
+		selfHosted.Status.SandboxPool = snapshot
+		selfHosted.Status.ConfigurationDigest = openaiapi.SandboxEnvironmentDigest(selfHosted.Spec, snapshot)
+		if err := k8s.Update(t.Context(), selfHosted); err != nil {
+			t.Fatal(err)
+		}
+	}
 	writer := &workWorkerWriter{Client: k8s, store: store}
 	if err := g.EnableProfiles(writer); err != nil {
 		t.Fatal(err)
 	}
-	record, _, err := g.createConversation(t.Context(), Principal{Namespace: _testNamespace, Subject: _testConversationSubject},
+	record, _, err := g.createConversation(t.Context(), requestScope{Namespace: _testNamespace, Subject: _testConversationSubject},
 		"worker-route", ConversationInput{RouteID: _profileTestName, Text: "Investigate this failing CI run."})
 	if err != nil {
 		t.Fatal(err)
@@ -155,13 +182,10 @@ func TestWorkWorkerReusesSessionAndQueuesTaskBeforeEvidence(t *testing.T) {
 			t.Fatal("event not queued with bounded key")
 		}
 	}
-	if err := g.workSessionOpen(t.Context(), session); err != nil {
+	if err := g.ValidateSessionPolicy(t.Context(), session, &agentsv1alpha1.SessionEnvironmentSnapshot{Name: _workWorkerEnvironment, UID: _profileTestEnvironmentUID, Profile: agentsv1alpha1.EnvironmentSpec{Mode: _selfHostedMode}}); err != nil {
 		t.Fatal(err)
 	}
-	if err := g.validateWorkSession(t.Context(), session, &agentsv1alpha1.SessionEnvironmentSnapshot{Name: _workWorkerEnvironment, UID: _profileTestEnvironmentUID, Profile: agentsv1alpha1.EnvironmentSpec{Mode: _selfHostedMode}}); err != nil {
-		t.Fatal(err)
-	}
-	session.Status.Phase = _readyCondition
+	session.Status.Conditions = []metav1.Condition{{Type: _readyCondition, Status: metav1.ConditionTrue, Reason: "Observed", ObservedGeneration: session.Generation, LastTransitionTime: metav1.Now()}}
 	if err := writer.Update(context.Background(), session); err != nil {
 		t.Fatal(err)
 	}
@@ -175,15 +199,15 @@ func TestWorkWorkerReusesSessionAndQueuesTaskBeforeEvidence(t *testing.T) {
 
 func TestWorkWorkerNoneModeReservesInitialInput(t *testing.T) {
 	store := testStore(t)
-	g, writer, id := workerWorkGateway(t, store, _noneMode)
+	g, writer, id := workerWorkGateway(t, store, string(agentsv1alpha1.EnvironmentModeNone))
 	writer.loseCreate = true
 	if err := g.syncWork(context.Background(), id); !errors.Is(err, io.ErrUnexpectedEOF) {
 		t.Fatal(err)
 	}
 	record := workerWorkRecord(t, store, id)
 	session := workerWorkSession(t, writer, record)
-	if err := g.workSessionOpen(t.Context(), session); err == nil {
-		t.Fatal("direct input can replace initial task before binding")
+	if err := g.ValidateSessionPolicy(t.Context(), session, workerPolicyEnvironment()); err == nil {
+		t.Fatal("unbound work Session passed controller creation policy")
 	}
 	if err := g.syncWork(context.Background(), id); err != nil {
 		t.Fatal(err)
@@ -197,14 +221,14 @@ func TestWorkWorkerNoneModeReservesInitialInput(t *testing.T) {
 	if err != nil || text != record.Work.Events[0].Text || key != conversation.Submissions[0].RemoteKey {
 		t.Fatal(text, key, err)
 	}
-	if err := g.workSessionOpen(t.Context(), workerWorkSession(t, writer, record)); err != nil {
+	if err := g.ValidateSessionPolicy(t.Context(), workerWorkSession(t, writer, record), workerPolicyEnvironment()); err != nil {
 		t.Fatal(err)
 	}
 }
 
 func TestWorkWorkerRecoversAfterCommitCreateAndEnqueue(t *testing.T) {
 	store, dsn := postgresForTest(t)
-	g, writer, id := workerWorkGateway(t, store, _noneMode)
+	g, writer, id := workerWorkGateway(t, store, string(agentsv1alpha1.EnvironmentModeNone))
 	writer.loseCreate = true
 	if err := g.syncWork(context.Background(), id); !errors.Is(err, io.ErrUnexpectedEOF) {
 		t.Fatal(err)
@@ -290,7 +314,7 @@ func TestWorkWorkerClosesAndRequiresExplicitNewAttempt(t *testing.T) {
 	if err := g.syncWork(context.Background(), id); !errors.Is(err, io.ErrUnexpectedEOF) {
 		t.Fatal(err)
 	}
-	if err := g.workSessionOpen(t.Context(), previous); !errors.Is(err, errClosed) {
+	if err := g.ValidateSessionPolicy(t.Context(), previous, workerPolicyEnvironment()); !errors.Is(err, errClosed) {
 		t.Fatal(err)
 	}
 	writer.failDelete = false
@@ -320,11 +344,11 @@ func TestWorkWorkerClosesAndRequiresExplicitNewAttempt(t *testing.T) {
 	if writer.creates != 2 || workerWorkRecord(t, store, id).Work.Attempts[1].SessionUID == string(previous.UID) {
 		t.Fatal("explicit restart did not create independent attempt")
 	}
-	if err := g.workSessionOpen(t.Context(), previous); err == nil {
-		t.Fatal("prior attempt permits direct delivery")
+	if err := g.ValidateSessionPolicy(t.Context(), previous, workerPolicyEnvironment()); err == nil {
+		t.Fatal("prior attempt passed controller policy")
 	}
 	delete(previous.Annotations, _workAnnotation)
-	if err := g.workSessionOpen(t.Context(), previous); err == nil {
+	if err := g.ValidateSessionPolicy(t.Context(), previous, workerPolicyEnvironment()); err == nil {
 		t.Fatal("removed annotation bypasses prior attempt index")
 	}
 }
@@ -384,8 +408,8 @@ func TestWorkWorkerRejectsForeignObjectAndUIDRecreation(t *testing.T) {
 		if err := g.syncWork(context.Background(), id); err == nil || writer.creates != 1 {
 			t.Fatal("recreated UID adopted", err)
 		}
-		if err := g.workSessionOpen(t.Context(), recreated); err == nil {
-			t.Fatal("recreated UID permits direct delivery")
+		if err := g.ValidateSessionPolicy(t.Context(), recreated, workerPolicyEnvironment()); err == nil {
+			t.Fatal("recreated UID passed controller policy")
 		}
 	})
 }

@@ -27,25 +27,31 @@ import (
 // VaultCredentialSpec contains public configuration and scoped protected references.
 type VaultCredentialSpec struct {
 	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="vaultRef is immutable"
+	// +required
 	VaultRef AgentReference `json:"vaultRef"`
 	// +kubebuilder:validation:MinLength=1
 	// +kubebuilder:validation:MaxLength=256
 	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="credential name is immutable"
+	// +required
 	Name string `json:"name"`
 	// +optional
 	// +kubebuilder:validation:MaxProperties=13
 	// +kubebuilder:validation:XValidation:rule="self.all(k, size(k) >= 1 && size(k) <= 64 && size(self[k]) <= 512 && !(k in ['kubernetes_uid', 'operator', 'owner_scope']))",message="metadata exceeds limits or uses ownership keys"
-	Metadata *map[string]string  `json:"metadata,omitempty"`
-	Auth     VaultCredentialAuth `json:"auth"`
+	Metadata *map[string]string `json:"metadata,omitempty"`
+	// +required
+	Auth VaultCredentialAuth `json:"auth"`
 	// +kubebuilder:validation:Enum=Delete;Retain
-	DeletionPolicy string `json:"deletionPolicy"`
+	// +required
+	DeletionPolicy DeletionPolicy `json:"deletionPolicy"`
 }
 
 // CredentialSecretReference selects a key in the namespace's protected Vault source.
 type CredentialSecretReference struct {
 	// +kubebuilder:validation:Enum=codex-vault
+	// +required
 	Name string `json:"name"`
 	// +kubebuilder:validation:Pattern="^[a-zA-Z0-9._-]{1,253}$"
+	// +required
 	Key string `json:"key"`
 }
 
@@ -56,6 +62,7 @@ type CredentialSecretReference struct {
 type VaultCredentialAuth struct {
 	// +kubebuilder:validation:Enum=static_bearer;mcp_oauth;environment_variable
 	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="auth type is immutable"
+	// +required
 	Type string `json:"type"`
 	// +optional
 	StaticBearer *VaultStaticBearer `json:"staticBearer,omitempty"`
@@ -70,7 +77,9 @@ type VaultStaticBearer struct {
 	// +kubebuilder:validation:MaxLength=2048
 	// +kubebuilder:validation:Pattern="^https://[^/@?#]+(/[^?#]*)?$"
 	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="MCP URL is immutable"
-	ServerURL      string                    `json:"serverURL"`
+	// +required
+	ServerURL string `json:"serverURL"`
+	// +required
 	TokenSecretRef CredentialSecretReference `json:"tokenSecretRef"`
 }
 
@@ -80,11 +89,13 @@ type VaultMCPOAuth struct {
 	// +kubebuilder:validation:MaxLength=2048
 	// +kubebuilder:validation:Pattern="^https://[^/@?#]+(/[^?#]*)?$"
 	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="MCP URL is immutable"
-	ServerURL            string                    `json:"serverURL"`
+	// +required
+	ServerURL string `json:"serverURL"`
+	// +required
 	AccessTokenSecretRef CredentialSecretReference `json:"accessTokenSecretRef"`
-	// ExpiresAt omission clears expiry when the access token is replaced.
+	// ExpirationTime omission clears expiry when the access token is replaced.
 	// +optional
-	ExpiresAt *metav1.Time `json:"expiresAt,omitempty"`
+	ExpirationTime *metav1.Time `json:"expirationTime,omitempty"`
 	// +optional
 	Refresh *VaultOAuthRefresh `json:"refresh,omitempty"`
 }
@@ -96,11 +107,14 @@ type VaultOAuthRefresh struct {
 	// +kubebuilder:validation:MaxLength=2048
 	// +kubebuilder:validation:Pattern="^https://[^/@?#]+(/[^?#]*)?$"
 	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="token endpoint is immutable"
+	// +required
 	TokenEndpoint string `json:"tokenEndpoint"`
 	// +kubebuilder:validation:MinLength=1
 	// +kubebuilder:validation:MaxLength=512
 	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="client ID is immutable"
-	ClientID              string                    `json:"clientID"`
+	// +required
+	ClientID string `json:"clientID"`
+	// +required
 	RefreshTokenSecretRef CredentialSecretReference `json:"refreshTokenSecretRef"`
 	// +optional
 	// +kubebuilder:validation:MaxLength=2048
@@ -109,7 +123,8 @@ type VaultOAuthRefresh struct {
 	// +kubebuilder:validation:MaxLength=2048
 	Scope *string `json:"scope,omitempty"`
 	// +optional
-	ClearScope        bool                   `json:"clearScope,omitempty"`
+	ClearScope bool `json:"clearScope,omitempty"`
+	// +required
 	TokenEndpointAuth VaultTokenEndpointAuth `json:"tokenEndpointAuth"`
 }
 
@@ -118,18 +133,24 @@ type VaultOAuthRefresh struct {
 type VaultTokenEndpointAuth struct {
 	// +kubebuilder:validation:Enum=none;client_secret_basic;client_secret_post
 	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="token endpoint authentication method is immutable"
+	// +required
 	Type string `json:"type"`
 	// +optional
 	ClientSecretRef *CredentialSecretReference `json:"clientSecretRef,omitempty"`
 }
 
 // VaultEnvironmentVariable supplies a hosted sandbox placeholder, never Pod credentials.
+// +kubebuilder:validation:XValidation:rule="!self.variableName.startsWith('CODEX_') && !(self.variableName.upperAscii() in ['OPENAI_API_KEY', 'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'NO_PROXY', 'SSL_CERT_FILE', 'SSL_CERT_DIR', 'REQUESTS_CA_BUNDLE', 'CURL_CA_BUNDLE', 'NODE_EXTRA_CA_CERTS'])",message="runtime-reserved variable names are forbidden"
 type VaultEnvironmentVariable struct {
 	// +kubebuilder:validation:Pattern="^[A-Za-z_][A-Za-z0-9_]{0,127}$"
-	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="secretName is immutable"
-	SecretName           string                    `json:"secretName"`
+	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="variableName is immutable"
+	// +required
+	// VariableName names the hosted environment placeholder, not a Kubernetes Secret.
+	VariableName string `json:"variableName"`
+	// +required
 	SecretValueSecretRef CredentialSecretReference `json:"secretValueSecretRef"`
 	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="networking is immutable"
+	// +required
 	Networking VaultCredentialNetworking `json:"networking"`
 }
 
@@ -137,18 +158,26 @@ type VaultEnvironmentVariable struct {
 // +kubebuilder:validation:XValidation:rule="(self.type == 'limited') == has(self.allowedHosts)",message="limited requires hosts; unrestricted forbids hosts"
 type VaultCredentialNetworking struct {
 	// +kubebuilder:validation:Enum=limited;unrestricted
+	// +required
 	Type string `json:"type"`
 	// +optional
 	// +kubebuilder:validation:MinItems=1
 	// +kubebuilder:validation:MaxItems=16
 	// +listType=set
+	// +kubebuilder:validation:items:MinLength=1
+	// +kubebuilder:validation:items:MaxLength=253
+	// +kubebuilder:validation:items:Pattern="^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$"
+	// +kubebuilder:validation:XValidation:rule="self.all(h, !h.contains('..'))",message="hosts must be exact lowercase hostnames or IPv4 addresses"
 	AllowedHosts []string `json:"allowedHosts,omitempty"`
 }
 
 // CredentialSourceVersion exposes source identity, never secret bytes or their hash.
 type CredentialSourceVersion struct {
-	Name            string `json:"name"`
-	UID             string `json:"uid"`
+	// +required
+	Name string `json:"name"`
+	// +required
+	UID string `json:"uid"`
+	// +required
 	ResourceVersion string `json:"resourceVersion"`
 }
 
@@ -164,14 +193,19 @@ type VaultCredentialStatus struct {
 	ConfigurationDigest string `json:"configurationDigest,omitempty"`
 	// +optional
 	// +kubebuilder:validation:MaxItems=1
+	// +listType=map
+	// +listMapKey=name
 	SourceVersions []CredentialSourceVersion `json:"sourceVersions,omitempty"`
 	// +optional
 	// +kubebuilder:validation:MaxItems=26
 	// +listType=set
+	// +kubebuilder:validation:items:MinLength=1
+	// +kubebuilder:validation:items:MaxLength=256
 	ManagedMetadataKeys []string `json:"managedMetadataKeys,omitempty"`
 	// +listType=map
 	// +listMapKey=type
 	// +optional
+	// +kubebuilder:validation:MaxItems=16
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
 }
 

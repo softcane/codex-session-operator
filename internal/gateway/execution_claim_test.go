@@ -26,9 +26,9 @@ func TestSelfHostedPodChangeDuringSendClaimHoldsOriginalInputUntilFreshProof(t *
 			}
 			store := &executionClaimFaultStore{memoryStore: testStore(t)}
 			provider := simulatorForTest()
-			g, writer := testGateway(t, store, provider, session, pod)
+			g, writer := testGateway(t, store, provider, executionObjects(t, session, pod)...)
 			const key = "pod-claim-change"
-			if response := request(g, http.MethodPost, _testMessagePath, _token, key, `{"text":"Keep the original operation"}`); response.Code != http.StatusAccepted {
+			if response := request(g, http.MethodPost, _testMessagePath, key, `{"text":"Keep the original operation"}`); response.Code != http.StatusAccepted {
 				t.Fatal(response.Code)
 			}
 			replacement := replacementExecutionPod(pod)
@@ -76,8 +76,9 @@ func TestSelfHostedPodChangeDuringSendClaimHoldsOriginalInputUntilFreshProof(t *
 			}
 			proof := currentSession.Status.WorkspacePreparation
 			proof.PodUID = string(replacement.UID)
+			currentSession.Status.ExecutorPodUID = string(replacement.UID)
 			proof.ContainerID = replacement.Status.ContainerStatuses[0].ContainerID
-			proof.StartedAt = replacement.Status.ContainerStatuses[0].State.Running.StartedAt
+			proof.StartTime = replacement.Status.ContainerStatuses[0].State.Running.StartedAt
 			if err := writer.Update(t.Context(), &currentSession); err != nil {
 				t.Fatal(err)
 			}
@@ -104,9 +105,9 @@ func TestSessionUIDChangeDuringSendClaimNeverDeliversOrAdoptsReplacement(t *test
 	session, pod := executionSessionAndPod(t)
 	store := &executionClaimFaultStore{memoryStore: testStore(t)}
 	provider := simulatorForTest()
-	g, writer := testGateway(t, store, provider, session, pod)
+	g, writer := testGateway(t, store, provider, executionObjects(t, session, pod)...)
 	const key = "session-claim-change"
-	if response := request(g, http.MethodPost, _testMessagePath, _token, key, `{"text":"Bound to the original Session"}`); response.Code != http.StatusAccepted {
+	if response := request(g, http.MethodPost, _testMessagePath, key, `{"text":"Bound to the original Session"}`); response.Code != http.StatusAccepted {
 		t.Fatal(response.Code)
 	}
 	store.afterClaim = func() {

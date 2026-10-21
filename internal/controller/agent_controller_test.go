@@ -465,7 +465,7 @@ var _ = Describe("Agent CRD admission", func() {
 		Expect(k8sClient.Create(ctx, resource)).To(Succeed())
 		var stored agentsv1alpha1.Agent
 		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(resource), &stored)).To(Succeed())
-		Expect(stored.Spec.DeletionPolicy).To(Equal(deletePolicy))
+		Expect(stored.Spec.DeletionPolicy).To(Equal(agentsv1alpha1.DeletionPolicyDelete))
 		Expect(stored.Status.OpenAIAgentID).To(BeEmpty())
 		stored.Status.OpenAIAgentID = "saved"
 		Expect(k8sClient.Status().Update(ctx, &stored)).To(Succeed())

@@ -2,16 +2,18 @@
 
 Codex Session Operator exposes six namespaced resources in `agents.softcane.io/v1alpha1`. The generated [CRD schemas](../config/crd/bases/) define accepted fields and validation for this checkout.
 
+Operator-owned modes use `SelfHosted`, `OpenAIHosted`, `None`, `Limited` and `Unlimited`; hosted source selectors use `FileID`, `Inline` and `SkillReference`; deletion policies use `Delete` and `Retain`. Provider/protocol values such as `reasoning.effort: high`, tool types, hosted network access and OAuth methods retain their documented wire literals. The adapter translates CRD field names, including `workingDirectory` to `cwd` and `expirationTime` to `expires_at`.
+
 ## Resource relationships
 
 | Resource | Role | Creates task compute? |
 | --- | --- | --- |
 | `Agent` | Reusable model, instructions, reasoning and tools backed by an OpenAI Agent. | No. |
-| `Environment` | Reusable execution recipe: `none`, `openaiHosted` or `selfHosted`. | No. |
+| `Environment` | Reusable execution recipe: `None`, `OpenAIHosted` or `SelfHosted`. | No. |
 | `Profile` | Gateway-approved binding of one Agent, one Environment, optional Vaults and spend control. | No. |
 | `Vault` | Reusable remote credential container. | No. |
 | `VaultCredential` | Credential metadata and a protected same-namespace Secret reference. | No. |
-| `Session` | One remote conversation with frozen dependency identities. | A self-hosted Session creates an executor Pod and optional PVC. |
+| `Session` | One remote conversation with frozen dependency identities. | A self-hosted Session creates a SandboxClaim; Agent Sandbox creates compute and storage. |
 
 Agent instructions are reusable configuration. Task messages, turns, approvals and replay identities belong in PostgreSQL. Resource status contains remote IDs, conditions and safe dependency snapshots, without conversation text or credential values.
 
@@ -19,15 +21,15 @@ Agent instructions are reusable configuration. Task messages, turns, approvals a
 
 An Agent declares the model and reusable behavior. Its `tools` field replaces the complete remote tool list when present, including an explicit empty list. Session overrides can change supported Agent settings for one Session.
 
-The [README example](../README.md#my-go-project-example) shows a repository-maintenance Agent. See the [Agent API source](../api/v1alpha1/agent_types.go) and generated schema for the full reasoning, output, multi-agent and tool variants.
+The [repository example](my-go-project.md) shows a repository-maintenance Agent. See the [Agent API source](../api/v1alpha1/agent_types.go) and generated schema for the full reasoning, output, multi-agent and tool variants.
 
 ## Environment
 
 | Mode | Execution | Per-Session Kubernetes resources |
 | --- | --- | --- |
-| `none` | OpenAI reasoning and permitted service tools, without an execution filesystem. | Session CR only. The first durable message accompanies remote creation. |
-| `openaiHosted` | OpenAI-managed runtime created from the Environment template. | Session CR; OpenAI reports runtime readiness. |
-| `selfHosted` | OpenAI runs the agent while `codex exec-server` supplies commands and files from your cluster. | Session CR, executor Pod and optional workspace PVC. |
+| `None` | OpenAI reasoning and permitted service tools, without an execution filesystem. | Session CR only. The first durable message accompanies remote creation. |
+| `OpenAIHosted` | OpenAI-managed runtime created from the Environment template. | Session CR; OpenAI reports runtime readiness. |
+| `SelfHosted` | OpenAI runs the agent while `codex exec-server` supplies commands and files from your cluster. | Session CR, SandboxClaim, Sandbox, executor Pod and template-defined storage. |
 
 A text-only Environment has no mode-specific branch:
 
@@ -38,7 +40,7 @@ metadata:
   name: text-only
   namespace: codex-session-operator-system
 spec:
-  mode: none
+  mode: None
   deletionPolicy: Delete
 ```
 
@@ -51,7 +53,7 @@ metadata:
   name: hosted-small
   namespace: codex-session-operator-system
 spec:
-  mode: openaiHosted
+  mode: OpenAIHosted
   deletionPolicy: Delete
   openaiHosted:
     name: hosted-small
@@ -60,7 +62,30 @@ spec:
       access: disabled
 ```
 
-A self-hosted Environment selects an approved immutable application executor image, architecture, workspace policy and optional repository or capability bundles. See the [persistent Environment sample](../config/samples/agents_v1alpha1_environment_persistent.yaml) and [my-go-project Environment](../examples/my-go-project/automation/k8s/environment.yaml.tmpl).
+A self-hosted Environment selects an approved, same-namespace SandboxWarmPool. Its SandboxTemplate defines the executor image, preparation, tools, resources, security and storage. The SandboxTemplate owns those settings.
+
+```yaml
+apiVersion: agents.softcane.io/v1alpha1
+kind: Environment
+metadata:
+  name: go-workspace
+  namespace: codex-session-operator-system
+spec:
+  mode: SelfHosted
+  deletionPolicy: Delete
+  selfHosted:
+    sandboxPoolRef:
+      name: my-go-project-v1
+    capabilityDirectories:
+      - /capabilities/my-go-project
+    workspace:
+      directory: /workspace
+      deletionPolicy: Retain
+```
+
+`selfHosted.workspace.directory` (default `/workspace`) and `selfHosted.capabilityDirectories` tell OpenAI where the template exposes files and skills. `selfHosted.workspace.deletionPolicy` is required and controls cleanup of the whole Sandbox environment. See the [Environment sample](../config/samples/agents_v1alpha1_environment_selfhosted.yaml), [application template](../examples/my-go-project/automation/k8s/sandbox.yaml.tmpl) and [deployment guide](deployment.md#self-hosted-execution).
+
+Workspace paths must be clean absolute directories outside reserved runtime paths. Capability paths must be clean absolute paths. References use same-namespace DNS subdomain names. Pool approval, live template identities, credentials and resource availability remain reconciliation checks.
 
 Environment readiness validates the recipe. It does not prove that repository preparation, an executor connection or a model task has run. Those checks happen for each Session.
 
@@ -80,7 +105,7 @@ spec:
   environmentRef:
     name: text-only
   spendControl:
-    mode: limited
+    mode: Limited
     limitCents: 500
   vaultRefs: []
 ```
@@ -103,12 +128,12 @@ spec:
   environmentRef:
     name: text-only
   spendControl:
-    mode: limited
+    mode: Limited
     limitCents: 500
   vaultRefs: []
 ```
 
-The authenticated gateway can create the same resource through `POST /v1/namespaces/{namespace}/sessions`:
+The gateway can create the same resource through `POST /v1/namespaces/{namespace}/sessions`:
 
 ```json
 {
@@ -116,13 +141,13 @@ The authenticated gateway can create the same resource through `POST /v1/namespa
   "spec": {
     "agentRef": {"name": "investigator"},
     "environmentRef": {"name": "text-only"},
-    "spendControl": {"mode": "limited", "limitCents": 500},
+    "spendControl": {"mode": "Limited", "limitCents": 500},
     "vaultRefs": []
   }
 }
 ```
 
-The route returns `201` with the Session URL. A `none` Environment waits for durable initial input. Send it to `POST /v1/namespaces/{namespace}/sessions/{name}/messages` with an idempotency key, then read `/history` for the saved result.
+The route returns `201` with the Session URL. A `None` Environment waits for durable initial input. Send it to `POST /v1/namespaces/{namespace}/sessions/{name}/messages` with an idempotency key, then read `/history` for the saved result.
 
 These live Session routes remain available while the Session exists:
 
@@ -136,6 +161,18 @@ These live Session routes remain available while the Session exists:
 | `/sessions/{name}/actions/...` | Read or resolve pending tool approvals. |
 
 Use the full `/v1/namespaces/{namespace}` prefix for every route. Conversation URLs remain the preferred interface for Profile-backed tasks because they stay readable after Session cleanup.
+
+## Desired state, updates and observation
+
+Optional provider settings distinguish omitted/unmanaged fields, explicit empty replacements and explicit provider-default resets. `clearName`, `clearScope`, `clearTools`, `resetReasoning` and `resetServiceTier` express persistent desired clear/default state. They are reconciled idempotently; false or omission does not request a reset. Tools, skills, packages, setup commands and process arguments are ordered atomic lists. Set/map lists such as allowed hosts/domains, capability directories, files by path and environment variables by name have order-independent comparisons and digests.
+
+Before its remote creation claim, a Session may change its references and creation settings. After `status.creationAttempted` is persisted, admission freezes Agent, Environment and Vault selection, instructions, tools, text, multi-agent configuration and reasoning summary. Existing Sessions may update model, reasoning effort, service tier, metadata and explicit spending policy. Editing reusable dependencies affects future Sessions; existing Sessions keep their frozen identity and recipe.
+
+Opaque JSON Schemas in function parameters and text formats are also creation-only. Kubernetes CEL equality can admit some same-sized replacements of unknown schema keys. The controller compares its frozen creation digest after admission, reports `ConfigurationCurrent=False` with `RequiresNewSession`, and preserves the original remote configuration and identity. Revert that edit or create a new Session. This controller check also protects against drift independently of admission.
+
+Conditions are independent observations: `RemoteSessionCreated` describes the owned remote object's existence, `ConfigurationCurrent` describes desired configuration, `WorkspacePrepared` describes the verified current executor process/workspace and `EnvironmentConnected` describes the provider connection; `Ready` summarizes current eligibility. Supported settings updates do not erase remote existence or verified workspace/connection facts. Definite remote absence, ownership changes and lost execution identity revoke the relevant execution proofs. During cleanup, confirmed remote absence remains false while compute or workspace cleanup is pending.
+
+Consumers must check the relevant condition's `observedGeneration` against `metadata.generation`. Condition types and reasons are open-ended: ignore unknown types and handle unfamiliar reasons without assuming failure or inventing a phase ordering. `Session.status` has no phase; the gateway's `summary.phase` is a display summary derived from conditions. A Ready Session or display phase does not establish turn completion; read durable root-turn history.
 
 ## Vault credentials and MCP tools
 
@@ -201,7 +238,7 @@ spec:
   environmentRef:
     name: text-only
   spendControl:
-    mode: limited
+    mode: Limited
     limitCents: 500
   vaultRefs:
     - name: service-credentials
@@ -209,13 +246,13 @@ spec:
 
 Create the `codex-vault` Secret separately. When one attached credential matches the MCP URL, the controller selects it. If several attached credentials match, set `Agent.spec.tools[].mcp.credentialID` to the chosen provider ID from `VaultCredential.status.openaiCredentialID`.
 
-`static_bearer` and `mcp_oauth` credentials apply to service-origin HTTP MCP tools. `environment_variable` credentials supply placeholders to supported hosted environments; they do not inject values into self-hosted executor Pods. The executor connection key in `codex-executor` has a separate purpose.
+`static_bearer` and `mcp_oauth` credentials apply to service-origin HTTP MCP tools. `environment_variable` credentials use `environmentVariable.variableName` to name a hosted environment variable, not a Kubernetes Secret. They supply placeholders to supported hosted environments; they do not inject values into self-hosted executor Pods. The executor connection key in `codex-executor` has a separate purpose.
 
 ## Deletion and ownership
 
 Reusable Agent, Environment, Vault and VaultCredential resources use explicit `Delete` or `Retain` policies. Profile deletion removes only the reusable binding. A Session always cleans up its owned remote conversation and, when self-hosted, its executor before its finalizer completes.
 
-For persistent self-hosted workspaces, `claimDeletionPolicy` controls whether Session cleanup deletes or retains the PVC. A retained claim does not attach to a later Session. The StorageClass volume reclaim policy and backup policy are separate controls.
+For self-hosted workspaces, `workspace.deletionPolicy: Delete` removes the SandboxClaim and its dependent Sandbox, Pod and storage. `workspace.deletionPolicy: Retain` suspends the Sandbox, detaches it from its claim, and deletes the claim while preserving the stopped environment and persistent files. A retained environment does not attach to a later Session. The StorageClass volume reclaim policy and backup policy are separate controls.
 
 The controller keeps creation claims and finalizers when a remote create or delete outcome is uncertain. Recover the exact object through its Kubernetes UID and verified owner scope; do not clear claims or finalizers to force progress.
 

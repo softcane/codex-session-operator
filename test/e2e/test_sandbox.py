@@ -55,10 +55,10 @@ class SandboxEvidenceTests(unittest.TestCase):
 
     def test_current_executor_requires_gateway_eligibility_and_exact_running_instance(self):
         session = {"metadata": {"uid": "session", "namespace": "team", "generation": 1}, "status": {
-            "conditions": [{"type": "Ready", "status": "True", "observedGeneration": 1}], "workspaceClaimUID": "claim",
-            "workspacePreparation": {"podUID": "pod", "containerID": "runtime", "restartCount": 0, "startedAt": "now",
+            "conditions": [{"type": "Ready", "status": "True", "observedGeneration": 1}], "workspaceClaimUID": "claim", "sandboxUID": "sandbox",
+            "workspacePreparation": {"podUID": "pod", "containerID": "runtime", "restartCount": 0, "startTime": "now",
                                      "configDigest": "configuration", "claimUID": "claim"}}}
-        pod = {"metadata": {"uid": "pod", "namespace": "team", "ownerReferences": [{"uid": "session", "controller": True}],
+        pod = {"metadata": {"uid": "pod", "namespace": "team", "ownerReferences": [{"uid": "sandbox", "controller": True}],
                 "annotations": {"agents.softcane.io/executor-config": "configuration"}},
             "spec": {"initContainers": [{"name": "repository-prepare"}]}, "status": {"phase": "Running",
                 "conditions": [{"type": "Ready", "status": "True"}],
@@ -101,12 +101,11 @@ class SandboxEvidenceTests(unittest.TestCase):
             alias.symlink_to(actual, target_is_directory=True)
             certificate = actual / "gateway.crt"
             certificate.write_text("fixture certificate")
-            private, token, text, state, ca = cli.private_paths(alias, "fixture-token", "fixture input", alias / "gateway.crt")
+            private, text, state, ca = cli.private_paths(alias, "fixture input", alias / "gateway.crt")
             self.assertEqual(private, actual / "cli")
-            self.assertEqual((token, text, state, ca), (actual / "cli/gateway-token", actual / "cli/task.txt",
+            self.assertEqual((text, state, ca), (actual / "cli/task.txt",
                                                        actual / "cli/operations", certificate))
-            self.assertEqual(token.stat().st_mode & 0o777, 0o600)
-            self.assertEqual(token.read_text(), "fixture-token\n")
+            self.assertEqual(text.stat().st_mode & 0o777, 0o600)
 
     def test_imported_manifest_identity_is_not_a_docker_configuration_hash(self):
         digest = "sha256:" + "a" * 64
@@ -137,14 +136,14 @@ class SandboxEvidenceTests(unittest.TestCase):
 class LiveSandboxSafetyTests(unittest.TestCase):
     def test_spending_policy_is_limited_by_default_and_unbudgeted_only_when_explicit(self):
         journey = live.Journey(Mock(), Mock(), Mock(), Mock(), {"scope": "scope", "run": "run"}, "image", "arm64", Mock())
-        self.assertEqual(journey.spending_policy(200), {"mode": "limited", "limitCents": 200})
+        self.assertEqual(journey.spending_policy(200), {"mode": "Limited", "limitCents": 200})
         journey.budgets["existing"] = 400
         with self.assertRaisesRegex(RuntimeError, "budget exhausted"):
             journey.spending_policy(200)
         explicit = live.Journey(Mock(), Mock(), Mock(), Mock(), {"scope": "scope", "run": "run"}, "image", "arm64", Mock(),
                                 without_session_budget=True)
-        self.assertEqual(explicit.spending_policy(200), {"mode": "unlimited"})
-        self.assertEqual(explicit.spending_policy(50), {"mode": "unlimited"})
+        self.assertEqual(explicit.spending_policy(200), {"mode": "Unlimited"})
+        self.assertEqual(explicit.spending_policy(50), {"mode": "Unlimited"})
 
     def test_spending_readback_requires_exact_cap_or_explicit_absent_null_policy(self):
         self.assertTrue(live.verify_spending({"spend_control": {"limit": 200, "consumed": 0}}, 200))

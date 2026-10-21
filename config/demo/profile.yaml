@@ -10,4 +10,4 @@ spec:
   environmentRef:
     name: demo-text-v1
   spendControl:
-    mode: unlimited
+    mode: Unlimited

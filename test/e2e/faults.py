@@ -156,7 +156,7 @@ def network_fault(checks,api,base,report,evidence,runtime,counts,detail,create,c
     ensure(packet_probe(checks,pod_name)=="reachable","Network baseline connection did not succeed")
     ensure(packet_probe(checks,pod_name,service_ip)=="reachable","Actual service-route baseline connection did not succeed")
     checks.apply({"apiVersion":"networking.k8s.io/v1","kind":"NetworkPolicy","metadata":{"name":name,"namespace":NS},
-        "spec":{"podSelector":{"matchLabels":{"agents.softcane.io/session-uid":session["metadata"]["uid"]}},"policyTypes":["Egress"],"egress":[]}})
+        "spec":{"podSelector":{"matchLabels":{"sandbox.users.io/session-uid":session["metadata"]["uid"]}},"policyTypes":["Egress"],"egress":[]}})
     rule=None
     boundary="actual CNI NetworkPolicy enforcement"
     firewall_packets=None

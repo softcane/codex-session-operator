@@ -15,5 +15,5 @@ Use the registered `golang-how-to` skill before Go changes.
 - Push branches or create PRs only when the task explicitly authorizes publication.
 - Do not inspect credentials, dump environment variables or print token values.
 
-The Environment registers a read-only skill bundle under `/capabilities/my-go-project`.
+The SandboxTemplate mounts a read-only skill bundle under `/capabilities/my-go-project`.
 Project skills in this checkout are source files for that bundle.

@@ -6,27 +6,24 @@ inspection; failures and ordinary runs remove only their own cluster.
 """
 
 import argparse
-import base64
 import hashlib
 import json
 from pathlib import Path
-import secrets
 import shlex
 import shutil
 import socket
-import ssl
 import subprocess
 import time
 import traceback
 import urllib.error
 import uuid
 
-import gateway_tls
 from reporting import report_path, public_report
 
 import support as helpers
 import lifecycle
 import sandbox
+import sandbox_resources
 import cli
 import faults
 
@@ -139,11 +136,10 @@ def private_write(path, text):
     path.write_text(text)
 
 
-def prepare_manual(directory, kubeconfig, token, port):
-    private_write(directory / "curl.conf", 'header = "Authorization: Bearer ' + token + '"\n')
+def prepare_manual(directory, kubeconfig, port):
     private_write(directory / "env.sh", "export DEMO_DIR=" + shlex.quote(str(directory)) +
                   "\nexport KUBECONFIG=" + shlex.quote(str(kubeconfig)) + "\nexport DEMO_NAMESPACE=" + NS +
-                  "\nexport DEMO_PORT=" + str(port) + "\nexport DEMO_URL=https://127.0.0.1:" + str(port) + "\n")
+                  "\nexport DEMO_PORT=" + str(port) + "\nexport DEMO_URL=http://127.0.0.1:" + str(port) + "\n")
 
 
 def test_conversations(checks, api, base, run, evidence, report, replace_gateway, fixture_counts):
@@ -156,7 +152,7 @@ def test_conversations(checks, api, base, run, evidence, report, replace_gateway
                        helpers.current_ready(value := checks.get("vault", vault_name)) else None)
     profile = {"id": route_id, "namespace": NS, "agent": "demo-investigator-v1",
                "environment": "demo-text-v1", "vaults": [vault_name],
-               "spend_control": {"mode": "unlimited"}}
+               "spend_control": {"mode": "Unlimited"}}
     helpers.apply_profile(checks, profile)
     replace_gateway()
     status, catalog = api.request(base + "/catalog")
@@ -185,7 +181,7 @@ def test_conversations(checks, api, base, run, evidence, report, replace_gateway
                                   ("/close", "POST", {}), ("/restart", "POST", {"text": "forbidden"})):
         forbidden = path.replace("/namespaces/" + NS + "/", "/namespaces/kube-system/") + suffix
         ensure(api.request(forbidden, method, value, "denied-" + run)[0] == 404,
-               "Conversation route accepted a caller outside its authorized namespace")
+               "Conversation route accepted a caller with a different URL namespace")
     ensure(api.request(collection.replace(NS, "kube-system"), "POST", body, key)[0] == 404,
            "Cross-namespace conversation creation was accepted")
 
@@ -206,10 +202,10 @@ def test_conversations(checks, api, base, run, evidence, report, replace_gateway
            session["spec"]["agentRef"]["name"] == "demo-investigator-v1" and
            session["spec"]["environmentRef"]["name"] == "demo-text-v1" and
            session["spec"]["vaultRefs"] == [{"name": vault_name}] and
-           session["spec"]["spendControl"] == {"mode": "unlimited"},
+           session["spec"]["spendControl"] == {"mode": "Unlimited"},
            "Conversation generated a Session with a different profile policy")
     ensure(summary["agent"] == "demo-investigator-v1" and summary["environment"] == "demo-text-v1" and
-           summary["vaults"] == [vault_name] and summary["spend_control"] == {"mode": "unlimited"},
+           summary["vaults"] == [vault_name] and summary["spend_control"] == {"mode": "Unlimited"},
            "Conversation detail omitted or changed its frozen profile policy")
     for field, resource, expected_name in (("agentSnapshot", "agent", "demo-investigator-v1"),
                                            ("environmentSnapshot", "environment", "demo-text-v1")):
@@ -230,7 +226,7 @@ def test_conversations(checks, api, base, run, evidence, report, replace_gateway
     status, listing = api.request(collection)
     ensure(status == 200 and any(item["conversation_id"] == conversation_id for item in listing["conversations"]),
            "Conversation collection omitted the accepted conversation")
-    report["checks"]["conversationProfileMappingInitialInputReplayAndAuthorization"] = True
+    report["checks"]["conversationProfileMappingInitialInputReplayAndNamespace"] = True
 
     followup = {"text": "CONVERSATION_FOLLOWUP_" + run + ": include the second observation."}
     message_key = "conversation-message-" + run
@@ -248,7 +244,7 @@ def test_conversations(checks, api, base, run, evidence, report, replace_gateway
     next_environment = "demo-conversation-text-v2"
     checks.apply({"apiVersion": "agents.softcane.io/v1alpha1", "kind": "Environment",
                   "metadata": {"name": next_environment, "namespace": NS},
-                  "spec": {"mode": "none", "deletionPolicy": "Delete"}})
+                  "spec": {"mode": "None", "deletionPolicy": "Delete"}})
     checks.wait("revised conversation Environment Ready", lambda:
                 helpers.current_ready(checks.get("environment", next_environment)))
     profile = {**profile, "environment": next_environment, "vaults": []}
@@ -345,10 +341,8 @@ def main():
     directory = report_path(cluster)
     directory.mkdir(mode=0o700)
     kubeconfig = directory / "kubeconfig"
-    token = secrets.token_hex(32)
-    other_token = secrets.token_hex(32)
-    checks = helpers.Checks(kubeconfig, cluster, {"demo-token": token, "other-token": other_token})
-    evidence = helpers.Evidence(directory, [token, other_token])
+    checks = helpers.Checks(kubeconfig, cluster, {})
+    evidence = helpers.Evidence(directory, [])
     config = Path.home() / ".kube/config"
     before = config.read_bytes() if config.exists() else None
     existing = checks.run(["kind", "get", "clusters"]).splitlines()
@@ -374,18 +368,12 @@ def main():
         checks.apply({"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": NS,
                       "labels": {"pod-security.kubernetes.io/enforce": "restricted"}}})
         checks.secret("openai-application", {"OPENAI_API_KEY": "fixture-only-no-real-key"})
-        checks.secret("gateway-auth", {"principals.json": json.dumps([
-            {"token": token, "subject": "demo-user", "namespace": NS},
-            {"token": other_token, "subject": "other-user", "namespace": "profile-scope"}])})
-        certificate = gateway_tls.provision(checks, directory)
-        (directory / "gateway.key").chmod(0o600)
-        evidence.protect([(directory / "gateway.key").read_text()])
-        internal = json.loads(checks.kubectl("get", "secret/gateway-internal", "-n", NS, "-o", "json"))
-        evidence.protect([base64.b64decode(internal["data"]["token"]).decode()])
+        certificate = None
         checks.apply({"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": "provider-fixture", "namespace": NS},
                       "data": {"server.js": (ROOT / "test/e2e/provider.js").read_text()}})
         database_url = "postgres://postgres@gateway-postgres:5432/postgres?sslmode=disable"
         checks.secret("gateway-database", {"url": database_url})
+        sandbox_resources.install(checks)
         manifest = checks.run([str(ROOT / "bin/kustomize"), "build", "config/demo"])
         evidence.write("install.yaml", manifest)
         report["images"] = {tag: checks.run(["docker", "image", "inspect", tag, "--format", "{{.Id}}"])
@@ -417,7 +405,7 @@ def main():
         checks.wait("demo Profile Ready", lambda:
                     helpers.current_ready(checks.get("profile", "demo-investigation")))
         demo_profile = {"id": "demo-investigation", "namespace": NS, "agent": "demo-investigator-v1",
-                        "environment": "demo-text-v1", "spend_control": {"mode": "unlimited"}}
+                        "environment": "demo-text-v1", "spend_control": {"mode": "Unlimited"}}
         sandbox_runtime = sandbox.install(checks, sandbox_fixture, evidence)
         checks.kubectl("apply", "--dry-run=server", "-f", "config/demo/session.yaml")
         report["checks"]["yamlAndDirectSessionAdmission"] = True
@@ -425,8 +413,8 @@ def main():
         with socket.socket() as available:
             available.bind(("127.0.0.1", 0))
             port = available.getsockname()[1]
-        context = ssl.create_default_context(cafile=str(certificate))
-        raw_api = helpers.API(port, token, context)
+        context = None
+        raw_api = helpers.API(port, context)
         base = "/v1/namespaces/" + NS
         gateway_restart_baseline = {}
 
@@ -471,7 +459,7 @@ def main():
         checks.apply({"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": "profile-scope"}})
         for kind, name, specification in (
             ("Agent", "scoped-agent", {"model": "gpt-6-luna", "deletionPolicy": "Delete"}),
-            ("Environment", "scoped-environment", {"mode": "none", "deletionPolicy": "Delete"})):
+            ("Environment", "scoped-environment", {"mode": "None", "deletionPolicy": "Delete"})):
             checks.apply({"apiVersion": "agents.softcane.io/v1alpha1", "kind": kind,
                           "metadata": {"name": name, "namespace": "profile-scope"}, "spec": specification})
             def scoped_ready(kind=kind, name=name):
@@ -480,19 +468,19 @@ def main():
             checks.wait("other namespace dependency current Ready", scoped_ready, 180)
         shared_name = demo_profile["id"]
         helpers.apply_profile(checks, {"id": shared_name, "namespace": "profile-scope", "agent": "scoped-agent",
-            "environment": "scoped-environment", "spend_control": {"mode": "limited", "limitCents": 500}})
-        other_api = helpers.API(port, other_token, context)
+            "environment": "scoped-environment", "spend_control": {"mode": "Limited", "limitCents": 500}})
+        other_api = helpers.API(port, context)
         status, other_catalog = other_api.request("/v1/namespaces/profile-scope/catalog")
         ensure(status == 200 and any(route["id"] == shared_name and route["agent"] == "scoped-agent" for route in other_catalog["profiles"]),
                "Same-named Profile did not remain independent in the other namespace")
         ensure(any(route["id"] == shared_name and route["agent"] == "demo-investigator-v1" for route in api.request(base + "/catalog")[1]["profiles"]),
                "Other namespace Profile replaced the original selection")
-        ensure(other_api.request(base + "/catalog")[0] == 404, "Profile catalog crossed the authenticated namespace")
+        ensure(other_api.request(base + "/catalog")[0] == 200, "URL-selected namespace catalog unavailable")
         report["checks"]["sameNamedProfilesRemainNamespaceScoped"] = True
-        unauthorized = helpers.API(port, "", context)
-        ensure(unauthorized.request(base + "/catalog")[0] == 401, "Unauthenticated gateway request was accepted")
+        unauthorized = helpers.API(port, context)
+        ensure(unauthorized.request(base + "/catalog")[0] == 200, "Gateway unexpectedly required authentication")
         test_conversations(checks, api, base, run, evidence, report, replace_gateway, fixture_counts)
-        cli.run(checks, api, base, directory, token, certificate, report, evidence, run, replace_gateway, fixture_counts)
+        cli.run(checks, api, base, directory, certificate, report, evidence, run, replace_gateway, fixture_counts)
         evidence.protect(["lifecycle-secret-v1", "lifecycle-secret-v2"])
         sandbox.run(checks, api, base, report, evidence, sandbox_runtime, replace_gateway, fixture_counts)
         faults.run(checks, api, base, report, evidence, sandbox_runtime, fixture_counts)
@@ -577,11 +565,11 @@ def main():
         public_report(directory, report)
     print("Demo", report["result"] + "; report:", directory / "report.json", flush=True)
     if report["result"] == "passed" and report["clusterKept"]:
-        prepare_manual(directory, kubeconfig, token, port)
+        prepare_manual(directory, kubeconfig, port)
         print("For manual testing: source " + shlex.quote(str(directory / "env.sh")), flush=True)
         print('Then: kubectl -n "$DEMO_NAMESPACE" port-forward --address 127.0.0.1 service/' +
               GATEWAY + ' "$DEMO_PORT:8082"', flush=True)
-        print("The disposable HTTPS certificate is self-signed; trust " + str(directory / "gateway.crt") + " for this local demo.", flush=True)
+        print("Gateway HTTP URL: http://127.0.0.1:" + str(port), flush=True)
         print("Cleanup: kind delete cluster --name " + cluster, flush=True)
     return 0 if report["result"] == "passed" else 1
 

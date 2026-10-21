@@ -15,24 +15,24 @@ import json
 import os
 from pathlib import Path
 import re
-import secrets
 import shutil
 import socket
-import ssl
 import tempfile
 import time
 import urllib.error
 import urllib.request
 import uuid
 
-import gateway_tls
 from reporting import report_path, public_report
 import sandbox
+import sandbox_resources
 import support
+import retained
 
 ROOT, NS, ensure = support.ROOT, support.NS, support.ensure
 REPOSITORY_URL = "https://github.com/google/uuid.git"
 REPOSITORY_COMMIT = "0f11ee6918f41a04c201eceeadf612a377bc7fbc"
+GO_TMP_SIZE = "1Gi"
 spec = importlib.util.spec_from_file_location("sandbox_local_setup", ROOT / "hack/local-up.py")
 local_setup = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(local_setup)
@@ -90,9 +90,9 @@ class Journey:
 
     def spending_policy(self, limit):
         if self.without_session_budget:
-            return {"mode": "unlimited"}
+            return {"mode": "Unlimited"}
         ensure(sum(self.budgets.values()) + limit <= 500, "Aggregate acceptance budget exhausted; further creation refused")
-        return {"mode": "limited", "limitCents": limit}
+        return {"mode": "Limited", "limitCents": limit}
 
     def stage(self, name):
         self.report["stage"] = name
@@ -170,10 +170,10 @@ class Journey:
         expected_limit = None if self.without_session_budget else self.budgets[path]
         if verify_spending(remote, expected_limit):
             self.verified_limits.add(path)
-            self.report["spendingLimitQualified"] = len(self.verified_limits) == 4 and sum(self.budgets.values()) == 500
-        claim = self.checks.get("pvc", "workspace-" + session["metadata"]["uid"])
-        ensure(pod and pod["spec"]["containers"][0]["image"] == self.image and
-               any(owner.get("controller") and owner["uid"] == session["metadata"]["uid"] for owner in pod["metadata"].get("ownerReferences", []))
+            self.report["spendingLimitQualified"] = len(self.verified_limits) == (1 if self.report.get("singleSession") else 4) and sum(self.budgets.values()) == 500
+        claim = support.workspace_claim(self.checks, session, pod)
+        support.sandbox_chain(self.checks, session, pod)
+        ensure(pod and pod["spec"]["containers"][0]["image"] == self.image
                and claim and claim["metadata"]["uid"] == session["status"]["workspaceClaimUID"], "Production executor/PVC ownership differs")
         self.evidence.write(session["metadata"]["name"] + "-runtime.json", {"session": session, "pod": pod, "pvc": claim})
         return value, session, pod, claim
@@ -252,14 +252,64 @@ scan('');process.stdout.write(JSON.stringify(result));"""
                self.provider.get("session", entry["remoteID"]) is None, "Local/provider cleanup was not independently confirmed")
         return value
 
+    def exercise_single(self, *, keep=False):
+        """One managed root turn; explicit keep leaves its conversation open."""
+        name = "live-delete"
+        self.stage("single managed Session authoring")
+        for resource in sandbox_resources.resources(name, NS, self.image, self.architecture,
+                REPOSITORY_URL, REPOSITORY_COMMIT, tmp_size=GO_TMP_SIZE):
+            for container in resource.get("spec", {}).get("podTemplate", {}).get("spec", {}).get("containers", []):
+                container["resources"] = {"requests": {"cpu": "250m", "memory": "256Mi"}, "limits": {"cpu": "2", "memory": "2Gi"}}
+            self.checks.apply(resource)
+        self.publish("Environment", name, {"mode": "SelfHosted", "deletionPolicy": "Delete", "selfHosted": {
+            "sandboxPoolRef": {"name": name}, "workspace": {"directory": "/workspace", "deletionPolicy": "Delete"}}})
+        self.publish("Profile", name, {"agentRef": {"name": "live-agent"}, "environmentRef": {"name": name},
+            "spendControl": self.spending_policy(500)})
+        receipt = self.operation(self.base + "/conversations", {"route_id": name,
+            "text": "In the prepared repository, run pwd, git rev-parse HEAD, hostname and go test ./... using actual shell commands. "
+                    "Report the actual commit and test result. Do not modify source or tests, inspect credentials, or delegate this task."}, "single-session")
+        path = receipt["conversation_url"]
+        if not self.without_session_budget:
+            self.budgets[path] = 500
+        _, session, pod, claim = self.ready(path)
+        self.stage("single managed Session saved root completion and command output")
+        result, command_ids = self.command_history(path, {"history": {}}, ["go test", REPOSITORY_COMMIT])
+        roots = [turn for turn in result["history"]["turns"] if not turn.get("subagent_id")]
+        ensure(len(roots) == 1 and roots[0]["status"] == "completed", "Single run did not finish exactly one root turn")
+        outputs = [item for item in result["history"]["items"] if item.get("type") == "message" and item.get("role") == "assistant"
+                   and any(part.get("type") == "output_text" and part.get("text") for part in item.get("content", []))]
+        ensure(outputs, "Completed root has no saved assistant output")
+        remote = self.provider.get("session", session["status"]["openaiSessionID"])
+        verify_owner(remote, session["metadata"]["uid"], self.scope, session["status"]["openaiSessionID"])
+        ensure(remote.get("agent", {}).get("model") == self.report["model"], "Provider model differs from requested exact model")
+        ensure(self.read_exec(pod["metadata"]["name"], "git", "rev-parse", "HEAD") == REPOSITORY_COMMIT,
+               "Independent executor repository commit differs")
+        baseline = self.exec(pod["metadata"]["name"], "go", "test", "./...", timeout=180)
+        ensure("github.com/google/uuid" in baseline, "Independent repository test output missing")
+        ensure(self.exec(pod["metadata"]["name"], "git", "diff", "HEAD", "--") == "", "Managed task changed tracked project files")
+        self.evidence.write("single-session-history.json", result)
+        self.evidence.write("single-session-independent-test.log", baseline)
+        self.report["scenarios"].append({"id": "single_managed_session_real_repository", "status": "passed",
+            "model": self.report["model"], "rootTurnIDs": [turn["id"] for turn in roots], "assistantOutputItems": len(outputs),
+            "commandIDs": command_ids, "sessionUID": session["metadata"]["uid"], "remoteSessionID": session["status"]["openaiSessionID"],
+            "podUID": pod["metadata"]["uid"], "pvcUID": claim["metadata"]["uid"]})
+        if not keep:
+            self.stage("single managed Session owned cleanup")
+            self.close(path, "single-close")
+            ensure(self.checks.get("pvc", claim["metadata"]["name"]) is None, "Delete policy left the workspace PVC")
+        return {"path": path, "session": session, "pod": pod, "claim": claim}
+
     def exercise(self, policy):
         name = "live-" + policy.lower()
         self.stage(name + " authoring")
-        self.publish("Environment", name, {"mode": "selfHosted", "deletionPolicy": "Delete", "selfHosted": {
-            "image": self.image, "architecture": self.architecture, "workspaceDirectory": "/workspace", "workspaceSize": "1Gi",
-            "resources": {"cpuRequest": "250m", "cpuLimit": "2", "memoryRequest": "256Mi", "memoryLimit": "2Gi"},
-            "workspaceStorage": {"type": "Persistent", "storageClassName": "standard", "claimDeletionPolicy": policy},
-            "repository": {"url": REPOSITORY_URL, "commit": REPOSITORY_COMMIT}}})
+        for resource in sandbox_resources.resources(name, NS, self.image, self.architecture, REPOSITORY_URL, REPOSITORY_COMMIT,
+                                                   tmp_size=GO_TMP_SIZE):
+            # Real repository builds need room for the Go compiler and its cache.
+            for container in resource.get("spec", {}).get("podTemplate", {}).get("spec", {}).get("containers", []):
+                container["resources"] = {"requests": {"cpu": "250m", "memory": "256Mi"}, "limits": {"cpu": "2", "memory": "2Gi"}}
+            self.checks.apply(resource)
+        self.publish("Environment", name, {"mode": "SelfHosted", "deletionPolicy": "Delete", "selfHosted": {
+            "sandboxPoolRef": {"name": name}, "workspace": {"directory": "/workspace", "deletionPolicy": policy}}})
         self.publish("Profile", name, {"agentRef": {"name": "live-agent"}, "environmentRef": {"name": name},
             "spendControl": self.spending_policy(200)})
         receipt = self.operation(self.base + "/conversations", {"route_id": name,
@@ -341,7 +391,8 @@ anchor+'\\treturn Nil, fmt.Errorf("sandbox controlled Parse regression")\\n'));"
             ensure(self.checks.get("pvc", claim["metadata"]["name"]) is None, "Delete policy left a workspace PVC")
         else:
             old_claim = self.checks.get("pvc", claim["metadata"]["name"])
-            ensure(old_claim and old_claim["metadata"]["uid"] == claim["metadata"]["uid"] and not old_claim["metadata"].get("ownerReferences"), "Retain claim ownership changed")
+            ensure(old_claim and old_claim["metadata"]["uid"] == claim["metadata"]["uid"] and old_claim["metadata"].get("ownerReferences"), "Retain claim ownership changed")
+            support.retained_sandbox(self.checks, session)
             reader = sandbox.read_only_probe(self.checks, self.image, claim["metadata"]["name"])
             ensure(self.read_exec(reader, "cat", "/workspace/proof.txt", container="reader") == nonce, "Retained file did not survive cleanup")
             self.checks.kubectl("delete", "pod", reader, "-n", NS, "--wait=true", "--timeout=120s")
@@ -360,10 +411,9 @@ anchor+'\\treturn Nil, fmt.Errorf("sandbox controlled Parse regression")\\n'));"
         ensure(self.detail(path)["history"]["items"] == retained_history["history"]["items"], "Fresh attempt changed retained old history")
         self.close(fresh_path, name + "-fresh-close")
         if policy == "Retain":
-            for owned in (claim, fresh_claim):
-                current = self.checks.get("pvc", owned["metadata"]["name"])
-                ensure(current and current["metadata"]["uid"] == owned["metadata"]["uid"], "Retained claim UID changed before harness cleanup")
-                self.checks.kubectl("delete", "pvc", current["metadata"]["name"], "-n", NS, "--wait=true", "--timeout=120s")
+            for retained_session in (session, fresh_session):
+                retained = support.retained_sandbox(self.checks, retained_session)
+                self.checks.kubectl("delete", "sandbox", retained["metadata"]["name"], "-n", NS, "--wait=true", "--timeout=120s")
         self.report["scenarios"].append({"id": name + "_close_policy_start_fresh_independence", "status": "passed"})
 
     def cleanup(self):
@@ -394,14 +444,13 @@ anchor+'\\treturn Nil, fmt.Errorf("sandbox controlled Parse regression")\\n'));"
                 entry["remoteID"] = identifier
             ensure(entry["remoteID"] and self.provider.get("session", entry["remoteID"]) is None, "Remote cleanup outcome unresolved; cluster retained")
             session = entry["session"]
-            if session.get("status", {}).get("workspaceClaimUID"):
-                claim = self.checks.get("pvc", "workspace-" + entry["uid"])
-                if claim:
-                    policy = session["status"]["environmentSnapshot"]["profile"]["selfHosted"]["workspaceStorage"]["claimDeletionPolicy"]
-                    ensure(policy == "Retain" and claim["metadata"]["uid"] == session["status"]["workspaceClaimUID"]
-                           and claim["metadata"].get("labels", {}).get("agents.softcane.io/session-uid") == entry["uid"]
-                           and not claim["metadata"].get("ownerReferences"), "Workspace cleanup ownership or policy differs")
-                    self.checks.kubectl("delete", "pvc", claim["metadata"]["name"], "-n", NS, "--wait=true", "--timeout=120s")
+            if session.get("status", {}).get("sandboxName"):
+                retained = self.checks.get("sandbox", session["status"]["sandboxName"])
+                if retained:
+                    policy = session["status"]["environmentSnapshot"]["profile"]["selfHosted"]["workspace"]["deletionPolicy"]
+                    ensure(policy == "Retain", "Unexpected execution resources remain after cleanup")
+                    retained = support.retained_sandbox(self.checks, session)
+                    self.checks.kubectl("delete", "sandbox", retained["metadata"]["name"], "-n", NS, "--wait=true", "--timeout=120s")
         for (_, name), entry in reversed(list(self.resources.items())):
             current = self.checks.get(entry["kind"].lower(), name)
             if not current:
@@ -423,42 +472,53 @@ anchor+'\\treturn Nil, fmt.Errorf("sandbox controlled Parse regression")\\n'));"
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", default="gpt-6-luna")
+    parser.add_argument("--single-session", action="store_true", help="Run one Session/root turn with real commands and owned cleanup")
+    parser.add_argument("--keep", action="store_true", help="Keep a successful --single-session conversation and local gateway open")
     spending = parser.add_mutually_exclusive_group()
     spending.add_argument("--spend-limit-cents", type=int, default=500)
     spending.add_argument("--without-session-budget", action="store_true", help="Explicitly omit Session budgets; this run has no monetary cap")
     args = parser.parse_args()
+    ensure(not args.keep or args.single_session, "--keep requires --single-session")
     ensure(args.spend_limit_cents == 500, "This acceptance requires limited 500 cents; unlimited fallback is unavailable")
     run = uuid.uuid4().hex[:12]
     cluster = "codex-sandbox-live-" + run
     directory = report_path(cluster, default_root=ROOT / ".private/reports")
     directory.mkdir(mode=0o700)
-    report = {"run": run, "cluster": cluster, "scope": "sandbox-live/" + cluster, "result": "failed", "stage": "preflight-incomplete",
+    report = {"retentionRequested": args.keep, "model": args.model, "singleSession": args.single_session, "run": run, "cluster": cluster, "scope": "sandbox-live/" + cluster, "result": "failed", "stage": "preflight-incomplete",
               "layer": "real OpenAI / production exec-server / actual Kind Pod/PVC / real PostgreSQL / pinned google/uuid",
               "spendingMode": "unlimited" if args.without_session_budget else "limited",
               "aggregateLimitCents": None if args.without_session_budget else 500,
-              "allocationCents": None if args.without_session_budget else {"delete": 200, "deleteFresh": 50, "retain": 200, "retainFresh": 50},
+              "allocationCents": None if args.without_session_budget else ({"single": 500} if args.single_session else {"delete": 200, "deleteFresh": 50, "retain": 200, "retainFresh": 50}),
               "spendingLimitQualified": False,
               "scenarios": [], "checks": {}, "sourceHashes": support.source_hashes(),
               "notTested": ["production HA", "node/volume loss", "hosted runtime", "transparent mid-command replay"]}
+    if args.single_session:
+        report["notTested"] += ["live regression repair", "live process replacement", "live Retain policy", "fresh Session isolation"]
     evidence = support.Evidence(directory, [])
     created = False
     checks = forward = journey = None
+    access_config = None
+    retained_success = False
+    access_directory = ROOT / ".private/live-access" / run if args.keep else directory
+    if args.keep:
+        access_directory.mkdir(mode=0o700, parents=True)
+        access_directory.parent.chmod(0o700)
     baseline = local_setup.global_configs()
     existing = None
     result = 1
     try:
-        for executable in ("docker", "kind", "kubectl", "openssl", "make"):
+        for executable in ("docker", "kind", "kubectl", "make"):
             ensure(shutil.which(executable), executable + " is required")
         ensure((ROOT / "bin/kustomize").exists(), "Pinned kustomize must be prepared before live acceptance")
         keys = {name: local_setup.configuration_key(os.environ, ROOT / ".env", name)
                 for name in ("OPENAI_API_KEY", "OPENAI_EXECUTOR_API_KEY")}
         ensure(keys["OPENAI_API_KEY"] != keys["OPENAI_EXECUTOR_API_KEY"], "Separate application/executor credentials are required")
-        token = secrets.token_hex(32)
-        keys["gateway-token"] = token
         evidence.protect(keys.values())
-        checks = support.Checks(directory / "kubeconfig", cluster, keys)
+        checks = support.Checks(access_directory / "kubeconfig", cluster, keys)
         existing = checks.run(["kind", "get", "clusters"]).splitlines()
         ensure(cluster not in existing, "Generated owned cluster already exists; refusing reuse")
+        if args.keep:
+            checks.run(["go", "build", "-trimpath", "-o", str(ROOT / "bin/gateway-client"), "./cmd/gateway-client"])
         controller_tag = "codex-session-controller:live-" + run
         gateway_tag = "codex-session-gateway:live-" + run
         executor_base_tag = "codex-executor:live-" + run
@@ -472,6 +532,21 @@ def main():
         checks.run(["docker", "run", "--rm", "--network", "none", "--entrypoint", "/bin/bash", executor_tag,
                     "-lc", "command -v go && go version && command -v gofmt"], timeout=30)
         report["checks"]["productionExecutorLoginShellToolchain"] = True
+        report["stage"] = "credential-free production repository build preflight"
+        # Check an uncached build before creating any paid provider resources.
+        # These mounts bound capacity without supplying application/executor keys.
+        preflight = checks.run(["docker", "run", "--rm", "--read-only", "--cap-drop", "ALL",
+            "--security-opt", "no-new-privileges", "--memory", "2g", "--cpus", "2",
+            "--tmpfs", "/tmp:size=1g,uid=1000,gid=1000,mode=1777,exec",
+            "--tmpfs", "/home/node:size=128m,uid=1000,gid=1000,mode=0755",
+            "--tmpfs", "/workspace:size=1g,uid=1000,gid=1000,mode=0755",
+            "--entrypoint", "/bin/bash", executor_tag, "-lc",
+            'git init -q . && git fetch -q --depth=1 "$1" "$2" && git checkout -q --detach FETCH_HEAD '
+            '&& test "$(git rev-parse HEAD)" = "$2" && go test ./... '
+            '&& du -sk /home/node /workspace/.cache',
+            "repository-preflight", REPOSITORY_URL, REPOSITORY_COMMIT], timeout=300)
+        evidence.write("production-repository-preflight.log", preflight)
+        report["checks"]["productionRepositoryBuildPreflight"] = True
         created = True
         checks.run(["kind", "create", "cluster", "--name", cluster, "--image", support.NODE_IMAGE,
                     "--kubeconfig", checks.env["KUBECONFIG"], "--wait", "120s"])
@@ -486,21 +561,16 @@ def main():
         checks.apply({"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": NS, "labels": {"pod-security.kubernetes.io/enforce": "restricted"}}})
         checks.secret("openai-application", {"OPENAI_API_KEY": keys["OPENAI_API_KEY"]})
         checks.secret("codex-executor", {"CODEX_API_KEY": keys["OPENAI_EXECUTOR_API_KEY"]})
-        checks.secret("gateway-auth", {"principals.json": json.dumps([{"token": token, "subject": "live-acceptance", "namespace": NS}])})
-        certificate = gateway_tls.provision(checks, directory)
-        evidence.protect([(directory / "gateway.key").read_text()])
-        internal = checks.get("secret", "gateway-internal")
-        evidence.protect([base64.b64decode(internal["data"]["token"]).decode()])
+        certificate = None
         database_url = "postgres://postgres@gateway-postgres:5432/postgres?sslmode=disable"
         checks.secret("gateway-database", {"url": database_url})
+        sandbox_resources.install(checks)
         checks.kubectl("apply", "-f", "config/demo/postgres.yaml")
         checks.kubectl("rollout", "status", "deployment/gateway-postgres", "-n", NS, "--timeout=180s")
         patches = [
             {"apiVersion": "apps/v1", "kind": "Deployment", "metadata": {"name": support.DEPLOYMENT, "namespace": NS},
              "spec": {"template": {"spec": {"containers": [{"name": "manager", "imagePullPolicy": "IfNotPresent", "env": [
-                 {"name": "EXECUTOR_IMAGES", "value": image},
-                 {"name": "WORKSPACE_STORAGE_CLASSES", "value": "standard"},
-                 {"name": "REPOSITORY_URLS", "value": REPOSITORY_URL},
+                 {"name": "SANDBOX_POOLS", "value": "live-delete,live-retain"},
                  {"name": "OPENAI_AGENT_OWNER_SCOPE", "value": report["scope"]},
              ]}]}}}},
             {"apiVersion": "apps/v1", "kind": "Deployment",
@@ -528,14 +598,14 @@ def main():
         with socket.socket() as available:
             available.bind(("127.0.0.1", 0))
             port = available.getsockname()[1]
-        api = support.API(port, token, ssl.create_default_context(cafile=str(certificate)))
+        api = support.API(port)
         forward = support.start_forward(checks, port)
         def reachable():
             try:
                 return api.request("/v1/namespaces/" + NS + "/catalog")[0] == 200
             except (OSError, urllib.error.URLError):
                 return False
-        checks.wait("authenticated gateway listening", reachable)
+        checks.wait("gateway listening", reachable)
         def service_restart():
             nonlocal forward
             def uids(name):
@@ -560,13 +630,45 @@ def main():
             report["checks"]["actualServicePodReplacement"] = True
         journey = Journey(checks, api, Provider(keys["OPENAI_API_KEY"]), evidence, report, image, architecture, service_restart,
                           without_session_budget=args.without_session_budget)
+        disk = checks.run(["docker", "exec", cluster + "-control-plane", "df", "-Pk", "/var/lib/containerd"])
+        evidence.write("node-disk-preflight.log", disk)
+        evidence.write("node-inodes-preflight.log", checks.run(["docker", "exec", cluster + "-control-plane", "df", "-Pi", "/var/lib/containerd"]))
+        node_available_kib = int(disk.splitlines()[-1].split()[3])
+        report["nodeDiskAvailableKiB"] = node_available_kib
+        nodes = json.loads(checks.kubectl("get", "nodes", "-o", "json"))["items"]
+        no_disk_pressure = bool(nodes) and all(any(condition.get("type") == "DiskPressure" and
+            condition.get("status") == "False" for condition in node.get("status", {}).get("conditions", [])) for node in nodes)
+        # Fail before the first provider resource, while the empty journey can
+        # still prove there are no remote cleanup obligations.
+        ensure(node_available_kib >= 2 * 1024 * 1024,
+               "Kind backing disk has less than 2Gi available after image loading; no provider resources created")
+        ensure(no_disk_pressure, "Kind node has unconfirmed/active DiskPressure; no provider resources created")
+        report["checks"]["nodeDiskHeadroomPreflight"] = True
         agent = journey.publish("Agent", "live-agent", {"name": "Live repository investigator", "model": args.model,
             "instructions": "Use actual shell commands and repository evidence. Do not inspect credentials. Follow task write limits.", "deletionPolicy": "Delete"})
         journey.resources[("Agent", "live-agent")]["remoteID"] = agent["status"]["openaiAgentID"]
-        for policy in ("Delete", "Retain"):
-            journey.exercise(policy)
+        if args.single_session:
+            single = journey.exercise_single(keep=args.keep)
+        else:
+            for policy in ("Delete", "Retain"):
+                journey.exercise(policy)
         ensure(support.source_hashes() == report["sourceHashes"], "Sources changed during live acceptance")
         report["checks"]["sourcesUnchanged"] = True
+        if args.keep:
+            report["stage"] = "retaining gateway and open conversation"
+            configuration, access_config = retained.prepare_access(ROOT, directory, certificate, checks, journey, port, single)
+            forward.terminate()
+            forward.wait(10)
+            forward = None
+            state = retained.connect(access_config)
+            code, value = retained.request(access_config, access_config["conversationPath"])
+            ensure(code == 200 and value.get("summary", {}).get("state") == "open", "Retained conversation is not open")
+            ensure(value.get("lifecycle", {}).get("execution_ready"), "Retained executor is not eligible for follow-up input")
+            report["access"] = {key: access_config[key] for key in ("origin", "conversationID", "conversationURL", "messagesURL", "kubeconfig", "forwardLog")}
+            report["access"].update({"configuration": str(configuration), "helperDirectory": str(configuration.parent), "forwardPID": state["pid"]})
+            report["checks"]["retainedOpenAndExecutionReady"] = True
+            report["checks"]["detachedForwardReady"] = True
+            retained_success = True
         report["result"] = "passed"
         result = 0
     except (Exception, KeyboardInterrupt) as error:
@@ -576,19 +678,29 @@ def main():
                 report["error"] = report["error"].replace(value, "[withheld]").replace(base64.b64encode(value.encode()).decode(), "[withheld]")
         print("Live acceptance failed; private report records the stage and recovery obligations.", flush=True)
     finally:
+        keep_success = args.keep and retained_success and result == 0
         clean = not created
+        report["cleanupPerformed"] = not keep_success
         try:
-            if journey:
-                journey.cleanup()
-                clean = True
-            if created and clean:
-                checks.run(["kind", "delete", "cluster", "--name", cluster])
-            elif created:
-                report["cleanupAuditRequired"] = "Installation exists without a complete remote-obligation ledger; cluster retained"
-                result = 1
+            if keep_success:
+                report["checks"]["resourcesIntentionallyRetained"] = True
+            else:
+                if journey:
+                    journey.cleanup()
+                    clean = True
+                if created and clean:
+                    checks.run(["kind", "delete", "cluster", "--name", cluster])
+                elif created:
+                    report["cleanupAuditRequired"] = "Installation exists without a complete remote-obligation ledger; cluster retained"
+                    result = 1
         except (Exception, KeyboardInterrupt) as error:
             report["cleanupAuditRequired"] = type(error).__name__
             result = 1
+        if access_config and not keep_success:
+            try:
+                retained.stop_forward(access_config)
+            except Exception:
+                result = 1
         if forward:
             forward.terminate()
             try:
@@ -597,7 +709,8 @@ def main():
                 forward.kill()
                 forward.wait(10)
                 result = 1
-        report["checks"]["remoteCleanupConfirmed"] = clean
+        if not keep_success:
+            report["checks"]["remoteCleanupConfirmed"] = clean
         report["checks"]["globalKubeconfigUnchanged"] = local_setup.global_configs() == baseline
         if checks and existing is not None:
             try:
@@ -606,6 +719,8 @@ def main():
                 report["clusterKept"] = cluster in remaining
                 if report["clusterKept"]:
                     report["recoveryKubeconfig"] = checks.env["KUBECONFIG"]
+                    if keep_success:
+                        report["checks"]["ownedClusterIntentionallyRetained"] = True
                 elif created:
                     report["checks"]["ownedClusterRemoved"] = True
             except Exception:
@@ -619,6 +734,10 @@ def main():
         evidence.write("report.json", text)
         public_report(directory, report)
         print("Live acceptance", report["result"] + "; private evidence:", directory, flush=True)
+        if keep_success:
+            print("Retained gateway:", access_config["origin"], flush=True)
+            print("Open conversation:", access_config["conversationURL"], flush=True)
+            print("Private access helpers:", Path(report["access"]["configuration"]).parent, flush=True)
     return result
 
 

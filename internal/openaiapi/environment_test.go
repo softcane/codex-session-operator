@@ -43,8 +43,8 @@ const (
 
 func TestHostedCompleteWireAndSDKSizeGap(t *testing.T) {
 	hosted := &agentsv1alpha1.HostedEnvironment{ContainerSize: testSmallContainerSize, Network: agentsv1alpha1.HostedNetwork{Access: restrictedNetworkAccess, BlockedDomains: []string{"example.com"}},
-		Env: []agentsv1alpha1.HostedVariable{{Name: "TEST_VALUE", SecretKey: "env"}}, Files: []agentsv1alpha1.HostedFile{{Type: inlineType, Path: "/workspace/input", SecretKey: testFileKey}, {Type: "fileID", Path: "/workspace/from-api", FileID: "file_test"}},
-		SetupCommands: []agentsv1alpha1.HostedSetupCommand{{SecretKey: "setup"}}, Skills: []agentsv1alpha1.HostedSkill{{Type: "skillReference", SkillID: "skill_test", Version: "2"}}}
+		Env: []agentsv1alpha1.HostedVariable{{Name: "TEST_VALUE", SecretKey: "env"}}, Files: []agentsv1alpha1.HostedFile{{Type: agentsv1alpha1.HostedFileTypeInline, Path: "/workspace/input", SecretKey: testFileKey}, {Type: agentsv1alpha1.HostedFileTypeFileID, Path: "/workspace/from-api", FileID: "file_test"}},
+		SetupCommands: []agentsv1alpha1.HostedSetupCommand{{SecretKey: "setup"}}, Skills: []agentsv1alpha1.HostedSkill{{Type: agentsv1alpha1.HostedSkillTypeSkillReference, SkillID: "skill_test", Version: "2"}}}
 	secret := &corev1.Secret{Type: corev1.SecretTypeOpaque, Data: map[string][]byte{"env": []byte("protected-placeholder"), testFileKey: []byte("file-placeholder"), "setup": []byte("mkdir -p outputs")}}
 	fields, err := HostedConfiguration(hosted, secret, "audit name")
 	if err != nil {
@@ -289,10 +289,10 @@ func TestHostedRestrictions(t *testing.T) {
 			h.Env = []agentsv1alpha1.HostedVariable{{Name: "OPENAI_API_KEY", SecretKey: "x"}}
 		}},
 		{name: "file traversal", change: func(h *agentsv1alpha1.HostedEnvironment) {
-			h.Files = []agentsv1alpha1.HostedFile{{Type: "fileID", FileID: testFileKey, Path: "/workspace/../etc/key"}}
+			h.Files = []agentsv1alpha1.HostedFile{{Type: agentsv1alpha1.HostedFileTypeFileID, FileID: testFileKey, Path: "/workspace/../etc/key"}}
 		}},
 		{name: "latest skill", change: func(h *agentsv1alpha1.HostedEnvironment) {
-			h.Skills = []agentsv1alpha1.HostedSkill{{Type: "skillReference", SkillID: testSkillKey, Version: "latest"}}
+			h.Skills = []agentsv1alpha1.HostedSkill{{Type: agentsv1alpha1.HostedSkillTypeSkillReference, SkillID: testSkillKey, Version: "latest"}}
 		}},
 		{name: "conflicting network", change: func(h *agentsv1alpha1.HostedEnvironment) {
 			h.Network = agentsv1alpha1.HostedNetwork{Access: restrictedNetworkAccess, AllowedDomains: []string{"a.com"}, BlockedDomains: []string{"b.com"}}
@@ -342,8 +342,8 @@ func TestHostedPluginNetworkRequirement(t *testing.T) {
 }
 
 func TestMCPEnvironmentPlacement(t *testing.T) {
-	local := &agentsv1alpha1.EnvironmentSpec{Mode: "selfHosted", SelfHosted: &agentsv1alpha1.SelfHostedEnvironment{Capabilities: []agentsv1alpha1.LocalCapability{{Name: "helper", Path: testPinnedCapabilityPath, Type: testPluginKey}}}}
-	disabledHosted := &agentsv1alpha1.EnvironmentSpec{Mode: "openaiHosted", OpenAIHosted: &agentsv1alpha1.HostedEnvironment{Network: agentsv1alpha1.HostedNetwork{Access: "disabled"}}}
+	local := &agentsv1alpha1.EnvironmentSpec{Mode: "SelfHosted", SelfHosted: &agentsv1alpha1.SelfHostedEnvironment{CapabilityDirectories: []string{testPinnedCapabilityPath}}}
+	disabledHosted := &agentsv1alpha1.EnvironmentSpec{Mode: "OpenAIHosted", OpenAIHosted: &agentsv1alpha1.HostedEnvironment{Network: agentsv1alpha1.HostedNetwork{Access: "disabled"}}}
 	tests := []struct {
 		name       string
 		profile    *agentsv1alpha1.EnvironmentSpec

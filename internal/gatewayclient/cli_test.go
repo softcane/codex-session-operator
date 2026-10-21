@@ -42,7 +42,6 @@ const (
 type testCLI struct {
 	args  []string
 	state string
-	token string
 }
 
 func newTestCLI(t *testing.T, handler http.HandlerFunc) testCLI {
@@ -53,18 +52,14 @@ func newTestCLI(t *testing.T, handler http.HandlerFunc) testCLI {
 	if err != nil {
 		t.Fatal(err)
 	}
-	token := filepath.Join(directory, "token")
-	if err := os.WriteFile(token, []byte("private-test-token\n"), 0600); err != nil {
-		t.Fatal(err)
-	}
 	ca := filepath.Join(directory, "ca.pem")
 	cert := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: server.Certificate().Raw})
 	if err := os.WriteFile(ca, cert, 0600); err != nil {
 		t.Fatal(err)
 	}
 	state := filepath.Join(directory, "operations")
-	return testCLI{args: []string{"--origin", server.URL, "--namespace", _testNamespace, "--token-file", token,
-		"--ca-file", ca, "--state-dir", state}, state: state, token: token}
+	return testCLI{args: []string{"--origin", server.URL, "--namespace", _testNamespace,
+		"--ca-file", ca, "--state-dir", state}, state: state}
 }
 
 func (c testCLI) run(t *testing.T, input string, args ...string) (int, string, string) {
@@ -106,8 +101,8 @@ func TestRunLostAcceptanceResumesExactRequest(t *testing.T) {
 	keys := make([]string, 0)
 	bodies := make([]string, 0)
 	cli = newTestCLI(t, func(w http.ResponseWriter, req *http.Request) {
-		if req.Header.Get("Authorization") != "Bearer private-test-token" {
-			t.Error("missing authentication")
+		if req.Header.Get("Authorization") != "" {
+			t.Error("CLI unexpectedly supplied gateway authentication")
 		}
 		if req.Method == http.MethodGet {
 			writeTestJSON(t, w, 200, testIdentity(req, _testSubject))
@@ -454,13 +449,13 @@ func TestRunStartFreshRequiresCleanupAndFreezesAttempt(t *testing.T) {
 	}
 }
 
-func TestRunSecretsNeverAppearInOutput(t *testing.T) {
+func TestRunPreservesConversationOutput(t *testing.T) {
 	cli := newTestCLI(t, func(w http.ResponseWriter, req *http.Request) {
-		writeTestJSON(t, w, 200, map[string]any{"last_error": "echoed private-test-token", "history": "private-test-token"})
+		writeTestJSON(t, w, 200, map[string]string{"history": "ordinary task output"})
 	})
 	code, output, diagnostic := cli.run(t, "", "read", _testConversationID)
-	if code != 0 || strings.Contains(output+diagnostic, "private-test-token") || !strings.Contains(output, "[redacted]") {
-		t.Fatalf("secret leaked: %d %s %s", code, output, diagnostic)
+	if code != 0 || !strings.Contains(output, "ordinary task output") {
+		t.Fatalf("conversation output changed: %d %s %s", code, output, diagnostic)
 	}
 }
 
@@ -591,21 +586,32 @@ func TestRunWatchRejectsAnotherAttempt(t *testing.T) {
 	}
 }
 
-func TestRunTLSOnlyAndPrivateToken(t *testing.T) {
+func TestRunHTTPConversationURL(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if req.Header.Get("Authorization") != "" {
+			t.Error("HTTP request unexpectedly supplied caller token")
+		}
+		writeTestJSON(t, w, http.StatusOK, map[string]string{"id": _testConversationID})
+	}))
+	defer server.Close()
+	cli := newTestCLI(t, func(http.ResponseWriter, *http.Request) { t.Error("unexpected TLS request") })
+	cli.args[1] = server.URL
+	// HTTP needs no CA file, including when reading an absolute conversation URL.
+	code, output, diagnostic := cli.run(t, "", "read", server.URL+"/v1/namespaces/"+_testNamespace+"/conversations/"+_testConversationID)
+	if code != 0 || !strings.Contains(output, _testConversationID) {
+		t.Fatalf("HTTP read failed: %d %s %s", code, output, diagnostic)
+	}
+}
+
+func TestRunUnsupportedScheme(t *testing.T) {
 	cli := newTestCLI(t, func(w http.ResponseWriter, req *http.Request) { t.Error("unexpected network request") })
 	args := append([]string{}, cli.args...)
-	args[1] = "http://localhost:8080"
+	args[1] = "ftp://localhost:8080"
 	var output bytes.Buffer
 	if code := Run(t.Context(), append(args, "read", _testConversationID), strings.NewReader(""), &output, &output); code != _exitFailure {
 		t.Fatal(code)
 	}
-	if err := os.Chmod(cli.token, 0644); err != nil {
-		t.Fatal(err)
-	}
-	code, _, diagnostic := cli.run(t, "", "read", _testConversationID)
-	if code != _exitFailure || !strings.Contains(diagnostic, "restricted") {
-		t.Fatalf("public token accepted: %d %s", code, diagnostic)
-	}
+
 }
 
 func TestRunBoundedRequestRetainsOperation(t *testing.T) {

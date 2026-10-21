@@ -8,7 +8,7 @@ spec:
   environmentRef:
     name: environment-sample
   spendControl:
-    mode: limited
+    mode: Limited
     limitCents: 500
   vaultRefs:
   - name: vault-sample

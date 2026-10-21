@@ -18,7 +18,7 @@ func TestLimitedSpendPausesMessagesAndQueuedDeliveryUntilCurrentReady(t *testing
 	session.Spec.SpendControl = &agentsv1alpha1.SessionSpendControl{Mode: _scenarioLimited, LimitCents: func() *int64 { n := int64(100); return &n }()}
 	g, k8s := testGateway(t, store, p, session)
 	path := _testMessagePath
-	if got := request(g, http.MethodPost, path, _token, "first", `{"text":"hello"}`).Code; got != http.StatusServiceUnavailable {
+	if got := request(g, http.MethodPost, path, "first", `{"text":"hello"}`).Code; got != http.StatusServiceUnavailable {
 		t.Fatalf("unverified cap accepted message: %d", got)
 	}
 	if err := g.enqueue(t.Context(), session, "queued-before-observation", "queued message", "", nil); err != nil {
@@ -38,7 +38,7 @@ func TestLimitedSpendPausesMessagesAndQueuedDeliveryUntilCurrentReady(t *testing
 	if err := k8s.Update(t.Context(), &saved); err != nil {
 		t.Fatal(err)
 	}
-	if got := request(g, http.MethodPost, path, _token, "second", `{"text":"hello"}`).Code; got != http.StatusServiceUnavailable {
+	if got := request(g, http.MethodPost, path, "second", `{"text":"hello"}`).Code; got != http.StatusServiceUnavailable {
 		t.Fatalf("stale Ready accepted message: %d", got)
 	}
 	saved.Status.Conditions[0].ObservedGeneration = saved.Generation
@@ -51,7 +51,7 @@ func TestLimitedSpendPausesMessagesAndQueuedDeliveryUntilCurrentReady(t *testing
 	if p.commits != 1 {
 		t.Fatalf("verified cap did not release queued work: %d", p.commits)
 	}
-	if got := request(g, http.MethodPost, path, _token, "second", `{"text":"hello"}`).Code; got != http.StatusAccepted {
+	if got := request(g, http.MethodPost, path, "second", `{"text":"hello"}`).Code; got != http.StatusAccepted {
 		t.Fatalf("verified cap rejected new message: %d", got)
 	}
 }

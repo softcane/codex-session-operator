@@ -1,7 +1,6 @@
 package gatewayclient
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -47,7 +46,7 @@ const _stateField = "state"
 
 const _statePreparing = "preparing"
 
-const _usage = `gateway-client --origin HTTPS_ORIGIN --namespace NS --token-file FILE [--ca-file FILE] [--state-dir DIR] COMMAND
+const _usage = `gateway-client --origin HTTP_OR_HTTPS_ORIGIN --namespace NS [--ca-file FILE] [--state-dir DIR] COMMAND
 
 Commands:
   profiles [list [--limit 100] | show NAME]  Discover approved profiles
@@ -77,16 +76,14 @@ type runner struct {
 	diagnostic io.Writer
 }
 
-// Run is a testable command entry point. Credentials are loaded from a restricted
-// file and never accepted in command arguments or retained in the journal.
+// Run is a testable command entry point with a private durable operation journal.
 func Run(ctx context.Context, args []string, in io.Reader, out, diagnostic io.Writer) int {
 	flags := flag.NewFlagSet("gateway-client", flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
 	var config clientConfig
 	var stateDir string
-	flags.StringVar(&config.origin, "origin", "", "explicit HTTPS origin")
-	flags.StringVar(&config.namespace, _namespaceField, "", "authorized namespace")
-	flags.StringVar(&config.tokenFile, "token-file", "", "restricted bearer token file")
+	flags.StringVar(&config.origin, "origin", "", "explicit HTTP or HTTPS origin")
+	flags.StringVar(&config.namespace, _namespaceField, "", "target Kubernetes namespace")
 	flags.StringVar(&config.caFile, "ca-file", "", "trusted CA PEM file")
 	flags.DurationVar(&config.requestTimeout, "request-timeout", 15*time.Second, "bounded HTTP request timeout")
 	flags.StringVar(&stateDir, "state-dir", "", "private durable operation directory")
@@ -112,7 +109,7 @@ func Run(ctx context.Context, args []string, in io.Reader, out, diagnostic io.Wr
 	r := &runner{client: c, stateDir: stateDir, in: in, out: out, diagnostic: diagnostic}
 	code, err := r.run(ctx, remaining)
 	if err != nil {
-		_, _ = fmt.Fprintln(diagnostic, r.redact(err.Error()))
+		_, _ = fmt.Fprintln(diagnostic, err.Error())
 		if code == 0 {
 			code = _exitFailure
 		}
@@ -184,7 +181,7 @@ func (r *runner) profiles(ctx context.Context, args []string) (int, error) {
 		}
 		profile, ok := result["profile"].(map[string]any)
 		if !ok || profile[_namespaceField] != r.client.namespace {
-			return _exitFailure, errors.New("profile response does not match the authorized namespace")
+			return _exitFailure, errors.New("profile response does not match the selected namespace")
 		}
 		return 0, r.emit(result)
 	}
@@ -220,7 +217,7 @@ func (r *runner) profiles(ctx context.Context, args []string) (int, error) {
 		source, subject = result.Source, result.Subject
 		for _, profile := range result.Profiles {
 			if profile[_namespaceField] != r.client.namespace {
-				return _exitFailure, errors.New("profile response does not match the authorized namespace")
+				return _exitFailure, errors.New("profile response does not match the selected namespace")
 			}
 			all = append(all, profile)
 		}
@@ -280,7 +277,7 @@ func (r *runner) mutate(ctx context.Context, command string, args []string) (int
 	existing, loadErr := j.load(op.ID)
 	if loadErr == nil {
 		if !sameRequest(existing, op) {
-			return _exitFailure, errors.New("saved operation conflicts with body, target, namespace or authenticated subject")
+			return _exitFailure, errors.New("saved operation conflicts with body, target, namespace or service replay subject")
 		}
 		op = existing
 	} else {
@@ -408,7 +405,7 @@ func (r *runner) resume(ctx context.Context, args []string) (int, error) {
 		return _exitFailure, err
 	}
 	if op.Origin != r.client.origin || op.Namespace != r.client.namespace || op.Subject != subject {
-		return _exitFailure, errors.New("saved operation conflicts with origin, namespace or authenticated subject")
+		return _exitFailure, errors.New("saved operation conflicts with origin, namespace or service replay subject")
 	}
 	return r.submit(ctx, j, op)
 }
@@ -505,7 +502,7 @@ func (r *runner) conversationPath(value string) (string, error) {
 	if suffix, found := strings.CutPrefix(value, base); found {
 		value = suffix
 	}
-	if strings.HasPrefix(value, "https://") {
+	if strings.HasPrefix(value, "https://") || strings.HasPrefix(value, "http://") {
 		u, err := url.Parse(value)
 		if err != nil || u.Scheme+"://"+u.Host != r.client.origin || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
 			return "", errors.New("conversation URL must use the configured origin and namespace")
@@ -547,21 +544,8 @@ func validProfileIdentifier(value string) bool {
 	return len(validation.IsDNS1123Subdomain(value)) == 0
 }
 
-func (r *runner) redact(value string) string {
-	return strings.ReplaceAll(value, r.client.token, "[redacted]")
-}
-
 func (r *runner) emit(value any) error {
-	var buffer bytes.Buffer
-	if err := json.NewEncoder(&buffer).Encode(value); err != nil {
-		return errors.New("encode output")
-	}
-	encodedToken, err := json.Marshal(r.client.token)
-	if err != nil {
-		return errors.New("encode output redaction")
-	}
-	text := strings.ReplaceAll(buffer.String(), string(encodedToken[1:len(encodedToken)-1]), "[redacted]")
-	if _, err := io.WriteString(r.out, r.redact(text)); err != nil {
+	if err := json.NewEncoder(r.out).Encode(value); err != nil {
 		return errors.New("write output")
 	}
 	return nil

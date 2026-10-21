@@ -66,8 +66,8 @@ spec:
         image: controller:latest
         name: manager
         env:
-        # Approve exact executor digests used by Environment resources.
-        - name: EXECUTOR_IMAGES
+        # Approve administrator-managed SandboxWarmPool names in managed namespaces.
+        - name: SANDBOX_POOLS
           value: ""
         - name: OPENAI_API_KEY
           valueFrom:

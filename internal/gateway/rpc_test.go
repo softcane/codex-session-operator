@@ -14,7 +14,6 @@ import (
 	agentsv1alpha1 "github.com/softcane/codex-session-operator/api/v1alpha1"
 )
 
-const _internalToken = "gateway-controller-token-0123456789abcdef"
 const _certificatePEMType = "CERTIFICATE"
 const (
 	_rpcFirstKey     = "first"
@@ -35,10 +34,7 @@ func TestSeparateGatewayLifecycleRPC(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	handler, err := g.InternalHandler(_internalToken)
-	if err != nil {
-		t.Fatal(err)
-	}
+	handler := g.InternalHandler()
 	server := httptest.NewTLSServer(handler)
 	defer server.Close()
 	certificate, err := x509.ParseCertificate(server.TLS.Certificates[0].Certificate[0])
@@ -46,7 +42,7 @@ func TestSeparateGatewayLifecycleRPC(t *testing.T) {
 		t.Fatal(err)
 	}
 	ca := pem.EncodeToMemory(&pem.Block{Type: _certificatePEMType, Bytes: certificate.Raw})
-	remote, err := NewRemoteClient(server.URL, _internalToken, ca)
+	remote, err := NewRemoteClient(server.URL, ca)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -76,8 +72,8 @@ func TestSeparateGatewayLifecycleRPC(t *testing.T) {
 	req.Header.Set("Authorization", "Bearer wrong-token")
 	w := httptest.NewRecorder()
 	handler.ServeHTTP(w, req)
-	if w.Code != http.StatusUnauthorized {
-		t.Fatalf("internal RPC without token returned %d", w.Code)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("internal RPC did not validate its body: %d", w.Code)
 	}
 }
 
@@ -96,14 +92,11 @@ func TestRemoteClientValidatesCurrentProfileSessionPolicy(t *testing.T) {
 		Name: _profileTestEnvironment,
 		UID:  _profileTestEnvironmentUID,
 		Profile: agentsv1alpha1.EnvironmentSpec{
-			Mode: _noneMode,
+			Mode: agentsv1alpha1.EnvironmentModeNone,
 		},
 	}
 
-	handler, err := g.InternalHandler(_internalToken)
-	if err != nil {
-		t.Fatal(err)
-	}
+	handler := g.InternalHandler()
 	server := httptest.NewTLSServer(handler)
 	defer server.Close()
 	certificate, err := x509.ParseCertificate(server.TLS.Certificates[0].Certificate[0])
@@ -111,7 +104,7 @@ func TestRemoteClientValidatesCurrentProfileSessionPolicy(t *testing.T) {
 		t.Fatal(err)
 	}
 	ca := pem.EncodeToMemory(&pem.Block{Type: _certificatePEMType, Bytes: certificate.Raw})
-	remote, err := NewRemoteClient(server.URL, _internalToken, ca)
+	remote, err := NewRemoteClient(server.URL, ca)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -128,15 +121,31 @@ func TestRemoteClientValidatesCurrentProfileSessionPolicy(t *testing.T) {
 	}
 }
 
-func TestInternalClientRequiresTLSAndCA(t *testing.T) {
-	if _, err := NewRemoteClient("http://gateway:8083", _internalToken, []byte("bad")); err == nil {
-		t.Fatal("plaintext gateway accepted")
+func TestInternalClientUsesHTTPWithoutCredentials(t *testing.T) {
+	g, _ := testGateway(t, testStore(t), simulatorForTest(), testSession())
+	handler := g.InternalHandler()
+	server := httptest.NewServer(handler)
+	defer server.Close()
+	remote, err := NewRemoteClient(server.URL, nil)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if _, err := NewRemoteClient("https://gateway:8083", _internalToken, []byte("bad")); err == nil {
+	defer remote.http.CloseIdleConnections()
+	if err := remote.ValidateTools(t.Context(), map[string]any{_rpcToolsField: []any{}}); err != nil {
+		t.Fatal(err)
+	}
+
+}
+
+func TestInternalClientSupportsHTTPAndRequiresTrustedHTTPS(t *testing.T) {
+	if _, err := NewRemoteClient("http://gateway:8083", nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := NewRemoteClient("ftp://gateway:8083", nil); err == nil {
+		t.Fatal("unsupported scheme accepted")
+	}
+	if _, err := NewRemoteClient("https://gateway:8083", []byte("bad")); err == nil {
 		t.Fatal("invalid CA accepted")
-	}
-	if _, err := (&Gateway{}).InternalHandler("short"); err == nil {
-		t.Fatal("short token accepted")
 	}
 }
 

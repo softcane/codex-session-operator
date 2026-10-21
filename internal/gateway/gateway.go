@@ -66,7 +66,7 @@ type Gateway struct {
 	reader        client.Reader
 	provider      Provider
 	functions     map[string]Function
-	principals    []Principal
+	subject       string
 	mu            sync.Mutex
 	ctx           context.Context
 	worker        *Gateway
@@ -75,14 +75,14 @@ type Gateway struct {
 	wg            sync.WaitGroup
 	streamSlots   chan struct{}
 	requestSlots  chan struct{}
-	streamCounts  map[streamPrincipal]int
+	streamCounts  map[streamScope]int
 	metricsOnce   sync.Once
 	metrics       *gatewayMetrics
 }
 
-func New(store Storage, reader client.Reader, provider Provider, principals []Principal, functions map[string]Function) (*Gateway, error) {
-	if store == nil || reader == nil || provider == nil || len(principals) == 0 {
-		return nil, errors.New("gateway dependencies and authentication required")
+func New(store Storage, reader client.Reader, provider Provider, subject string, functions map[string]Function) (*Gateway, error) {
+	if store == nil || reader == nil || provider == nil {
+		return nil, errors.New("gateway dependencies required")
 	}
 	copied := make(map[string]Function, len(functions))
 	for name, function := range functions {
@@ -91,17 +91,19 @@ func New(store Storage, reader client.Reader, provider Provider, principals []Pr
 		}
 		copied[name] = function
 	}
-	auth, err := copyPrincipals(principals)
-	if err != nil {
-		return nil, err
+	if subject == "" {
+		subject = "gateway"
+	}
+	if len(subject) > 256 || strings.TrimSpace(subject) != subject || strings.ContainsAny(subject, "\r\n\t") {
+		return nil, errors.New("invalid gateway replay subject")
 	}
 	// Ordinary requests retain capacity even when every stream slot is occupied.
 	// Both admission paths reject excess requests instead of queueing goroutines.
-	return &Gateway{store: store, reader: reader, provider: provider, principals: auth, functions: copied,
+	return &Gateway{store: store, reader: reader, provider: provider, subject: subject, functions: copied,
 		profiles: &ProfileResolver{reader: reader},
 		gates:    &[64]sync.Mutex{}, watches: make(map[string]*watch),
 		requestSlots: make(chan struct{}, 64), streamSlots: make(chan struct{}, 32),
-		streamCounts: make(map[streamPrincipal]int)}, nil
+		streamCounts: make(map[streamScope]int)}, nil
 }
 
 func (g *Gateway) gate(uid string) *sync.Mutex {
@@ -436,7 +438,7 @@ func (g *Gateway) sync(ctx context.Context, uid string) error {
 		r.RemoteID = id
 		for i := range r.Submissions {
 			if r.Submissions[i].Initial {
-				if session.Status.EnvironmentSnapshot != nil && session.Status.EnvironmentSnapshot.Profile.Mode == _noneMode {
+				if session.Status.EnvironmentSnapshot != nil && session.Status.EnvironmentSnapshot.Profile.Mode == agentsv1alpha1.EnvironmentModeNone {
 					r.Submissions[i].Accepted = true
 				} else {
 					r.Submissions[i].Initial = false
