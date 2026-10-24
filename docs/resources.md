@@ -1,8 +1,10 @@
 # Resource reference
 
-Codex Session Operator exposes six namespaced resources in `agents.softcane.io/v1alpha1`. The generated [CRD schemas](../config/crd/bases/) define accepted fields and validation for this checkout.
+Codex Session Operator exposes six namespaced resources in `agents.softcane.io/v1alpha1`. Use this page to look up resource roles, common configuration, update rules and cleanup behavior. The generated [CRD schemas](../config/crd/bases/) define every accepted field and its validation for this checkout.
 
-Operator-owned modes use `SelfHosted`, `OpenAIHosted`, `None`, `Limited` and `Unlimited`; hosted source selectors use `FileID`, `Inline` and `SkillReference`; deletion policies use `Delete` and `Retain`. Provider/protocol values such as `reasoning.effort: high`, tool types, hosted network access and OAuth methods retain their documented wire literals. The adapter translates CRD field names, including `workingDirectory` to `cwd` and `expirationTime` to `expires_at`.
+The YAML examples describe provider-backed resources. Applied to a real-provider installation, Sessions can make paid model calls. The [local demo](development.md#use-the-retained-demo) uses a simulated provider instead.
+
+Enum values are case-sensitive. Operator-owned modes use `SelfHosted`, `OpenAIHosted`, `None`, `Limited` and `Unlimited`; hosted source selectors use `FileID`, `Inline` and `SkillReference`; deletion policies use `Delete` and `Retain`. Provider/protocol values such as `reasoning.effort: high`, tool types, hosted network access and OAuth methods retain their documented wire literals. The adapter translates CRD field names, including `workingDirectory` to `cwd` and `expirationTime` to `expires_at`.
 
 ## Resource relationships
 
@@ -21,7 +23,20 @@ Agent instructions are reusable configuration. Task messages, turns, approvals a
 
 An Agent declares the model and reusable behavior. Its `tools` field replaces the complete remote tool list when present, including an explicit empty list. Session overrides can change supported Agent settings for one Session.
 
-The [repository example](my-go-project.md) shows a repository-maintenance Agent. See the [Agent API source](../api/v1alpha1/agent_types.go) and generated schema for the full reasoning, output, multi-agent and tool variants.
+```yaml
+apiVersion: agents.softcane.io/v1alpha1
+kind: Agent
+metadata:
+  name: investigator
+  namespace: codex-session-operator-system
+spec:
+  model: gpt-6-luna
+  instructions: Investigate the supplied evidence and report the cause and uncertainty.
+  tools: []
+  deletionPolicy: Delete
+```
+
+This Agent can be referenced by the Profile and direct Session examples below. The [repository example](my-go-project.md) shows an Agent with repository skills and execution tools. See the [Agent API source](../api/v1alpha1/agent_types.go) and generated schema for the full reasoning, output, multi-agent and tool variants.
 
 ## Environment
 
@@ -83,7 +98,14 @@ spec:
       deletionPolicy: Retain
 ```
 
-`selfHosted.workspace.directory` (default `/workspace`) and `selfHosted.capabilityDirectories` tell OpenAI where the template exposes files and skills. `selfHosted.workspace.deletionPolicy` is required and controls cleanup of the whole Sandbox environment. See the [Environment sample](../config/samples/agents_v1alpha1_environment_selfhosted.yaml), [application template](../examples/my-go-project/automation/k8s/sandbox.yaml.tmpl) and [deployment guide](deployment.md#self-hosted-execution).
+| Field | Meaning |
+| --- | --- |
+| `selfHosted.sandboxPoolRef.name` | Required, approved SandboxWarmPool in the same namespace. |
+| `selfHosted.workspace.directory` | Workspace location exposed to OpenAI; defaults to `/workspace`. |
+| `selfHosted.workspace.deletionPolicy` | Required `Delete` or `Retain` policy for Session cleanup of the Sandbox environment. |
+| `selfHosted.capabilityDirectories` | Directories where the template exposes skills or other capabilities to the runtime. |
+
+The template must actually provide the declared files and directories. See the [Environment sample](../config/samples/agents_v1alpha1_environment_selfhosted.yaml), [application template](../examples/my-go-project/automation/k8s/sandbox.yaml.tmpl) and [deployment guide](deployment.md#self-hosted-execution).
 
 Workspace paths must be clean absolute directories outside reserved runtime paths. Capability paths must be clean absolute paths. References use same-namespace DNS subdomain names. Pool approval, live template identities, credentials and resource availability remain reconciliation checks.
 
@@ -111,6 +133,17 @@ spec:
 ```
 
 Profile readiness means its selected policy resources are Ready. Starting a task through the conversation API freezes the Profile identity, policy and selected dependency identities before the gateway creates a Session.
+
+## Spending policy
+
+Profiles and Sessions require an explicit `spendControl`:
+
+| Mode | Required configuration | Behavior |
+| --- | --- | --- |
+| `Limited` | Positive `limitCents`, in US cents. | Requests a per-Session cap. Requires provider-project support and verified readback before readiness and later delivery. |
+| `Unlimited` | Omit `limitCents`. | Explicitly selects unlimited Session spending. |
+
+In `None` mode, the first input is part of remote Session creation, so the first turn starts before cap readback. The controller reports `SpendControlUnavailable` when the provider does not support the requested cap; it does not switch to unlimited spending. See [spending verification](development.md#choose-a-spending-mode).
 
 ## Direct Session
 
@@ -164,11 +197,17 @@ Use the full `/v1/namespaces/{namespace}` prefix for every route. Conversation U
 
 ## Desired state, updates and observation
 
+### Omission, empty values and resets
+
 Optional provider settings distinguish omitted/unmanaged fields, explicit empty replacements and explicit provider-default resets. `clearName`, `clearScope`, `clearTools`, `resetReasoning` and `resetServiceTier` express persistent desired clear/default state. They are reconciled idempotently; false or omission does not request a reset. Tools, skills, packages, setup commands and process arguments are ordered atomic lists. Set/map lists such as allowed hosts/domains, capability directories, files by path and environment variables by name have order-independent comparisons and digests.
+
+### Session update rules
 
 Before its remote creation claim, a Session may change its references and creation settings. After `status.creationAttempted` is persisted, admission freezes Agent, Environment and Vault selection, instructions, tools, text, multi-agent configuration and reasoning summary. Existing Sessions may update model, reasoning effort, service tier, metadata and explicit spending policy. Editing reusable dependencies affects future Sessions; existing Sessions keep their frozen identity and recipe.
 
 Opaque JSON Schemas in function parameters and text formats are also creation-only. Kubernetes CEL equality can admit some same-sized replacements of unknown schema keys. The controller compares its frozen creation digest after admission, reports `ConfigurationCurrent=False` with `RequiresNewSession`, and preserves the original remote configuration and identity. Revert that edit or create a new Session. This controller check also protects against drift independently of admission.
+
+### Conditions
 
 Conditions are independent observations: `RemoteSessionCreated` describes the owned remote object's existence, `ConfigurationCurrent` describes desired configuration, `WorkspacePrepared` describes the verified current executor process/workspace and `EnvironmentConnected` describes the provider connection; `Ready` summarizes current eligibility. Supported settings updates do not erase remote existence or verified workspace/connection facts. Definite remote absence, ownership changes and lost execution identity revoke the relevant execution proofs. During cleanup, confirmed remote absence remains false while compute or workspace cleanup is pending.
 
@@ -252,7 +291,14 @@ Create the `codex-vault` Secret separately. When one attached credential matches
 
 Reusable Agent, Environment, Vault and VaultCredential resources use explicit `Delete` or `Retain` policies. Profile deletion removes only the reusable binding. A Session always cleans up its owned remote conversation and, when self-hosted, its executor before its finalizer completes.
 
-For self-hosted workspaces, `workspace.deletionPolicy: Delete` removes the SandboxClaim and its dependent Sandbox, Pod and storage. `workspace.deletionPolicy: Retain` suspends the Sandbox, detaches it from its claim, and deletes the claim while preserving the stopped environment and persistent files. A retained environment does not attach to a later Session. The StorageClass volume reclaim policy and backup policy are separate controls.
+Self-hosted workspace policy is set at `Environment.spec.selfHosted.workspace.deletionPolicy`:
+
+| Policy | Cleanup behavior | What remains |
+| --- | --- | --- |
+| `Delete` | Remove the SandboxClaim and wait for its dependent execution resources to disappear. | Gateway conversation history. |
+| `Retain` | Suspend the Sandbox, wait for its Pod to disappear, detach it from the claim, then delete the claim. | Gateway history, the suspended Sandbox and its persistent files for administrative inspection. |
+
+A retained Sandbox does not attach to a later Session. Delete it explicitly when its files are no longer needed. The StorageClass volume reclaim policy and backup policy are separate controls.
 
 The controller keeps creation claims and finalizers when a remote create or delete outcome is uncertain. Recover the exact object through its Kubernetes UID and verified owner scope; do not clear claims or finalizers to force progress.
 

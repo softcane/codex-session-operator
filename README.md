@@ -1,112 +1,85 @@
 # Codex Session Operator
 
-Run OpenAI managed coding agents against repositories in Kubernetes. Define an Agent, choose a Sandbox workspace, and send a task through a reusable Profile. The operator creates a Session for the conversation; the gateway saves its messages, history and approvals in PostgreSQL.
+Run OpenAI coding agents against repositories in Kubernetes. Define reusable agent and workspace configuration, then submit a task through the gateway. The operator creates a Session for the conversation, and the gateway saves messages, history and approvals in PostgreSQL.
 
-OpenAI runs the agent. [Kubernetes Agent Sandbox](https://agent-sandbox.sigs.k8s.io/) runs the executor and manages its workspace. This project connects them and tracks the conversation through provisioning, execution and cleanup.
+OpenAI runs the agent loop. For self-hosted execution, [Kubernetes Agent Sandbox](https://agent-sandbox.sigs.k8s.io/) runs `codex exec-server` in your cluster, where it edits files and executes commands. You control the executor image, repository revision, tools, credentials and persistent storage.
 
-## How it fits together
+The API is alpha. Start with the simulated demo to try the lifecycle without an API key, or follow the repository walkthrough to run a real coding task.
 
-![Step-by-step SelfHosted flow: configure a Profile, accept input into PostgreSQL, create a Session and SandboxClaim, run tools in an Agent Sandbox executor, read history and clean up](docs/assets/session-flow.gif)
+## Try the local demo
 
-The animation walks through the self-hosted lifecycle below. [View the static overview](docs/assets/session-flow.png).
-
-| Component | Responsibility |
-| --- | --- |
-| Our controller | Reconciles custom resources, manages OpenAI identities and requests Sandbox workspaces. |
-| Our gateway | Accepts tasks, delivers messages, saves history and handles approvals. |
-| Agent Sandbox | Creates and replaces executor Pods and manages workspace storage. |
-| OpenAI | Runs the managed Agent and Session, including reasoning and tool requests. |
-| PostgreSQL | Stores conversations, pending input and retry receipts. |
-
-For self-hosted execution, the Kubernetes ownership chain is:
-
-```mermaid
-flowchart LR
-    S[Our Session] --> C[SandboxClaim]
-    C --> B[Sandbox]
-    B --> P[Codex executor Pod]
-    B --> W[(Workspace PVC)]
-```
-
-Our controller creates the claim. The separately installed Agent Sandbox operator creates the Sandbox, Pod and storage. The Pod runs `codex exec-server`, connects to OpenAI and executes the agent's commands against the repository. Use an application executor image with the tools your project needs; the Go example adds Go, Make, a C compiler and GitHub CLI.
-
-Administrators define the image, repository revision, resources, security, Secret references and storage in a `SandboxTemplate`. A `SandboxWarmPool` selects that template. We use `replicas: 0` for on-demand allocation: each Session needs its own OpenAI connection settings and workspace.
-
-We pin the Go dependency and deployment examples to **Agent Sandbox v1.0.7**. Install its core and extensions controllers and CRDs separately from our controller and gateway. See [deployment](docs/deployment.md#self-hosted-execution) for the setup.
-
-## Get started
-
-### Try the local demo
-
-With Docker, Go, Make, Kind, kubectl, Python 3.10+, Node.js and OpenSSL installed, run:
+From this checkout, with Docker running and Go, Make, Kind, kubectl, Python 3.10+, Node.js and OpenSSL installed, run:
 
 ```sh
 make demo
 ```
 
-This builds an isolated Kind deployment with the real Sandbox operator and a simulated OpenAI provider. It needs no API key and makes no model calls. The command retains the successful playground and prints client and cleanup instructions. `make test-e2e` runs the same suite and removes its cluster afterward.
+Use the Go toolchain specified in [go.mod](go.mod). Make downloads pinned build tools into `bin/` as needed.
 
-### Run a real repository task
+The demo builds an isolated Kind cluster with the controller, gateway, PostgreSQL, Agent Sandbox and a simulated OpenAI provider. It exercises conversations and resource cleanup, then keeps the successful deployment for inspection. It needs no API key and makes no model calls.
 
-Follow [Run my-go-project](docs/my-go-project.md) to build the executor, install the services, configure credentials and ask an agent to fix a Go service. You need an OpenAI project with Agents API access, a separate restricted executor key and PostgreSQL. Model calls incur charges.
+After a successful run, follow the printed `env.sh` and port-forward instructions to reach the gateway. The command also prints the report path and the command to delete its cluster. See [Use the retained demo](docs/development.md#use-the-retained-demo) for a CLI example. To run the same suite and remove the cluster afterward, use `make test-e2e`.
 
-The [deployment guide](docs/deployment.md) covers installation in your own cluster. Install our controller and gateway together as separate Deployments; have your platform team provision and manage PostgreSQL externally, and install Agent Sandbox separately. The demo and local development helpers deploy PostgreSQL in Kubernetes for convenience. The gateway serves HTTP by default. Your deployment layer manages access control.
+## Run a real repository task
 
-## Configuration
+Follow [Run my-go-project](docs/my-go-project.md) to ask an agent to reproduce and fix a bug in a Go service, verify the change and export its commit. The walkthrough covers image builds, credentials, PostgreSQL, installation and the durable CLI.
 
-Our resources use `agents.softcane.io/v1alpha1` and namespaced references.
+You need a Kubernetes cluster, an OpenAI project with Agents API access, a separate restricted executor key and PostgreSQL. Model calls incur charges; the walkthrough's Profile explicitly selects unlimited spending. For an existing platform, use the [deployment guide](docs/deployment.md).
 
-| Resource | What you configure |
+## Configure once, start conversations as needed
+
+All six custom resources use `agents.softcane.io/v1alpha1`. References stay within a Kubernetes namespace.
+
+| Resource | Purpose |
 | --- | --- |
-| `Agent` | Model, instructions, reasoning settings and tools. |
-| `Environment` | An approved Sandbox pool and workspace policy for self-hosted execution. It also supports OpenAI-hosted execution and no-runtime tasks. |
-| `Profile` | Agent, Environment, optional Vault references and an explicit spending policy. Callers select a Profile when starting work. |
+| `Agent` | Model, reusable instructions, reasoning settings and tools. |
+| `Environment` | Execution mode and workspace policy. Self-hosted environments select an approved Sandbox pool. |
+| `Profile` | Agent, Environment, optional Vaults and an explicit spending policy that callers select when starting work. |
 | `Session` | One conversation attempt, normally created by the gateway from a Profile. |
-| `Vault` and `VaultCredential` | Provider tool credentials backed by Kubernetes Secret references. |
+| `Vault` | Provider credential container for connected tools. |
+| `VaultCredential` | Provider credential configuration backed by Kubernetes Secret references. |
 
-An Environment selects an administrator's approved pool:
+Applying an Agent, Environment and Profile creates no task Pod. A caller starts work by selecting a Ready Profile and sending a message with a stable idempotency key. Each new self-hosted conversation gets its own Session and workspace; follow-up messages use the existing conversation.
 
-```yaml
-apiVersion: agents.softcane.io/v1alpha1
-kind: Environment
-metadata:
-  name: go-development
-  namespace: codex-session-operator-system
-spec:
-  mode: SelfHosted
-  deletionPolicy: Delete
-  selfHosted:
-    sandboxPoolRef:
-      name: my-go-project-v1
-    workspace:
-      directory: /workspace
-      deletionPolicy: Retain
-```
+Administrators define executor images, repository preparation, resources, Secret mounts and storage in a `SandboxTemplate`. A `SandboxWarmPool` selects that template, and the controller's `SANDBOX_POOLS` setting approves the pool. Managed templates and pools have immutable specifications; use versioned names when changing them. See the [resource reference](docs/resources.md) and [complete application templates](examples/my-go-project/automation/k8s/).
 
-Approve the pool through the controller's `SANDBOX_POOLS` configuration. Keep managed template and pool specifications immutable; create a new versioned setup when their configuration changes. Applying an Agent, Environment and Profile creates no task Pod. Start a conversation through the gateway to use the Profile.
+## How a task runs
 
-See the [complete example templates](examples/my-go-project/automation/k8s/) for the Agent, Environment, Profile, SandboxTemplate and SandboxWarmPool, and the [resource reference](docs/resources.md) for all supported fields.
+![Self-hosted lifecycle: configure a Profile, accept input into PostgreSQL, create a Session and SandboxClaim, run commands in an Agent Sandbox executor, read history and clean up](docs/assets/session-flow.gif)
 
-## Task lifecycle
+[View the static overview](docs/assets/session-flow.png).
 
-The animation shows these steps for a `SelfHosted` Environment:
+1. **Accept input.** The gateway commits the message and retry receipt to PostgreSQL, then returns HTTP `202` with a conversation URL.
+2. **Create the Session.** A gateway worker creates the Kubernetes Session. The controller resolves Ready dependencies, freezes their identities and creation settings, and records a claim before creating the remote OpenAI Session.
+3. **Prepare execution.** For a `SelfHosted` Environment, the controller creates a Session-owned SandboxClaim. Agent Sandbox creates the Sandbox, executor Pod and workspace storage from the approved template.
+4. **Run the task.** After verifying ownership, repository preparation, workspace identity and a current OpenAI connection, the gateway delivers input. OpenAI runs the agent and requests commands from the executor.
+5. **Read the outcome.** The gateway saves turns and output. Read the new root turn and its results to determine whether the task succeeded.
+6. **Continue or close.** Follow-up messages keep the Session and workspace. Close stops new input and requests cleanup; a fresh attempt after cleanup creates a new Session and workspace.
 
-1. **Install the services.** Deploy our controller and gateway together. Provision PostgreSQL and install the Agent Sandbox core and extensions separately.
-2. **Declare the configuration.** Set up an Agent, Environment and Profile with an explicit spending policy. An administrator supplies a versioned SandboxTemplate and pool, approved through `SANDBOX_POOLS`. These declarations create no task Pod.
-3. **Start a conversation.** Send a Profile name, message and stable idempotency key to the gateway.
-4. **Save the input.** The gateway commits the request and receipt to PostgreSQL, then returns HTTP `202` with a conversation URL.
-5. **Create the Kubernetes Session.** A gateway worker creates one Session from the accepted Profile selection.
-6. **Create the remote Session.** The controller resolves Ready dependencies, freezes their identities and creation settings, and persists a creation claim before calling OpenAI.
-7. **Request the workspace.** Our controller creates a Session-owned SandboxClaim. Agent Sandbox creates the Sandbox, executor Pod and workspace PVC from the approved recipe.
-8. **Prepare and connect.** The template prepares the repository and starts `codex exec-server`. Input delivery waits for verified ownership, preparation, workspace identity and a current OpenAI connection.
-9. **Run and read the result.** OpenAI runs the agent loop and requests tools from the executor. The gateway delivers messages, saves turns and handles approvals. Read the saved new root turn and its output to confirm its outcome.
-10. **Continue or close.** Follow-up messages use the same conversation and workspace. Closing stops input and suspends execution before cleanup. After cleanup, an explicit start-fresh request creates a new Session and workspace.
+HTTP `202` confirms durable acceptance. Completion requires a later history read. When retrying an uncertain request, keep its idempotency key and body unchanged. The [conversation guide](docs/conversations.md) explains retries, completion checks and approvals.
 
-HTTP `202` means the gateway accepted the input durably. Check a new completed root turn and its output to establish that the task finished. Keep the same idempotency key and request body when retrying an uncertain request.
+A replacement executor reconnects to the same Session and persistent workspace. On close, `workspace.deletionPolicy: Delete` removes the workspace; `Retain` leaves a suspended Sandbox and its files for administrative inspection. The claim is removed in both cases. PostgreSQL keeps conversation history after Session cleanup.
 
-A replacement executor reconnects to the same Session and persistent workspace. Closing stops new input and triggers cleanup. With `workspace.deletionPolicy: Delete`, cleanup removes the workspace. With `Retain`, cleanup leaves a suspended Sandbox and its files for administrative inspection. A fresh Session gets a separate workspace. PostgreSQL retains conversation history after Session cleanup.
+## Install and operate
 
-## Development and reference
+Deploy the controller and gateway together as separate Deployments and images. Provision PostgreSQL separately, and install the Agent Sandbox core and extensions separately for self-hosted execution. The Go dependency and deployment examples pin **Agent Sandbox v1.0.7**.
+
+The gateway serves HTTP by default. Your deployment layer provides authentication, access control and any required TLS termination. Callers who can reach a namespace's gateway routes share access to its conversations. See [deployment](docs/deployment.md) for installation, approved pools, storage and recovery.
+
+## Documentation and development
+
+| To… | Read |
+| --- | --- |
+| Run a real coding task from setup to exported commit | [Repository walkthrough](docs/my-go-project.md) |
+| Install and operate the services | [Deployment](docs/deployment.md) |
+| Start, continue, retry and close conversations | [Conversations and CLI](docs/conversations.md) |
+| Look up CRD configuration and update rules | [Resource reference](docs/resources.md) |
+| Understand ownership, readiness and recovery | [Architecture](docs/architecture.md) |
+| Build and choose verification checks | [Development](docs/development.md) |
+| Contribute a change or publish a release | [Contributing](CONTRIBUTING.md) |
+| Report a vulnerability | [Security](SECURITY.md) |
+
+For local development:
 
 ```sh
 make lint
@@ -114,15 +87,7 @@ make test
 make test-helpers
 ```
 
-The [development guide](docs/development.md) covers database tests, isolated deployment tests and the separate paid OpenAI test. See [Contributing](CONTRIBUTING.md) for code changes and release checks.
-
-To regenerate the GIF and static overview after lifecycle changes, install `Pillow>=10.4,<13` and run `python3 docs/assets/generate-session-flow.py`.
-
-- [Architecture](docs/architecture.md): component boundaries, ownership and recovery.
-- [Deployment](docs/deployment.md): prerequisites, credentials, installation and operations.
-- [Conversations](docs/conversations.md): HTTP API, CLI, retries and approvals.
-- [Resources](docs/resources.md): CRD configuration and examples.
-- [CRD schemas](config/crd/bases/): accepted fields for this checkout.
+To regenerate the lifecycle images, install `Pillow>=10.4,<13` and run `python3 docs/assets/generate-session-flow.py`.
 
 ## License
 

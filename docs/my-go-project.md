@@ -1,26 +1,20 @@
 # Run `my-go-project` with Codex Session Operator
 
-Run coding agents against your repositories in Kubernetes. Declare an agent, its tools and its execution environment in YAML, then submit an investigation or bug report through the Go CLI or HTTP API.
+Use a coding agent to reproduce and fix an idempotency bug in a small Go HTTP service. By the end, you will have a verified commit exported from the executor into your own checkout, plus saved conversation history and test evidence.
 
-With a self-hosted Environment, the gateway creates a Session for each conversation and the controller requests a Sandbox through a claim. Agent Sandbox creates and maintains its executor Pod and storage. OpenAI runs the model and managed agent loop; your Pod runs shell commands, edits files and executes tests through `codex exec-server`. You choose the container image, repository revision, skills and workspace storage.
+This walkthrough uses **real OpenAI execution** and incurs charges. The supplied Profile selects `spendControl.mode: Unlimited`; choose your spending policy before starting a task. For a no-key introduction with simulated responses, use the [local demo](development.md#use-the-retained-demo).
 
-A reusable Profile lets you start independent tasks with the same configuration. The gateway commits input to PostgreSQL before accepting it, retains conversation history and supports retries with stable identities. A persistent workspace keeps Git changes and local commits across executor Pod replacement.
+You will:
 
-See the [architecture diagram](architecture.md) for the gateway, OpenAI and Sandbox ownership boundaries.
+1. Publish the example repository and build its executor and skills images.
+2. Install the controller, gateway, PostgreSQL and Agent Sandbox with the required credentials.
+3. Declare an Agent, Environment and Profile, then submit the bug report through the durable CLI.
+4. Inspect the new root turn, test results and commit before exporting the work.
+5. Optionally replace the executor to check workspace recovery, then close the conversation.
 
-## The resources
+OpenAI runs the agent loop; `codex exec-server` runs commands in your cluster. The controller requests a workspace through a SandboxClaim, and Agent Sandbox creates its Sandbox, Pod and storage. The Profile ties reusable agent and workspace configuration to a spending policy. Applying that configuration creates no task Pod; starting a conversation creates the Session and workspace.
 
-| Resource | What you declare |
-| --- | --- |
-| **Agent** | Model, instructions and optional tools or subagents. |
-| **Environment** | Approved sandbox pool, workspace/skills directories and cleanup policy. |
-| **Profile** | An Agent and Environment, optional Vaults and an explicit spending policy. |
-| **Session** | One conversation attempt. The gateway creates it when you start a task from a Profile. |
-| **Vault / VaultCredential** | Credential references for connected tools that need the provider's Vault. |
-
-An Environment selects an approved sandbox setup. Its administrator-maintained SandboxTemplate defines images, repository, resource limits and storage. Applying Agent, Environment and Profile creates no task Pod. A new self-hosted conversation selects that recipe and gets its own Session and workspace. Profile changes apply to future conversations. The API also supports OpenAI-hosted and text-only environments; this walkthrough uses self-hosted execution.
-
-Kubernetes stores safe configuration, identities and conditions. PostgreSQL stores task messages, receipts and history. The workspace PVC stores repository files. These are separate forms of persistence.
+The gateway stores messages, receipts and history in PostgreSQL. Repository edits and local commits live on a separate workspace PVC. See [architecture](architecture.md) for ownership boundaries and the [resource reference](resources.md) for all six CRDs.
 
 ## The `my-go-project` example
 
@@ -72,7 +66,7 @@ flowchart LR
 
 ## Run my-go-project
 
-This walkthrough uses real OpenAI execution. Model calls incur charges. The example Profile declares `spendControl.mode: Unlimited`; choose your spending policy before starting a task.
+### Prerequisites
 
 You need:
 
@@ -80,9 +74,10 @@ You need:
 - Docker with a builder for your node architecture, and a registry your Kubernetes nodes can pull from. Configure private registry pull credentials before deployment if needed.
 - Go matching this repository's `go.mod`, a C compiler for the host race check, Python 3.10 or newer, Git, Make, `kubectl`, `jq`, OpenSSL, `curl`, `envsubst` and GitHub CLI (`gh`). `envsubst` comes from gettext.
 - An authenticated GitHub CLI account and Docker registry credentials.
+- An external PostgreSQL service with TLS, or enough cluster capacity and storage for the local-development PostgreSQL instance in step 4.
 - An application OpenAI key with Agents API and inference access, plus a different restricted environment-connection key from the same provider project. Keep the application key outside executors. See [OpenAI authentication](https://developers.openai.com/api/docs/guides/agents-api/environments/self-hosted#authentication).
 
-Run the commands below in **Bash**, from this operator checkout. They use native tools and Kubernetes manifests.
+Run the steps in order in **Bash**, from this operator checkout, and keep the exported variables for later steps. Replace the placeholder context, StorageClass and registry values before running commands. Steps 1–6 prepare infrastructure; step 7 starts the paid agent task.
 
 ### 1. Select the cluster and prepare the project
 
@@ -306,7 +301,7 @@ k -n "$NAMESPACE" wait --for=condition=Ready --timeout=240s \
   agent/my-go-maintainer environment/my-go-development profile/my-go-project
 ```
 
-The supplied SandboxTemplate mounts `codex-repository` in preparation. For a public repository, remove that Secret mount and its credential arguments from the template. Ready confirms that the declared dependencies and policy are available. The first task proves checkout and execution. For PR publication, enable runtime credentials before applying these declarations; see [publication](#allow-the-agent-to-publish-a-pr).
+At this point, the Agent, Environment and Profile should be Ready, with no task executor Pod. The supplied SandboxTemplate mounts `codex-repository` in preparation. For a public repository, remove that Secret mount and its credential arguments from the template. Ready confirms that the declared dependencies and policy are available. The first task proves checkout and execution. For PR publication, enable runtime credentials before applying these declarations; see [publication](#allow-the-agent-to-publish-a-pr).
 
 ### 7. Submit the bug-fix task
 
@@ -352,7 +347,7 @@ The gateway returns acceptance after committing the task. Its worker creates the
 
 ### 8. Observe the actual outcome
 
-A `202` receipt confirms saved input. A completed root turn confirms finished execution; read its final message and command exit codes to decide whether the task succeeded. Send one task at a time in this example.
+The receipt from step 7 confirms saved input. A completed root turn confirms finished execution; read its final message and command exit codes to decide whether the task succeeded. Send one task at a time in this example.
 
 This shell function finds a new root and watches that exact ID. It avoids treating an earlier completed turn as the result of a later message.
 
@@ -446,7 +441,7 @@ jq -e '.summary.state=="closed" and .summary.cleaned==true' "$PRIVATE_DIR/conver
 kill "$FORWARD_PID"
 ```
 
-Close stops fresh input and removes the remote Session and executor. The example's `Retain` policy suspends and keeps the Sandbox and workspace PVC, then removes the claim; saved history remains readable. A fresh attempt creates a new Session and workspace using the current Profile. The retained Sandbox does not attach to that new Session.
+Close stops fresh input and removes the remote Session and executor. The example's `Retain` policy suspends and keeps the Sandbox and workspace PVC, then removes the claim; saved history remains readable. After `summary.cleaned` becomes `true`, a fresh attempt can create a new Session and workspace using the current Profile. The retained Sandbox does not attach to that new Session.
 
 After exporting any work you need, remove the example declarations with `k -n "$NAMESPACE" delete profile/my-go-project environment/my-go-development agent/my-go-maintainer`. Delete its retained Sandbox only after preserving the files you need; its PVC remains owned by that Sandbox until then. Keep PostgreSQL and the caller journal for retained history and replay; retire their credentials when the installation is no longer needed.
 

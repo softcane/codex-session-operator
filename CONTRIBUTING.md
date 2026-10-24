@@ -4,36 +4,29 @@ Read [README.md](README.md), [architecture](docs/architecture.md) and the [conve
 
 ## Development
 
-Use the Go toolchain in `go.mod`. Docker, Kind, kubectl, Python 3.10 or newer, Node.js, OpenSSL and Make support the isolated test harness. `make help` lists commands; Make installs pinned build tools into the ignored `bin/` directory.
+Use the Go toolchain in [go.mod](go.mod). Run `make help` to list supported commands. Make installs pinned tools into the ignored `bin/` directory.
+
+For Go changes, run:
 
 ```sh
 make dependencies-check
 make lint
 make test
-make test-storage-postgres
-make test-e2e
 ```
 
-`make test` runs unit tests and Kubernetes envtest with race detection and shuffled order. Envtest installs the pinned upstream Sandbox CRD fixtures. The PostgreSQL gate checks transactions, concurrency and crash recovery against a disposable database.
+`make test` includes race detection, shuffled order and Kubernetes envtest. Add verification for the behavior you changed: `make test-helpers` for deployment helpers, `make test-storage-postgres` for transactions and recovery, and `make test-e2e` for deployed lifecycle behavior. The [development guide](docs/development.md#choose-checks-for-your-change) lists prerequisites and what each check covers.
 
-The no-key end-to-end suite creates an isolated Kind cluster, installs Agent Sandbox, and exercises conversations, all six operator CRDs and upstream-managed Pods/PVCs with a simulated provider. It removes the cluster after a successful run. `make demo` keeps that deployment for inspection.
+The end-to-end suite creates its own isolated Kind cluster, uses a simulated provider and makes no model calls. `make demo` retains the successful deployment for inspection.
 
-The separate `make test-sandbox-live` gate uses restricted OpenAI credentials and incurs charges. Run it only when real provider verification is authorized; it is not part of ordinary CI. Read [development](docs/development.md#sandbox-qualification) before using it.
+The separate `make test-sandbox-live` gate uses restricted OpenAI credentials and incurs charges. Run it only when real-provider verification is authorized. Read [Sandbox qualification](docs/development.md#sandbox-qualification) for spending modes, retained deployments and cleanup.
 
 ## Code and configuration
 
-- `api/v1alpha1/`: custom resource types and validation markers.
-- `internal/controller/`: remote identity, reconciliation, Sandbox claims and cleanup.
-- `internal/gateway/`: HTTP, durable conversations, history and approvals.
-- `internal/openaiapi/`: provider adapter and ownership checks.
-- `internal/sandbox/`: approved recipe validation and execution ownership/preparation proofs.
-- `config/` and `examples/`: installation overlays, native Sandbox recipes and application examples.
-- `test/e2e/`: isolated deployment tests, fixtures and helper checks.
-- `hack/`: code generation headers, installer rendering and local setup.
+Use the [architecture source map](docs/architecture.md#source-map) to find the component that owns the behavior. Read [AGENTS.md](AGENTS.md) for repository contract rules.
 
 Edit API source, then run `make manifests generate`. Keep examples and documentation aligned with the generated schemas. Delegate Pod/PVC creation to Agent Sandbox and preserve the gateway's delivery checks. Store conversation content in PostgreSQL, keep credential values out of reports and status, and preserve claims/finalizers when a remote outcome is uncertain.
 
-Match verification to the changed boundary. Explain the resulting behavior and checks in the pull request. Contributions use [Apache 2.0](LICENSE).
+In your pull request, explain the problem, the resulting behavior and the checks you ran. Update runnable examples and public contracts alongside the implementation. Report any verification you could not complete. Contributions use [Apache 2.0](LICENSE).
 
 ## Releases
 
