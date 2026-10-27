@@ -1,6 +1,6 @@
 # Build the controller, gateway, executor and isolated acceptance fixtures.
 # Override BASE_IMAGE only with a reviewed, patched Go image.
-ARG BASE_IMAGE=golang:1.27.2@sha256:007a316059246276cb214df93950be77837545dc78007a73e0291a4963d5d3bf
+ARG BASE_IMAGE=golang:1.27.3@sha256:9048d5e7751706200eb1719c7dae0436950d362f29a1da91fa05e5c63867c60f
 ARG NODE_IMAGE=node:22.22.0-bookworm-slim@sha256:dd9d21971ec4395903fa6143c2b9267d048ae01ca6d3ea96f16cb30df6187d94
 
 # An unqualified build stage resolves for TARGETPLATFORM, so test executors copy

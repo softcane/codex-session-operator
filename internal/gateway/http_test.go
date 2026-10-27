@@ -16,6 +16,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 )
 
@@ -115,17 +116,6 @@ func TestGatewayListenersOnlyNegotiateHTTP1(t *testing.T) {
 	}
 }
 
-// Shorten a real configured write deadline so the regression does not wait for
-// the production timeout. An unbounded server never calls this method.
-type shortWriteConnection struct{ net.Conn }
-
-func (c *shortWriteConnection) SetWriteDeadline(deadline time.Time) error {
-	if !deadline.IsZero() {
-		deadline = time.Now().Add(50 * time.Millisecond)
-	}
-	return c.Conn.SetWriteDeadline(deadline)
-}
-
 type oneConnectionListener struct {
 	connection net.Conn
 	accepted   bool
@@ -148,11 +138,17 @@ func (l *oneConnectionListener) Close() error {
 func (l *oneConnectionListener) Addr() net.Addr { return l.connection.LocalAddr() }
 
 func TestOrdinaryResponseWriteDeadlineReleasesCapacity(t *testing.T) {
+	synctest.Test(t, testOrdinaryResponseWriteDeadlineReleasesCapacity)
+}
+
+func testOrdinaryResponseWriteDeadlineReleasesCapacity(t *testing.T) {
+	t.Helper()
 	store := testStore(t)
 	g, _ := testGateway(t, store, simulatorForTest(), testSession())
 	if err := store.Update(t.Context(), _testUID, func(r *Record) error {
 		r.Namespace, r.Name = _testNamespace, _testSessionName
-		r.Notes["large"] = strings.Repeat("x", 8<<20)
+		// Exceed net/http's response buffer; net.Pipe has no socket buffer.
+		r.Notes["large"] = strings.Repeat("x", 16<<10)
 		return nil
 	}); err != nil {
 		t.Fatal(err)
@@ -164,7 +160,7 @@ func TestOrdinaryResponseWriteDeadlineReleasesCapacity(t *testing.T) {
 		defer close(finished)
 		g.ServeHTTP(w, r)
 	}))
-	listener := &oneConnectionListener{connection: &shortWriteConnection{Conn: serverSide}, closed: make(chan struct{})}
+	listener := &oneConnectionListener{connection: serverSide, closed: make(chan struct{})}
 	served := make(chan error, 1)
 	go func() { served <- server.Serve(listener) }()
 	t.Cleanup(func() {
@@ -181,10 +177,15 @@ func TestOrdinaryResponseWriteDeadlineReleasesCapacity(t *testing.T) {
 	if _, err := io.WriteString(clientSide, "GET /v1/namespaces/team/sessions/work HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer "+_testAuthorizationValue+"\r\n\r\n"); err != nil {
 		t.Fatal(err)
 	}
-	// The client deliberately never reads its multi-megabyte response.
+	synctest.Wait()
+	if len(g.requestSlots) != 1 {
+		t.Fatal("slow response reader did not hold an ordinary request slot")
+	}
+	// The client never reads. Fake time advances only once the handler blocks,
+	// so fixture processing cannot consume the timeout on a busy CI runner.
 	select {
 	case <-finished:
-	case <-time.After(2 * time.Second):
+	case <-time.After(time.Minute):
 		t.Fatal("slow response reader retained gateway capacity without a write deadline")
 	}
 	if len(g.requestSlots) != 0 {

@@ -1,8 +1,8 @@
 module github.com/softcane/codex-session-operator
 
-go 1.26.9
+go 1.26.10
 
-toolchain go1.27.2
+toolchain go1.27.3
 
 require (
 	github.com/felixge/httpsnoop v1.1.0
