@@ -190,8 +190,12 @@ jobs:
           Path('dist/images.json').write_text(json.dumps({'version': os.environ['VERSION'], 'revision': os.environ['SOURCE_REVISION'], 'platforms': ['linux/amd64', 'linux/arm64'], 'controller': controller, 'gateway': gateway, 'executor': executor}, indent=2) + '\n')
           PY
           git diff --exit-code -- go.mod go.sum api config
+      - name: Build CLI archives and package the example
+        run: |
+          make build-cli-release
+          cp examples/repository-task.yaml dist/repository-task.yaml
           cd dist
-          sha256sum install.yaml images.json > SHA256SUMS
+          sha256sum install.yaml images.json repository-task.yaml gateway-client_*.tar.gz > SHA256SUMS
       - name: Create GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -201,4 +205,5 @@ jobs:
           if [ "$PRERELEASE" = true ]; then args+=(--prerelease); fi
           gh release create "$VERSION" --repo "$REPOSITORY" --verify-tag \
             --title "$VERSION" --generate-notes "${args[@]}" \
-            dist/install.yaml dist/images.json dist/SHA256SUMS
+            dist/install.yaml dist/images.json dist/repository-task.yaml \
+            dist/gateway-client_*.tar.gz dist/SHA256SUMS

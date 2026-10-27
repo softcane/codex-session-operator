@@ -2,7 +2,7 @@
 
 Codex Session Operator exposes six namespaced resources in `agents.softcane.io/v1alpha1`. Use this page to look up resource roles, common configuration, update rules and cleanup behavior. The generated [CRD schemas](../config/crd/bases/) define every accepted field and its validation for this checkout.
 
-The YAML examples describe provider-backed resources. Applied to a real-provider installation, Sessions can make paid model calls. The [local demo](development.md#use-the-retained-demo) uses a simulated provider instead.
+These examples use the configured provider. Real OpenAI execution incurs charges. Start with [getting started](getting-started.md) for a complete local setup.
 
 Enum values are case-sensitive. Operator-owned modes use `SelfHosted`, `OpenAIHosted`, `None`, `Limited` and `Unlimited`; hosted source selectors use `FileID`, `Inline` and `SkillReference`; deletion policies use `Delete` and `Retain`. Provider/protocol values such as `reasoning.effort: high`, tool types, hosted network access and OAuth methods retain their documented wire literals. The adapter translates CRD field names, including `workingDirectory` to `cwd` and `expirationTime` to `expires_at`.
 
@@ -36,7 +36,7 @@ spec:
   deletionPolicy: Delete
 ```
 
-This Agent can be referenced by the Profile and direct Session examples below. The [repository example](my-go-project.md) shows an Agent with repository skills and execution tools. See the [Agent API source](../api/v1alpha1/agent_types.go) and generated schema for the full reasoning, output, multi-agent and tool variants.
+This Agent can be referenced by the Profile and direct Session examples below. The [application Agent template](../examples/my-go-project/automation/k8s/agent.yaml.tmpl) shows an Agent with repository skills and execution tools. See the [Agent API source](../api/v1alpha1/agent_types.go) and generated schema for the full reasoning, output, multi-agent and tool variants.
 
 ## Environment
 
@@ -105,7 +105,7 @@ spec:
 | `selfHosted.workspace.deletionPolicy` | Required `Delete` or `Retain` policy for Session cleanup of the Sandbox environment. |
 | `selfHosted.capabilityDirectories` | Directories where the template exposes skills or other capabilities to the runtime. |
 
-The template must actually provide the declared files and directories. See the [Environment sample](../config/samples/agents_v1alpha1_environment_selfhosted.yaml), [application template](../examples/my-go-project/automation/k8s/sandbox.yaml.tmpl) and [deployment guide](deployment.md#self-hosted-execution).
+The template must actually provide the declared files and directories. See the [Environment sample](../config/samples/agents_v1alpha1_environment_selfhosted.yaml), [application template](../examples/my-go-project/automation/k8s/sandbox.yaml.tmpl) and [deployment guide](deployment.md#5-configure-a-workspace-and-profile).
 
 Workspace paths must be clean absolute directories outside reserved runtime paths. Capability paths must be clean absolute paths. References use same-namespace DNS subdomain names. Pool approval, live template identities, credentials and resource availability remain reconciliation checks.
 
@@ -143,7 +143,7 @@ Profiles and Sessions require an explicit `spendControl`:
 | `Limited` | Positive `limitCents`, in US cents. | Requests a per-Session cap. Requires provider-project support and verified readback before readiness and later delivery. |
 | `Unlimited` | Omit `limitCents`. | Explicitly selects unlimited Session spending. |
 
-In `None` mode, the first input is part of remote Session creation, so the first turn starts before cap readback. The controller reports `SpendControlUnavailable` when the provider does not support the requested cap; it does not switch to unlimited spending. See [spending verification](development.md#choose-a-spending-mode).
+In `None` mode, the first input is part of remote Session creation, so the first turn starts before cap readback. The controller reports `SpendControlUnavailable` when the provider does not support the requested cap; it does not switch to unlimited spending. See [spending verification](../CONTRIBUTING.md#choose-a-spending-mode).
 
 ## Direct Session
 
@@ -217,73 +217,9 @@ Consumers must check the relevant condition's `observedGeneration` against `meta
 
 Vault credential values come from the fixed same-namespace `codex-vault` Secret. The CR records the protected source identity and provider credential ID, without copying the secret value into status.
 
-This example configures one service-origin HTTP MCP tool and a matching bearer credential:
+Create the Secret separately, then apply a [Vault](../config/samples/agents_v1alpha1_vault.yaml) and [bearer credential](../config/samples/agents_v1alpha1_vaultcredential.yaml). Configure an Agent's service-origin HTTP MCP tool with the same server URL and attach the Vault through `Profile.spec.vaultRefs`.
 
-```yaml
-apiVersion: agents.softcane.io/v1alpha1
-kind: Agent
-metadata:
-  name: service-agent
-  namespace: codex-session-operator-system
-spec:
-  model: gpt-6-luna
-  instructions: Use the approved service when the task requires it.
-  tools:
-    - type: mcp
-      mcp:
-        serverLabel: service
-        transport:
-          type: http
-          http:
-            serverURL: https://mcp.example.com/mcp
-        connectionOrigin: service
-        required: true
-  deletionPolicy: Delete
----
-apiVersion: agents.softcane.io/v1alpha1
-kind: Vault
-metadata:
-  name: service-credentials
-  namespace: codex-session-operator-system
-spec:
-  deletionPolicy: Delete
----
-apiVersion: agents.softcane.io/v1alpha1
-kind: VaultCredential
-metadata:
-  name: service-token
-  namespace: codex-session-operator-system
-spec:
-  vaultRef:
-    name: service-credentials
-  name: Service MCP bearer credential
-  auth:
-    type: static_bearer
-    staticBearer:
-      serverURL: https://mcp.example.com/mcp
-      tokenSecretRef:
-        name: codex-vault
-        key: mcp-token
-  deletionPolicy: Delete
----
-apiVersion: agents.softcane.io/v1alpha1
-kind: Profile
-metadata:
-  name: service-tasks
-  namespace: codex-session-operator-system
-spec:
-  agentRef:
-    name: service-agent
-  environmentRef:
-    name: text-only
-  spendControl:
-    mode: Limited
-    limitCents: 500
-  vaultRefs:
-    - name: service-credentials
-```
-
-Create the `codex-vault` Secret separately. When one attached credential matches the MCP URL, the controller selects it. If several attached credentials match, set `Agent.spec.tools[].mcp.credentialID` to the chosen provider ID from `VaultCredential.status.openaiCredentialID`.
+When one attached credential matches the MCP URL, the controller selects it. If several match, set `Agent.spec.tools[].mcp.credentialID` to the provider ID in `VaultCredential.status.openaiCredentialID`. The application OpenAI key also needs `api.vaults.read` and `api.vaults.write`; see [OpenAI authentication](https://developers.openai.com/api/docs/guides/agents-api/environments/self-hosted#authentication).
 
 `static_bearer` and `mcp_oauth` credentials apply to service-origin HTTP MCP tools. `environment_variable` credentials use `environmentVariable.variableName` to name a hosted environment variable, not a Kubernetes Secret. They supply placeholders to supported hosted environments; they do not inject values into self-hosted executor Pods. The executor connection key in `codex-executor` has a separate purpose.
 

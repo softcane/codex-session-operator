@@ -43,6 +43,12 @@ jobs:
           test "$(grep -c 'image: registry.invalid/codex-gateway:test' dist/install.yaml)" -eq 1
       - name: Reject generated source drift
         run: git diff --exit-code -- go.mod go.sum api config
+      - name: Build CLI release archives and run the Linux client
+        run: |
+          make build-cli-release
+          mkdir -p "$RUNNER_TEMP/gateway-client"
+          tar -xzf dist/gateway-client_linux_amd64.tar.gz -C "$RUNNER_TEMP/gateway-client" gateway-client
+          "$RUNNER_TEMP/gateway-client/gateway-client" --help
       - name: Retain allowlisted durability evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2

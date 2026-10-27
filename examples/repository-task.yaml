@@ -1,0 +1,139 @@
+# Complete self-hosted repository example.
+# Install Agent Sandbox and Codex Session Operator first.
+# Approve sandbox-v1 through the controller's SANDBOX_POOLS setting.
+# Replace the executor image, node architecture and StorageClass before applying.
+# The Profile explicitly uses Unlimited spending for real OpenAI calls.
+apiVersion: extensions.agents.x-k8s.io/v1beta1
+kind: SandboxTemplate
+metadata:
+  name: sandbox-v1
+  namespace: codex-session-operator-system
+  labels:
+    agents.softcane.io/managed: "true"
+spec:
+  envVarsInjectionPolicy: Allowed
+  service: false
+  podTemplate:
+    spec:
+      automountServiceAccountToken: false
+      restartPolicy: Always
+      terminationGracePeriodSeconds: 10
+      nodeSelector:
+        kubernetes.io/arch: arm64
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile: {type: RuntimeDefault}
+      initContainers:
+        - name: repository-prepare
+          image: &executor_image registry.example/executor@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+          imagePullPolicy: IfNotPresent
+          command: [/workspace-bootstrap]
+          args:
+            - --storage-root
+            - /workspace-storage
+            - --session-uid
+            - $(SESSION_UID)
+            - --url
+            - https://github.com/google/uuid.git
+            - --commit
+            - 0f11ee6918f41a04c201eceeadf612a377bc7fbc
+          env:
+            - name: TMPDIR
+              value: /tmp
+          securityContext: &restricted
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: [ALL]}
+          resources:
+            requests: {cpu: 100m, memory: 128Mi}
+            limits: {cpu: "1", memory: 512Mi}
+          volumeMounts:
+            - {name: workspace, mountPath: /workspace-storage}
+            - {name: tmp, mountPath: /tmp}
+      containers:
+        - name: executor
+          image: *executor_image
+          imagePullPolicy: IfNotPresent
+          workingDir: /workspace
+          command: [codex, exec-server]
+          args: [--remote, $(CODEX_REMOTE_URL), --environment-id, $(CODEX_ENVIRONMENT_ID)]
+          env:
+            - name: CODEX_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: codex-executor
+                  key: CODEX_API_KEY
+          securityContext: *restricted
+          resources:
+            requests: {cpu: 250m, memory: 256Mi}
+            limits: {cpu: "2", memory: 2Gi}
+          volumeMounts:
+            - {name: workspace, mountPath: /workspace, subPath: project}
+            - {name: home, mountPath: /home/node}
+            - {name: tmp, mountPath: /tmp}
+      volumes:
+        - name: home
+          emptyDir: {sizeLimit: 128Mi}
+        - name: tmp
+          emptyDir: {sizeLimit: 1Gi}
+  volumeClaimTemplates:
+    - metadata:
+        name: workspace
+      spec:
+        accessModes: [ReadWriteOnce]
+        storageClassName: standard
+        resources:
+          requests: {storage: 1Gi}
+---
+apiVersion: extensions.agents.x-k8s.io/v1beta1
+kind: SandboxWarmPool
+metadata:
+  name: sandbox-v1
+  namespace: codex-session-operator-system
+  labels:
+    agents.softcane.io/managed: "true"
+spec:
+  replicas: 0
+  sandboxTemplateRef:
+    name: sandbox-v1
+---
+apiVersion: agents.softcane.io/v1alpha1
+kind: Agent
+metadata:
+  name: sandbox-agent
+  namespace: codex-session-operator-system
+spec:
+  model: gpt-6-luna
+  instructions: Use the prepared repository and report actual commands and results.
+  deletionPolicy: Delete
+---
+apiVersion: agents.softcane.io/v1alpha1
+kind: Environment
+metadata:
+  name: sandbox-environment
+  namespace: codex-session-operator-system
+spec:
+  mode: SelfHosted
+  deletionPolicy: Delete
+  selfHosted:
+    sandboxPoolRef:
+      name: sandbox-v1
+    workspace:
+      directory: /workspace
+      deletionPolicy: Delete
+---
+apiVersion: agents.softcane.io/v1alpha1
+kind: Profile
+metadata:
+  name: sandbox
+  namespace: codex-session-operator-system
+spec:
+  agentRef:
+    name: sandbox-agent
+  environmentRef:
+    name: sandbox-environment
+  spendControl:
+    mode: Unlimited

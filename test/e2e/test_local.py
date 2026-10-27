@@ -34,6 +34,12 @@ class LocalSetupTests(unittest.TestCase):
         self.assertEqual(runtime["workspace"]["deletionPolicy"], "Delete")
         template = author["sandbox-template"]["spec"]
         self.assertEqual(template["podTemplate"]["spec"]["containers"][0]["image"], image)
+        pod = template["podTemplate"]["spec"]
+        self.assertEqual(pod["containers"][0]["resources"], {
+            "requests": {"cpu": "250m", "memory": "256Mi"},
+            "limits": {"cpu": "2", "memory": "2Gi"},
+        })
+        self.assertEqual(next(volume for volume in pod["volumes"] if volume["name"] == "tmp")["emptyDir"]["sizeLimit"], "1Gi")
         self.assertEqual(template["envVarsInjectionPolicy"], "Allowed")
         self.assertEqual(author["sandbox-pool"]["spec"]["replicas"], 0)
         self.assertNotIn("Session", [value["kind"] for value in author.values()])

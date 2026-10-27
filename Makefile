@@ -89,6 +89,10 @@ docker-buildx-controller: ## Build and push the controller image for amd64 and a
 docker-buildx-gateway: ## Build and push the gateway image for amd64 and arm64.
 	$(CONTAINER_TOOL) buildx build --target gateway --push --platform=$(PLATFORMS) $(if $(BASE_IMAGE),--build-arg BASE_IMAGE=$(BASE_IMAGE)) --tag $(GATEWAY_IMG) .
 
+.PHONY: build-cli-release
+build-cli-release: ## Build gateway-client archives for Linux and macOS, amd64 and arm64.
+	bash hack/build-cli-release.sh
+
 .PHONY: build-installer
 build-installer: manifests generate kustomize ## Render the combined controller and gateway release manifest.
 	python3 -B hack/render-installer.py --kustomize "$(KUSTOMIZE)" --controller-image "$(CONTROLLER_IMG)" --gateway-image "$(GATEWAY_IMG)" $(if $(SANDBOX_POOLS),--sandbox-pools "$(SANDBOX_POOLS)") --output dist/install.yaml

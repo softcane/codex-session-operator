@@ -21,62 +21,7 @@ The gateway makes bounded authoritative Kubernetes reads, so additions, edits, d
 
 At acceptance the gateway freezes the Profile identity, policy and selected dependency UIDs. Its worker and the controller compare resolved dependencies before remote creation. Changes apply to new conversations and explicit fresh attempts. Reads and exact replay remain available after a Profile is changed, retired or deleted.
 
-## Start a conversation with the CLI
-
-This example assumes a reachable gateway and a Ready `my-go-project` Profile from the [repository walkthrough](my-go-project.md). It uses whichever provider your deployment configures; the walkthrough uses real OpenAI and incurs charges. For a no-key example, use the [retained demo](development.md#use-the-retained-demo).
-
-This example also requires `jq`. Build the client with `make build`. From the operator checkout, create a private directory for task text, receipts and the operation journal. Set the gateway origin and namespace to match your deployment; the origin is an HTTP or HTTPS origin without a path.
-
-```sh
-umask 077
-mkdir -p .private/conversations
-export CONVERSATION_DIR="$(cd .private/conversations && pwd -P)"
-export GATEWAY_ORIGIN=http://127.0.0.1:18082
-export NAMESPACE=codex-session-operator-system
-
-client() {
-  ./bin/gateway-client --origin "$GATEWAY_ORIGIN" --namespace "$NAMESPACE" \
-    --state-dir "$CONVERSATION_DIR/operations" "$@"
-}
-client profiles show my-go-project
-
-cat > "$CONVERSATION_DIR/task.txt" <<'TASK'
-Investigate why retries with the same request_id create duplicate jobs.
-Read AGENTS.md, reproduce the behavior and report the cause and test evidence.
-TASK
-client start --profile my-go-project --text-file "$CONVERSATION_DIR/task.txt" \
-  --operation investigate-retries > "$CONVERSATION_DIR/receipt.json"
-CONVERSATION_ID="$(jq -er .receipt.conversation_id "$CONVERSATION_DIR/receipt.json")"
-client read "$CONVERSATION_ID" > "$CONVERSATION_DIR/conversation.json"
-jq '[.history.turns[]? | select(.subagent_id == null) | {id, status}]' \
-  "$CONVERSATION_DIR/conversation.json"
-```
-
-`start` returns a receipt after acceptance. History may still be empty while the Session is provisioned. Repeat `client read` and inspect the root turns until a root appears. For this first task, with no concurrent input, select that root and watch its outcome:
-
-```sh
-ROOT_ID="$(jq -er '[.history.turns[]? | select(.subagent_id == null)] | last | .id // error("No root turn observed yet")' \
-  "$CONVERSATION_DIR/conversation.json")"
-client watch "$CONVERSATION_ID" --root-id "$ROOT_ID" --timeout 15m
-client read "$CONVERSATION_ID" > "$CONVERSATION_DIR/conversation.json"
-```
-
-A completed root means that execution finished. Read the saved assistant output and command results to assess success. The provider does not reliably correlate each accepted message with a root turn, so this example sends one task at a time. The [repository walkthrough](my-go-project.md#8-observe-the-actual-outcome) shows how to detect a new root after a follow-up.
-
-After a lost response or process crash, resume the saved operation with the same origin, namespace, service replay identity and journal:
-
-```sh
-client resume investigate-retries
-```
-
-Use a new operation name for each new message or lifecycle request. To close this conversation:
-
-```sh
-client close "$CONVERSATION_ID" --operation close-investigation
-client read "$CONVERSATION_ID"
-```
-
-Close acceptance starts background cleanup. Wait for `summary.state` to be `closed` and `summary.cleaned` to be `true` before starting fresh. Saved history remains readable at the original conversation URL. A restart returns a new conversation ID and URL.
+For a runnable CLI example, follow [getting started](getting-started.md). This page is the CLI and HTTP reference.
 
 ## HTTP API
 
@@ -160,7 +105,7 @@ Append these suffixes to `summary.session_url`, rather than to the conversation 
 
 PostgreSQL retains IDs, replay receipts, inputs and attempt mappings. Restore holds block fresh mutations until an administrator audits recovery; reads and exact replay remain available. Archive removes payloads from the selected closed record, including saved history, input text and action arguments or results. Receipts, replay fingerprints and lifecycle identities remain. Conversation and Session records have separate archive operations; archive each record whose content should be removed. See [deployment](deployment.md#storage-and-recovery).
 
-Gateway replicas initialize a fresh database from the embedded schema while holding a PostgreSQL advisory lock. Subsequent replicas and restarts use the existing tables. See [deployment](deployment.md#postgresql-connection-and-schema) for the required gateway database role.
+See [PostgreSQL setup](deployment.md#postgresql) for the database connection Secret.
 
 Clients must retain uncertain operation keys, target URLs and input across retries and process restarts. Creation keys are bound to the original `caller_subject`; retain the same configured service replay identity.
 
@@ -183,9 +128,9 @@ Supply `--origin`, `--namespace` and, for mutations, a private `--state-dir`. Us
 
 Give each mutation a stable local name with `--operation ID`. Run `bin/gateway-client --help` for all options.
 
-The CLI fsyncs a private immutable operation before POST and its receipt before successful return. `resume` reuses the exact subject, namespace, target, body and idempotency key after lost responses or crashes. Journals contain input and receipts; protect and retain them. Journal paths must be canonical paths without symlink components, including workstation temporary-directory aliases. No gateway token file is required.
+The CLI saves each operation to disk before sending it, then saves its receipt before reporting success. `resume` reuses the exact subject, namespace, target, body and idempotency key after lost responses or crashes. Journals contain input and receipts; protect and retain them. Journal paths must be canonical paths without symlink components, including workstation temporary-directory aliases. No gateway token file is required.
 
-A mutation's exit 0 means durable acceptance. Watching an operation cannot establish per-message completion because the provider does not return a reliable input-to-root correlation. The CLI distinguishes new observed roots, pending timeouts and ambiguous outcomes; a prior completed or failed root, subagent or concurrent steering cannot prove that input finished. `watch ID --root-id ROOT_ID` reports the selected provider root's terminal outcome.
+A mutation's exit 0 means durable acceptance. `watch ID --root-id ROOT_ID` reports the selected root's outcome. `watch ID --operation OPERATION_ID` observes changes, but the provider cannot reliably match each input to a root turn. Send one task at a time and inspect a new root for each follow-up.
 
 | Exit code | Meaning |
 | --- | --- |
@@ -197,4 +142,4 @@ A mutation's exit 0 means durable acceptance. Watching an operation cannot estab
 | `5` | The selected root failed or was cancelled. |
 | `130` | The process was interrupted before successful completion. |
 
-Conversation detail includes `lifecycle.delivery_held`, `execution_ready`, `delivery_observation`, `reason`, `recovery` and `actions`. `execution_ready` reports current owned compute and provider connection state. `delivery_observation` distinguishes a runtime observation from an inspected local worker stream; a follower replica does not claim it inspected another process’s stream. The elected worker applies its own live stream veto and current runtime checks before and after claiming each delivery. A preparing, failed-init, missing/replaced or disconnected executor holds delivery while accepted input remains durable. Pod preparation proof is tied to the current Session-owned SandboxClaim, Sandbox, Pod, workspace and frozen configuration. Cancel and close remain available while delivery is held. Start fresh requires completed cleanup and produces independent remote identity and workspace.
+Conversation detail includes `lifecycle.delivery_held`, `execution_ready`, `delivery_observation`, `reason`, `recovery` and `actions`. If delivery is held, inspect the Session's preparation, workspace and connection conditions. Accepted input stays saved while the executor is unavailable. Cancel and close remain available. Start fresh requires completed cleanup and creates a separate Session and workspace.

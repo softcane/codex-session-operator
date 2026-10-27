@@ -1,94 +1,228 @@
 # Codex Session Operator
 
-Run OpenAI coding agents against repositories in Kubernetes. Define reusable agent and workspace configuration, then submit a task through the gateway. The operator creates a Session for the conversation, and the gateway saves messages, history and approvals in PostgreSQL.
+Run OpenAI coding agents against Git repositories in Kubernetes. Give an agent a task, let it work in an isolated workspace, and read the results through an HTTP API or CLI. Continue the conversation to keep working in the same workspace.
 
-OpenAI runs the agent loop. For self-hosted execution, [Kubernetes Agent Sandbox](https://agent-sandbox.sigs.k8s.io/) runs `codex exec-server` in your cluster, where it edits files and executes commands. You control the executor image, repository revision, tools, credentials and persistent storage.
+OpenAI runs the agent loop and model inference. Your cluster runs the commands and stores repository files through [Kubernetes Agent Sandbox](https://agent-sandbox.sigs.k8s.io/). The gateway saves messages, results and approvals in PostgreSQL.
 
-The API is alpha. Start with the simulated demo to try the lifecycle without an API key, or follow the repository walkthrough to run a real coding task.
+The project is alpha. Real tasks require OpenAI Agents API access and incur API charges.
 
-## Try the local demo
+## Install
 
-From this checkout, with Docker running and Go, Make, Kind, kubectl, Python 3.10+, Node.js and OpenSSL installed, run:
+Release downloads install the operator and CLI without a source checkout, Go or Make. The commands below require a published release; replace `vX.Y.Z` with a tag from [Releases](https://github.com/softcane/codex-session-operator/releases).
 
 ```sh
-make demo
+# Latest stable release: CRDs, controller and gateway.
+kubectl apply -f https://github.com/softcane/codex-session-operator/releases/latest/download/install.yaml
+
+# Or pin a release for production and GitOps.
+export VERSION=vX.Y.Z
+kubectl apply -f "https://github.com/softcane/codex-session-operator/releases/download/${VERSION}/install.yaml"
 ```
 
-Use the Go toolchain specified in [go.mod](go.mod). Make downloads pinned build tools into `bin/` as needed.
+Install Agent Sandbox separately at the tested version, then supply PostgreSQL and Secrets using the [installation guide](docs/deployment.md). The gateway uses HTTP by default.
 
-The demo builds an isolated Kind cluster with the controller, gateway, PostgreSQL, Agent Sandbox and a simulated OpenAI provider. It exercises conversations and resource cleanup, then keeps the successful deployment for inspection. It needs no API key and makes no model calls.
+For the CLI, download the archive for your machine. For example, on macOS with Apple Silicon:
 
-After a successful run, follow the printed `env.sh` and port-forward instructions to reach the gateway. The command also prints the report path and the command to delete its cluster. See [Use the retained demo](docs/development.md#use-the-retained-demo) for a CLI example. To run the same suite and remove the cluster afterward, use `make test-e2e`.
+```sh
+curl -fsSLO https://github.com/softcane/codex-session-operator/releases/latest/download/gateway-client_darwin_arm64.tar.gz
+tar -xzf gateway-client_darwin_arm64.tar.gz gateway-client
+sudo install -m 0755 gateway-client /usr/local/bin/gateway-client
+```
 
-## Run a real repository task
+Archives are also available for `darwin_amd64`, `linux_amd64` and `linux_arm64`. To pin the CLI, replace `latest/download` with `download/${VERSION}`. Each release includes `SHA256SUMS`.
 
-Follow [Run my-go-project](docs/my-go-project.md) to ask an agent to reproduce and fix a bug in a Go service, verify the change and export its commit. The walkthrough covers image builds, credentials, PostgreSQL, installation and the durable CLI.
-
-You need a Kubernetes cluster, an OpenAI project with Agents API access, a separate restricted executor key and PostgreSQL. Model calls incur charges; the walkthrough's Profile explicitly selects unlimited spending. For an existing platform, use the [deployment guide](docs/deployment.md).
-
-## Configure once, start conversations as needed
-
-All six custom resources use `agents.softcane.io/v1alpha1`. References stay within a Kubernetes namespace.
-
-| Resource | Purpose |
-| --- | --- |
-| `Agent` | Model, reusable instructions, reasoning settings and tools. |
-| `Environment` | Execution mode and workspace policy. Self-hosted environments select an approved Sandbox pool. |
-| `Profile` | Agent, Environment, optional Vaults and an explicit spending policy that callers select when starting work. |
-| `Session` | One conversation attempt, normally created by the gateway from a Profile. |
-| `Vault` | Provider credential container for connected tools. |
-| `VaultCredential` | Provider credential configuration backed by Kubernetes Secret references. |
-
-Applying an Agent, Environment and Profile creates no task Pod. A caller starts work by selecting a Ready Profile and sending a message with a stable idempotency key. Each new self-hosted conversation gets its own Session and workspace; follow-up messages use the existing conversation.
-
-Administrators define executor images, repository preparation, resources, Secret mounts and storage in a `SandboxTemplate`. A `SandboxWarmPool` selects that template, and the controller's `SANDBOX_POOLS` setting approves the pool. Managed templates and pools have immutable specifications; use versioned names when changing them. See the [resource reference](docs/resources.md) and [complete application templates](examples/my-go-project/automation/k8s/).
+Follow [Run your first repository task](docs/getting-started.md) to download the matching example manifest, configure a workspace and send a task. Source builds are covered in [Contributing](CONTRIBUTING.md).
 
 ## How a task runs
 
-![Self-hosted lifecycle: configure a Profile, accept input into PostgreSQL, create a Session and SandboxClaim, run commands in an Agent Sandbox executor, read history and clean up](docs/assets/session-flow.gif)
+![A task moves from the gateway to an OpenAI Session and a Kubernetes workspace, then returns saved results](docs/assets/session-flow.gif)
 
-[View the static overview](docs/assets/session-flow.png).
+[Static diagram](docs/assets/session-flow.png).
 
-1. **Accept input.** The gateway commits the message and retry receipt to PostgreSQL, then returns HTTP `202` with a conversation URL.
-2. **Create the Session.** A gateway worker creates the Kubernetes Session. The controller resolves Ready dependencies, freezes their identities and creation settings, and records a claim before creating the remote OpenAI Session.
-3. **Prepare execution.** For a `SelfHosted` Environment, the controller creates a Session-owned SandboxClaim. Agent Sandbox creates the Sandbox, executor Pod and workspace storage from the approved template.
-4. **Run the task.** After verifying ownership, repository preparation, workspace identity and a current OpenAI connection, the gateway delivers input. OpenAI runs the agent and requests commands from the executor.
-5. **Read the outcome.** The gateway saves turns and output. Read the new root turn and its results to determine whether the task succeeded.
-6. **Continue or close.** Follow-up messages keep the Session and workspace. Close stops new input and requests cleanup; a fresh attempt after cleanup creates a new Session and workspace.
+1. **Choose a Profile.** It selects the agent, workspace configuration and spending policy.
+2. **Send a task.** The gateway saves your message and returns a conversation ID.
+3. **Prepare the workspace.** The operator creates a Session. Agent Sandbox starts the executor and prepares the repository on persistent storage.
+4. **Run the agent.** OpenAI directs the work; `codex exec-server` executes commands in your cluster.
+5. **Read the result.** Inspect the saved turn, assistant output and command results. HTTP `202` means your message was accepted; completion comes later.
+6. **Continue or close.** Follow-ups use the same workspace. Closing requests cleanup; the workspace policy controls whether files are deleted or retained. Saved conversation history remains in PostgreSQL.
 
-HTTP `202` confirms durable acceptance. Completion requires a later history read. When retrying an uncertain request, keep its idempotency key and body unchanged. The [conversation guide](docs/conversations.md) explains retries, completion checks and approvals.
+## Example configuration
 
-A replacement executor reconnects to the same Session and persistent workspace. On close, `workspace.deletionPolicy: Delete` removes the workspace; `Retain` leaves a suspended Sandbox and its files for administrative inspection. The claim is removed in both cases. PostgreSQL keeps conversation history after Session cleanup.
+Create a `SandboxTemplate` and a `SandboxWarmPool`, then define an `Agent`, an `Environment` and a `Profile` in the same namespace. These examples use `sandbox-v1` for the workspace setup and are available together in [examples/repository-task.yaml](examples/repository-task.yaml).
 
-## Install and operate
+### 1. Define the workspace
 
-Deploy the controller and gateway together as separate Deployments and images. Provision PostgreSQL separately, and install the Agent Sandbox core and extensions separately for self-hosted execution. The Go dependency and deployment examples pin **Agent Sandbox v1.0.7**.
+After [installation](docs/deployment.md), include `sandbox-v1` in the controller's `SANDBOX_POOLS` setting. Use the `codex-executor` Secret from the [Secret setup](docs/deployment.md#2-create-the-secrets) for the restricted environment key.
 
-The gateway serves HTTP by default. Your deployment layer provides authentication, access control and any required TLS termination. Callers who can reach a namespace's gateway routes share access to its conversations. See [deployment](docs/deployment.md) for installation, approved pools, storage and recovery.
+The template below prepares the public `google/uuid` repository and configures a Go executor for that checkout. Before applying it, replace the example image digest, select your node architecture and set a working StorageClass. The image must contain `codex exec-server`, `/workspace-bootstrap` and Go; the [application executor Dockerfile](examples/my-go-project/sandbox/Dockerfile.executor) builds that layer. The YAML image anchor lets both containers use the same image reference.
 
-## Documentation and development
+<details>
+<summary>SandboxTemplate CR: sandbox-v1</summary>
 
-| To… | Read |
-| --- | --- |
-| Run a real coding task from setup to exported commit | [Repository walkthrough](docs/my-go-project.md) |
-| Install and operate the services | [Deployment](docs/deployment.md) |
-| Start, continue, retry and close conversations | [Conversations and CLI](docs/conversations.md) |
-| Look up CRD configuration and update rules | [Resource reference](docs/resources.md) |
-| Understand ownership, readiness and recovery | [Architecture](docs/architecture.md) |
-| Build and choose verification checks | [Development](docs/development.md) |
-| Contribute a change or publish a release | [Contributing](CONTRIBUTING.md) |
-| Report a vulnerability | [Security](SECURITY.md) |
-
-For local development:
-
-```sh
-make lint
-make test
-make test-helpers
+```yaml
+apiVersion: extensions.agents.x-k8s.io/v1beta1
+kind: SandboxTemplate
+metadata:
+  name: sandbox-v1
+  namespace: codex-session-operator-system
+  labels:
+    agents.softcane.io/managed: "true"
+spec:
+  envVarsInjectionPolicy: Allowed
+  service: false
+  podTemplate:
+    spec:
+      automountServiceAccountToken: false
+      restartPolicy: Always
+      terminationGracePeriodSeconds: 10
+      nodeSelector:
+        kubernetes.io/arch: arm64
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile: {type: RuntimeDefault}
+      initContainers:
+        - name: repository-prepare
+          image: &executor_image registry.example/executor@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+          imagePullPolicy: IfNotPresent
+          command: [/workspace-bootstrap]
+          args:
+            - --storage-root
+            - /workspace-storage
+            - --session-uid
+            - $(SESSION_UID)
+            - --url
+            - https://github.com/google/uuid.git
+            - --commit
+            - 0f11ee6918f41a04c201eceeadf612a377bc7fbc
+          env:
+            - name: TMPDIR
+              value: /tmp
+          securityContext: &restricted
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: [ALL]}
+          resources:
+            requests: {cpu: 100m, memory: 128Mi}
+            limits: {cpu: "1", memory: 512Mi}
+          volumeMounts:
+            - {name: workspace, mountPath: /workspace-storage}
+            - {name: tmp, mountPath: /tmp}
+      containers:
+        - name: executor
+          image: *executor_image
+          imagePullPolicy: IfNotPresent
+          workingDir: /workspace
+          command: [codex, exec-server]
+          args: [--remote, $(CODEX_REMOTE_URL), --environment-id, $(CODEX_ENVIRONMENT_ID)]
+          env:
+            - name: CODEX_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: codex-executor
+                  key: CODEX_API_KEY
+          securityContext: *restricted
+          resources:
+            requests: {cpu: 250m, memory: 256Mi}
+            limits: {cpu: "2", memory: 2Gi}
+          volumeMounts:
+            - {name: workspace, mountPath: /workspace, subPath: project}
+            - {name: home, mountPath: /home/node}
+            - {name: tmp, mountPath: /tmp}
+      volumes:
+        - name: home
+          emptyDir: {sizeLimit: 128Mi}
+        - name: tmp
+          emptyDir: {sizeLimit: 1Gi}
+  volumeClaimTemplates:
+    - metadata:
+        name: workspace
+      spec:
+        accessModes: [ReadWriteOnce]
+        storageClassName: standard
+        resources:
+          requests: {storage: 1Gi}
 ```
 
-To regenerate the lifecycle images, install `Pillow>=10.4,<13` and run `python3 docs/assets/generate-session-flow.py`.
+</details>
 
-## License
+The pool selects that template. With `replicas: 0`, Agent Sandbox allocates a workspace when a Session requests one.
 
-[Apache License 2.0](LICENSE).
+```yaml
+apiVersion: extensions.agents.x-k8s.io/v1beta1
+kind: SandboxWarmPool
+metadata:
+  name: sandbox-v1
+  namespace: codex-session-operator-system
+  labels:
+    agents.softcane.io/managed: "true"
+spec:
+  replicas: 0
+  sandboxTemplateRef:
+    name: sandbox-v1
+```
+
+Managed template and pool specifications are immutable. To change an installed recipe, create a new versioned pair and approve the new pool.
+
+### 2. Define the agent and Profile
+
+The Environment selects `sandbox-v1`; the Profile combines it with the Agent and spending policy.
+
+```yaml
+apiVersion: agents.softcane.io/v1alpha1
+kind: Agent
+metadata:
+  name: sandbox-agent
+  namespace: codex-session-operator-system
+spec:
+  model: gpt-6-luna
+  instructions: Use the prepared repository and report actual commands and results.
+  deletionPolicy: Delete
+---
+apiVersion: agents.softcane.io/v1alpha1
+kind: Environment
+metadata:
+  name: sandbox-environment
+  namespace: codex-session-operator-system
+spec:
+  mode: SelfHosted
+  deletionPolicy: Delete
+  selfHosted:
+    sandboxPoolRef:
+      name: sandbox-v1
+    workspace:
+      directory: /workspace
+      deletionPolicy: Delete
+---
+apiVersion: agents.softcane.io/v1alpha1
+kind: Profile
+metadata:
+  name: sandbox
+  namespace: codex-session-operator-system
+spec:
+  agentRef:
+    name: sandbox-agent
+  environmentRef:
+    name: sandbox-environment
+  spendControl:
+    mode: Unlimited
+```
+
+`Unlimited` permits paid inference without a per-Session dollar cap. To request a cap, use `mode: Limited` and `limitCents: 500` for US$5; this requires provider-project support.
+
+Select the `sandbox` Profile when [sending a task](docs/getting-started.md#4-send-a-task). The gateway creates the `Session`; applying these CRs alone starts no task Pod. Follow-ups keep that Session and workspace. With the shown `Delete` policy, closing removes the workspace, so retrieve any changes first.
+
+Optional `Vault` and `VaultCredential` CRs supply credentials for connected provider tools. See the [resource reference](docs/resources.md) for all six CRs, other execution modes and update rules.
+
+## Documentation
+
+- [Getting started](docs/getting-started.md) — install locally and run a real task.
+- [Deployment](docs/deployment.md) — install and operate in your own cluster.
+- [Conversations](docs/conversations.md) — CLI, HTTP API, retries and approvals.
+- [Resources](docs/resources.md) — configuration fields and update rules.
+- [Architecture](docs/architecture.md) — components, state and recovery.
+- [Contributing](CONTRIBUTING.md) — builds, tests, simulated demo and releases.
+
+Report vulnerabilities through [SECURITY.md](SECURITY.md). Licensed under [Apache 2.0](LICENSE).

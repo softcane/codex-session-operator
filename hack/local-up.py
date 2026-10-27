@@ -191,6 +191,10 @@ def author_resources(args, executor, architecture):
         return {"apiVersion": "agents.softcane.io/v1alpha1", "kind": kind,
                 "metadata": {"name": name, "namespace": NS}, "spec": spec}
     if executor:
+        template, pool = sandbox_resources.resources("sandbox-v1", NS, executor, architecture,
+            args.repository_url, args.repository_commit, storage_class=args.storage_class, tmp_size="1Gi")
+        template["spec"]["podTemplate"]["spec"]["containers"][0]["resources"] = {
+            "requests": {"cpu": "250m", "memory": "256Mi"}, "limits": {"cpu": "2", "memory": "2Gi"}}
         return {
             "agent": resource("Agent", "sandbox-agent", {"name": "Sandbox investigator", "model": args.model,
                              "instructions": "Use the prepared repository and real shell evidence. Do not inspect credentials.",
@@ -198,8 +202,7 @@ def author_resources(args, executor, architecture):
             "environment": resource("Environment", "sandbox-environment", {"mode": "SelfHosted", "deletionPolicy": "Delete",
                 "selfHosted": {"sandboxPoolRef": {"name": "sandbox-v1"}, "workspace": {"directory": "/workspace", "deletionPolicy": "Delete"}}}),
             **{("sandbox-template" if value["kind"] == "SandboxTemplate" else "sandbox-pool"): value
-               for value in sandbox_resources.resources("sandbox-v1", NS, executor, architecture,
-                   args.repository_url, args.repository_commit, storage_class=args.storage_class)},
+               for value in (template, pool)},
             "profile": resource("Profile", "sandbox", {"agentRef": {"name": "sandbox-agent"},
                 "environmentRef": {"name": "sandbox-environment"}, "spendControl": {"mode": "Limited", "limitCents": 500}}),
         }
