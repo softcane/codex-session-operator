@@ -1,7 +1,7 @@
 """Current CRD lifecycle scenarios within the runner's already-owned cluster.
 
 Profile creation/edit/retirement/recreation and namespace independence are covered
-by run.py; all six shipped schemas are fingerprinted here.
+by run.py; all seven shipped schemas are fingerprinted here.
 """
 
 import hashlib
@@ -32,7 +32,7 @@ def projection(obj):
 def crd_hashes(checks):
     return {name: hashlib.sha256(checks.kubectl("get", "crd", name + ".agents.softcane.io",
             "-o", "jsonpath={.spec.versions}").encode()).hexdigest()
-            for name in ("agents", "environments", "sessions", "vaults", "vaultcredentials", "profiles")}
+            for name in ("agents", "environments", "sessions", "vaults", "vaultcredentials", "profiles", "workflowtemplates")}
 
 
 def run(checks, api, base, report, replace_gateway, fixture_counts):

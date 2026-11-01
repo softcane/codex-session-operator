@@ -121,6 +121,9 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (g *Gateway) serveScoped(w http.ResponseWriter, r *http.Request, parts []string, scope requestScope) {
+	if g.serveWorkflows(w, r, parts, scope) || g.serveTasks(w, r, parts, scope) {
+		return
+	}
 	if g.serveConversations(w, r, parts, scope) {
 		return
 	}
@@ -190,7 +193,11 @@ func (g *Gateway) serveSession(w http.ResponseWriter, r *http.Request, parts []s
 		return
 	}
 	switch parts[5] {
-	case "messages":
+	case _messagesSegment:
+		if record.TaskMember != nil {
+			http.Error(w, "Use the task message route", http.StatusConflict)
+			return
+		}
 		if len(parts) != 6 {
 			methodError(w)
 			return
@@ -358,12 +365,19 @@ func (g *Gateway) lookup(ctx context.Context, namespace, name string) (*agentsv1
 		return nil, Record{}, errClosed
 	}
 	uid := string(session.UID)
+	binding, err := g.sessionTaskBinding(ctx, &session)
+	if err != nil {
+		return nil, Record{}, err
+	}
 	if err := g.store.Update(ctx, uid, func(r *Record) error {
 		if r.Namespace != "" && (r.Namespace != namespace || r.Name != name) {
 			return errors.New("session identity mismatch")
 		}
 		r.Namespace = namespace
 		r.Name = name
+		if binding != nil {
+			r.TaskMember = binding
+		}
 		return nil
 	}); err != nil {
 		return nil, Record{}, err
@@ -415,7 +429,14 @@ func (g *Gateway) currentInputSession(ctx context.Context, session *agentsv1alph
 	return &current, nil
 }
 
-func (g *Gateway) sessionInputOpen(_ context.Context, session *agentsv1alpha1.Session) error {
+func (g *Gateway) sessionInputOpen(ctx context.Context, session *agentsv1alpha1.Session) error {
+	binding, err := g.sessionTaskBinding(ctx, session)
+	if err != nil {
+		return err
+	}
+	if err := g.taskMemberInputOpen(ctx, session.Namespace, binding); err != nil {
+		return err
+	}
 	condition := meta.FindStatusCondition(session.Status.Conditions, _readyCondition)
 	if condition == nil || condition.Status != metav1.ConditionFalse {
 		return nil

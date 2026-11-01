@@ -19,9 +19,31 @@ import cli
 import faults
 import reporting
 import support
+import sandbox
+import workflow
 
 
 class SandboxEvidenceTests(unittest.TestCase):
+    def test_baseline_and_workflow_reuse_exact_immutable_workspace_recipes(self):
+        commits = {"public": "public-commit", "private": "private-commit"}
+        self.assertEqual(sandbox.workspace_recipe("Delete", commits), ("sandbox-delete", "public-commit", False))
+        self.assertEqual(sandbox.workspace_recipe("Retain", commits), ("sandbox-retain", "private-commit", True))
+        with self.assertRaisesRegex(RuntimeError, "Unknown fixture workspace policy"):
+            sandbox.workspace_recipe("Other", commits)
+
+    def test_workflow_report_compares_decoded_full_observation_with_real_newlines(self):
+        actual = {"nonce": "proof", "hostname": "member-pod", "cwd": "/workspace", "test_exit": 1,
+                  "output": "expected 1099\nactual 1000\n"}
+        command_output = json.dumps(actual) + "\n"
+        self.assertNotIn(actual["output"], command_output)  # Reproduces the previous false failure.
+        workflow.verify_command_report(actual, command_output, "member-pod")
+        for field, value in (("nonce", "different"), ("output", "truncated"), ("cwd", "/other")):
+            changed = dict(actual, **{field: value})
+            with self.assertRaisesRegex(RuntimeError, "Saved command did not observe"):
+                workflow.verify_command_report(actual, json.dumps(changed), "member-pod")
+        with self.assertRaisesRegex(RuntimeError, "Saved command did not observe"):
+            workflow.verify_command_report(actual, command_output, "other-pod")
+
     def test_packet_probe_exits_after_outcome_and_never_calls_timeout_a_denial(self):
         captured=[]
         def invoke(*args,**kwargs):

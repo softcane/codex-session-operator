@@ -41,7 +41,7 @@ To regenerate the README lifecycle images, install `Pillow>=10.4,<13` and run `p
 
 ## Sandbox qualification
 
-The no-key Kind suite exercises all six CRDs, the deterministic execution protocol, real Session-owned SandboxClaims and upstream-managed Pods/PVCs, private HTTPS Git preparation, current connection/preparation holds, replacement and cleanup. Its provider simulation is a separate boundary from the production `codex exec-server`. Reports retain source hashes and safe identities; credentials, prompts, transcripts and Git authentication material stay private.
+The no-key Kind suite exercises the seven CRDs, workflow delegation, the deterministic execution protocol, real Session-owned SandboxClaims and upstream-managed Pods/PVCs, private HTTPS Git preparation, current connection/preparation holds, replacement and cleanup. Its provider simulation is a separate boundary from the production `codex exec-server`. Reports retain source hashes and safe identities; credentials, prompts, transcripts and Git authentication material stay private.
 
 ### Run the full paid gate
 

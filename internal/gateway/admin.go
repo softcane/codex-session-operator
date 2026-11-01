@@ -79,7 +79,7 @@ func (g *Gateway) handleAdminRecords(w http.ResponseWriter, r *http.Request, par
 		writeJSON(w, http.StatusOK, record)
 		return
 	}
-	if record.Work != nil {
+	if record.Work != nil || record.Task != nil || record.TaskMember != nil {
 		http.Error(w, "Conversation replay record cannot be purged", http.StatusConflict)
 		return
 	}
@@ -116,7 +116,7 @@ func summarizeClosedRecords(records []Record, namespace string) []closedRecordSu
 		if record.Namespace != namespace || !closedForPurge(record) {
 			continue
 		}
-		summary := closedRecordSummary{UID: record.UID, Name: record.Name, Purgeable: record.Work == nil}
+		summary := closedRecordSummary{UID: record.UID, Name: record.Name, Purgeable: record.Work == nil && record.Task == nil && record.TaskMember == nil}
 		if record.Work != nil {
 			summary.SourceID = record.Work.ID
 		}

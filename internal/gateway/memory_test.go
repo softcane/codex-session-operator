@@ -99,14 +99,43 @@ func (s *memoryStore) Update(ctx context.Context, uid string, change func(*Recor
 			return err
 		}
 	}
+	previousRaw, _ := json.Marshal(record)
+	var previous Record
+	if err := json.Unmarshal(previousRaw, &previous); err != nil {
+		return err
+	}
 	if err := change(&record); err != nil {
 		return err
+	}
+	if !taskIdentityPreserved(previous, record) {
+		return errConflict
+	}
+	cleanup := taskCleanupCancellation(previous, record) && !taskFreshEffect(previous, record)
+	if taskFreshEffect(previous, record) || cleanup {
+		if previous.DeliveryHeld || record.DeliveryHeld {
+			return errRestoreHeld
+		}
+		if previous.Task != nil && previous.Task.State != _taskOpen {
+			return errClosed
+		}
+		if record.TaskMember != nil {
+			var parent Record
+			if err := json.Unmarshal(s.records[record.TaskMember.TaskID], &parent); err != nil {
+				return errConflict
+			}
+			if cleanup {
+				parent.Task = copyCleanupTask(parent.Task)
+			}
+			if err := taskAuthorityAllowed(parent, record); err != nil {
+				return err
+			}
+		}
 	}
 	raw, err := json.Marshal(record)
 	if err != nil {
 		return err
 	}
-	if len(raw) > _maxRecordBytes {
+	if len(raw) > recordSizeLimit(record) {
 		return errConflict
 	}
 	s.records[uid] = raw
@@ -130,7 +159,7 @@ func (s *memoryStore) Purge(ctx context.Context, uid string) error {
 	if err := json.Unmarshal(raw, &record); err != nil {
 		return err
 	}
-	if !closedForPurge(record) || record.Work != nil {
+	if !closedForPurge(record) || record.Work != nil || record.Task != nil || record.TaskMember != nil {
 		return errors.New("record cannot be purged")
 	}
 	delete(s.records, uid)

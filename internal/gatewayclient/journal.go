@@ -35,6 +35,8 @@ type operation struct {
 }
 
 type receipt struct {
+	TaskID          string    `json:"task_id,omitempty"`
+	TaskURL         string    `json:"task_url,omitempty"`
 	ConversationID  string    `json:"conversation_id"`
 	ConversationURL string    `json:"conversation_url"`
 	RouteID         string    `json:"route_id"`

@@ -29,7 +29,7 @@ CONTEXT = "kind-" + CLUSTER
 CONTROLLER_IMAGE = "codex-session-controller:local"
 GATEWAY_IMAGE = "codex-session-gateway:local"
 GATEWAY = "codex-session-operator-gateway"
-KINDS = ("agents", "environments", "vaults", "vaultcredentials", "sessions", "profiles")
+KINDS = ("agents", "environments", "vaults", "vaultcredentials", "sessions", "profiles", "workflowtemplates")
 REPOSITORY_URL = "https://github.com/google/uuid.git"
 REPOSITORY_COMMIT = "0f11ee6918f41a04c201eceeadf612a377bc7fbc"
 EXECUTOR_BASE_TAG = "codex-executor:local"
@@ -362,7 +362,7 @@ def main():
         os.umask(previous_mask)
     if report["result"] != "passed":
         return 1
-    print("Real OpenAI infrastructure ready; all six resource lists are empty; setup ran no inference.")
+    print("Real OpenAI infrastructure ready; all resource lists are empty; setup ran no inference.")
     print("source " + shlex.quote(str(directory / "env.sh")))
     print('kubectl --context "$LOCAL_CONTEXT" -n "$NAMESPACE" port-forward --address 127.0.0.1 service/' + GATEWAY + ' "$LOCAL_PORT:8082"')
     print('In another sourced terminal: kubectl --context "$LOCAL_CONTEXT" apply -f "$LOCAL_DIR/author"')

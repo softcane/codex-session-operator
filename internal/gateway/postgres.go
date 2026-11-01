@@ -155,7 +155,7 @@ func (s *PostgreSQLStore) beginRead(ctx context.Context) (pgx.Tx, error) {
 		_ = tx.Rollback(ctx)
 		return nil, safeSQLError(err)
 	}
-	if version != 1 {
+	if version != _postgresSchemaVersion {
 		_ = tx.Rollback(ctx)
 		return nil, errUnavailable
 	}
@@ -287,6 +287,7 @@ func (s *PostgreSQLStore) RecordsInNamespace(ctx context.Context, namespace stri
 }
 
 func validateRecord(record Record) error {
+
 	if record.UID == "" || record.Actions == nil || record.Notes == nil {
 		return errConflict
 	}
@@ -314,7 +315,8 @@ func validateRecord(record Record) error {
 		}
 	}
 	raw, err := json.Marshal(record)
-	if err != nil || len(raw) > _maxRecordBytes {
+	limit := recordSizeLimit(record)
+	if err != nil || len(raw) > limit {
 		return errors.New("gateway record size limit reached")
 	}
 	return nil
@@ -323,6 +325,9 @@ func validateRecord(record Record) error {
 func validateRecordVersion(record Record) error {
 	if record.Version != _recordVersion {
 		return errConflict
+	}
+	if err := validateTaskRecord(record); err != nil {
+		return err
 	}
 	if record.Work != nil {
 		if record.Work.Conversation == nil {
@@ -384,7 +389,11 @@ func (s *PostgreSQLStore) Update(ctx context.Context, uid string, change func(*R
 		return err
 	}
 	namespace := record.Namespace
-	previous := record
+	previousRaw, _ := json.Marshal(record)
+	var previous Record
+	if err := json.Unmarshal(previousRaw, &previous); err != nil {
+		return errUnavailable
+	}
 	previousProfiles := profileAttemptDigests(record)
 	var previousEvents, previousAttempts int
 	var previousSessionUID string
@@ -402,6 +411,9 @@ func (s *PostgreSQLStore) Update(ctx context.Context, uid string, change func(*R
 	}
 	if previous.RemoteID != "" && previous.RemoteID != record.RemoteID {
 		return errConflict
+	}
+	if err := guardTaskMutation(ctx, tx, previous, record); err != nil {
+		return err
 	}
 	currentProfiles := profileAttemptDigests(record)
 	for i, digest := range previousProfiles {
@@ -555,6 +567,11 @@ func writeKeys(ctx context.Context, tx pgx.Tx, r Record) error {
 			return err
 		}
 	}
+	if r.Task != nil {
+		if err := put("task", "", r.UID, r.UID); err != nil {
+			return err
+		}
+	}
 	if r.Work != nil {
 		w := r.Work
 		if w.Conversation != nil {
@@ -573,8 +590,17 @@ func writeKeys(ctx context.Context, tx pgx.Tx, r Record) error {
 }
 
 func activeSlots(r Record) []string {
-	if closedForPurge(r) {
+	if closedForPurge(r) || r.Task != nil && r.Task.State == _taskClosed {
 		return nil
+	}
+	if r.Task != nil {
+		if len(r.Task.Members) == 0 {
+			return nil
+		}
+		return []string{r.UID + ":" + r.Task.Members[0].ID}
+	}
+	if r.TaskMember != nil {
+		return []string{r.TaskMember.TaskID + ":" + r.TaskMember.MemberID}
 	}
 	if r.Work != nil {
 		var slots []string
@@ -616,7 +642,7 @@ func (s *PostgreSQLStore) Purge(ctx context.Context, uid string) error {
 	if err != nil {
 		return err
 	}
-	if !closedForPurge(r) || r.Work != nil {
+	if !closedForPurge(r) || r.Work != nil || r.Task != nil || r.TaskMember != nil {
 		return errors.New("gateway active or source replay record cannot be purged")
 	}
 	if _, err := tx.Exec(ctx, "DELETE FROM gateway_records WHERE uid=$1", uid); err != nil {
@@ -629,6 +655,9 @@ func (s *PostgreSQLStore) Purge(ctx context.Context, uid string) error {
 // operation IDs and cleanup claims. APIs return archived:true and empty history.
 func (s *PostgreSQLStore) Archive(ctx context.Context, uid string) error {
 	return s.Update(ctx, uid, func(r *Record) error {
+		if r.Task != nil || r.TaskMember != nil {
+			return errors.New("task evidence archive is unsupported")
+		}
 		if !closedForPurge(*r) {
 			return errClosed
 		}
@@ -664,4 +693,35 @@ func (s *PostgreSQLStore) Archive(ctx context.Context, uid string) error {
 		}
 		return nil
 	})
+}
+
+func guardTaskMutation(ctx context.Context, tx pgx.Tx, previous, record Record) error {
+	if !taskIdentityPreserved(previous, record) {
+		return errConflict
+	}
+	cleanup := taskCleanupCancellation(previous, record) && !taskFreshEffect(previous, record)
+	if !taskFreshEffect(previous, record) && !cleanup {
+		return nil
+	}
+	var disabled bool
+	if err := tx.QueryRow(ctx, "SELECT delivery_disabled FROM gateway_meta WHERE id=1").Scan(&disabled); err != nil {
+		return safeSQLError(err)
+	}
+	if disabled || previous.DeliveryHeld || record.DeliveryHeld {
+		return errRestoreHeld
+	}
+	if previous.Task != nil && previous.Task.State != _taskOpen {
+		return errClosed
+	}
+	if record.TaskMember == nil {
+		return nil
+	}
+	parent, err := readSQLRecord(ctx, tx, record.TaskMember.TaskID)
+	if err != nil {
+		return err
+	}
+	if cleanup {
+		parent.Task = copyCleanupTask(parent.Task)
+	}
+	return taskAuthorityAllowed(parent, record)
 }

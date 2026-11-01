@@ -38,7 +38,7 @@ test-helpers: ## Test deployment helpers and the simulated provider; requires No
 	python3 -B -m unittest discover -s test/e2e -p 'test_*.py'
 test-storage-postgres: ## Run Go database unit/fault/crash tests against disposable PostgreSQL.
 	python3 -B test/postgres.py
-test-e2e: manifests generate kustomize test-helpers ## Run one isolated Kind suite: conversations and all six CRD lifecycles; no API key.
+test-e2e: manifests generate kustomize test-helpers ## Run one isolated Kind suite: conversations, workflows and resource lifecycles; no API key.
 	python3 -B test/e2e/run.py $(E2E_ARGS)
 test-sandbox-live: manifests generate kustomize ## Verify a real repository using restricted OpenAI credentials and a limited budget.
 	python3 -B test/e2e/live.py $(LIVE_ARGS)
@@ -114,7 +114,7 @@ uninstall: manifests kustomize ## Delete CRDs from an explicitly selected KUBE_C
 deploy: build-installer ## Deploy dist/install.yaml into an explicitly selected KUBE_CONTEXT.
 	@test -n "$(KUBE_CONTEXT)" || { echo 'Set KUBE_CONTEXT explicitly.' >&2; exit 1; }
 	"$(KUBECTL)" --context "$(KUBE_CONTEXT)" apply -f dist/install.yaml
-	"$(KUBECTL)" --context "$(KUBE_CONTEXT)" wait --for=condition=Established crd/agents.agents.softcane.io crd/environments.agents.softcane.io crd/profiles.agents.softcane.io crd/sessions.agents.softcane.io crd/vaultcredentials.agents.softcane.io crd/vaults.agents.softcane.io --timeout=60s
+	"$(KUBECTL)" --context "$(KUBE_CONTEXT)" wait --for=condition=Established crd/agents.agents.softcane.io crd/environments.agents.softcane.io crd/profiles.agents.softcane.io crd/workflowtemplates.agents.softcane.io crd/sessions.agents.softcane.io crd/vaultcredentials.agents.softcane.io crd/vaults.agents.softcane.io --timeout=60s
 	"$(KUBECTL)" --context "$(KUBE_CONTEXT)" rollout status deployment/codex-session-operator-controller-manager --namespace codex-session-operator-system --timeout=5m
 	"$(KUBECTL)" --context "$(KUBE_CONTEXT)" rollout status deployment/codex-session-operator-gateway --namespace codex-session-operator-system --timeout=5m
 undeploy: build-installer ## Remove operator resources from an explicitly selected KUBE_CONTEXT.

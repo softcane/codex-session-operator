@@ -4,6 +4,60 @@ Use the gateway to start a conversation from a Ready Profile, send follow-up mes
 
 HTTP `202` means the input was durably accepted. To establish completion, read the new root turn and its output. A Ready Session, a completed subagent or an earlier completed turn does not establish the outcome of the latest message.
 
+## Workflow tasks
+
+Use a `WorkflowTemplate` for a coordinator that can delegate to separate Sessions. Discover templates, start a task and read its durable state with these routes. All use `/v1/namespaces/{namespace}`; every POST requires a stable `Idempotency-Key`.
+
+| Endpoint | Request | Result |
+| --- | --- | --- |
+| `GET /workflows` | None. | Configured workflow summaries. |
+| `GET /workflows/{name}` | Template name. | Identity, generation, digest and spec. |
+| `POST /tasks` | `{"workflow":"go-bugfix","text":"Investigate this bug"}` | `202` committed receipt with `task_id`, `task_url` and `event_id`. |
+| `GET /tasks/{id}` | Task ID. | Accepted configuration, members, events, saved results and lifecycle state. |
+| `GET /tasks/{id}/results/{result_id}` | Exact saved result ID. | Result provenance, original JSON in `raw` and its `sha256`. |
+| `POST /tasks/{id}/messages` | `{"text":"Follow-up question"}` | `202` committed follow-up acceptance. |
+| `POST /tasks/{id}/stop` | `{}` | `202` committed stop acceptance; cleanup continues asynchronously. |
+
+Discovery describes configuration; member acceptance still requires a current Ready Profile and dependencies. Task start freezes the WorkflowTemplate identity and content. Each assignment binds its Profile policy when accepted. Profile edits can affect later assignments in the same task, while accepted members retain their selected identities and policy.
+
+```sh
+gateway-client --origin "$ORIGIN" --namespace "$NAMESPACE" workflows show go-bugfix
+gateway-client --origin "$ORIGIN" --namespace "$NAMESPACE" --state-dir "$STATE" \
+  task start --workflow go-bugfix --text-file bug.txt --operation bugfix-1
+gateway-client --origin "$ORIGIN" --namespace "$NAMESPACE" task read TASK_ID
+gateway-client --origin "$ORIGIN" --namespace "$NAMESPACE" \
+  task result TASK_ID RESULT_ID --output result.json
+gateway-client --origin "$ORIGIN" --namespace "$NAMESPACE" --state-dir "$STATE" \
+  task continue TASK_ID --text-file follow-up.txt --operation follow-up-1
+gateway-client --origin "$ORIGIN" --namespace "$NAMESPACE" --state-dir "$STATE" \
+  task stop TASK_ID --operation stop-1
+gateway-client --origin "$ORIGIN" --namespace "$NAMESPACE" --state-dir "$STATE" resume bugfix-1
+```
+
+Substitute returned IDs for `TASK_ID` and `RESULT_ID`. `resume` replays the journaled operation with its original identity; it does not request a replacement member. Changed content under the same operation identity conflicts. `task result --output` saves the exact original result JSON bytes after checking their SHA-256. Without `--output`, the command displays the result envelope.
+
+### Assignments and evidence
+
+Starting authorizes the coordinator to choose from the configured roles. Roles and named outputs are application choices; the gateway does not require every role, a fixed sequence or a universal reviewer. Existing consequential external-tool approvals still apply. Each self-hosted member has its own Session, Sandbox and workspace; files do not implicitly cross workspaces.
+
+The coordinator uses `workflow_delegate` with a role, assignment text and exact prerequisite result IDs. A role's dependencies require successful saved results from this task; the gateway never chooses a result by newest timestamp. A fresh delegation action may repeat a role. Transport replay preserves the existing assignment. Assignments are immutable, with no automatic replacement, retry or dependent rerun. Their complete initial input, including prerequisite result IDs, must fit the existing 256 KiB input boundary. Runtime input and relationships stay in PostgreSQL; Session instructions contain reusable configuration.
+
+Members submit explicit results through `workflow_result`; `workflow_read_result` retrieves exact saved evidence. The dispatcher derives authority from verified Session/root-turn/call provenance, rather than model-supplied task or member IDs. Only each independent Session's main agent calls these function tools; native subagents do not support function tools, as described in the [provider multi-agent guide](https://developers.openai.com/api/docs/guides/agents-api/multi-agent#tools-available-to-subagents). The first committed terminal result is final for that assignment. Exact replay returns it; changed terminal content conflicts. Corrections require a new explicit assignment.
+
+Result JSON supports `success`, `failed`, `cancelled` and `incomplete` outcomes. Successful results must include the role's configured outputs. Output labels are arbitrary; instructions specify their meaning. Patch outputs carry a full 40- or 64-character hexadecimal Git base revision, content digest, checks and limitations. Checks require an explicit exit code and must match saved completed or failed command observations; saved source snapshots preserve that evidence. A synthesis cites exact saved result IDs. Validation checks completeness and provenance, not whether an argument or scientific claim is true.
+
+The entire original UTF-8 result JSON, including metadata, is limited to 256 KiB of encoded bytes. Invalid or oversized submissions leave earlier evidence intact and do not finalize the assignment. Save a smaller explicit incomplete result when the full evidence cannot fit; the workspace stays available until stop. Retrieval returns original JSON bytes through `raw` and their SHA-256, including patch content. The CLI retains its existing 8 MiB response limit and rejects oversized responses without truncating them. A saved result and durable handoff do not prove the coordinator processed it. Turn completion does not prove result submission, and input acceptance does not identify which provider turn processed the input.
+
+### Stop and retained evidence
+
+Tasks remain open after results and synthesis. Continue talking to the coordinator or explicitly request more assignments. Only `stop` permanently blocks fresh input, delivery and delegation, accounts for in-flight effects and requests closure of every known member, including the coordinator. Read the task for cleanup observations; `202` is not completed cleanup.
+
+Each accepted Session keeps its Profile-derived workspace policy. `Delete` removes execution and workspace resources; retrieve evidence first, because stop can discard files never successfully transferred. `Retain` suspends execution, waits for Pod absence, detaches the Sandbox and deletes the claim while preserving files. Both preserve saved gateway evidence. Uncertain cleanup keeps claims and finalizers. Gateway restart recovers existing identities without starting replacement work.
+
+The 16 MiB stored-record boundary still applies. Open task and member records reserve 2 KiB for cleanup; member submission logs also reserve one cleanup cancellation beyond the ordinary input limit. Capacity failures hold fresh work without erasing earlier evidence. WorkflowTemplate adds no team budget or task deadline; spending remains per Session. Task and member records are included in logical backups and protected from archive/purge, which are explicitly unsupported for these records. Restore holds block fresh task effects while allowing reads and exact replay.
+
+The [Go bugfix](../examples/workflows/go-bugfix.yaml) and [research](../examples/workflows/research.yaml) files configure these choices. The full argument/experiment/review/synthesis research journey remains a later pilot target. Simulated-provider verification exercises transport and lifecycle behavior; it does not establish real-model collaboration, billing or production termination behavior.
+
 ## Profiles
 
 A namespaced `Profile` CRD selects an Agent, Environment, optional Vaults and explicit spending policy. The HTTP request field `route_id` contains the Profile name. Fresh acceptance requires a current Ready Profile and Ready dependencies with matching identities; a same-name replacement cannot substitute a different resource after acceptance.

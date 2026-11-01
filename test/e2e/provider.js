@@ -18,7 +18,12 @@ function finishJob(job, result, unknown=false) {
     content:[{type:'output_text',text:unknown?'Interrupted command outcome is unknown; no automatic replay':'Simulated executor observed actual Pod files and test output'}]});
   session.turns.find(turn=>turn.id===job.turn_id).status=unknown||result.exit_code!==0?'failed':'completed';
   session.remote.status='idle';executorCommands++;executorJobs.delete(job.id);
-  if(!unknown)emit(session.id,{type:'agent.session.completed',session_id:session.id});
+  if(!unknown && session.workflowMember) {
+    const content='Actual workspace diagnosis: '+result.output;
+    workflowAction(session,job.turn_id,'workflow_result',{outcome:'success',outputs:[{name:'diagnosis',content,
+      checks:[{command:item.command,output:item.output,exit_code:result.exit_code,source_item_id:item.id}],
+      limitations:'Controlled model fixture; command output is from the deployed executor.'}]});
+  } else if(!unknown)emit(session.id,{type:'agent.session.completed',session_id:session.id});
 }
 function emit(sessionID, value) {
   for (const response of eventStreams.get(sessionID) || []) response.write('data: '+JSON.stringify(value)+'\n\n');
@@ -50,13 +55,42 @@ function publicAuth(auth) {
   }
   return result;
 }
+// These branches replace only inference. Required actions travel through the same
+// provider API as model actions; the gateway still owns admission and all state.
+function workflowAction(session, turn, name, args) {
+  const call={type:'function_call',turn_id:turn,call_id:'call_'+turn+'_'+name,name,arguments:args};
+  session.remote.required_actions=[call];session.remote.status='requires_action';
+  Object.assign(session.turns.find(value=>value.id===turn),{status:'requires_action',session_id:session.id,subagent_id:null});
+  emit(session.id,{type:'agent.session.requires_action',session_id:session.id});
+}
+function workflowOutput(session,event) {
+  const action=session.remote.required_actions.find(value=>value.call_id===event.call_id && value.turn_id===event.turn_id);
+  if(!action)return;
+  session.items.push({id:'tool_'+event.call_id,type:'message',role:'assistant',turn_id:event.turn_id,
+    content:[{type:'output_text',text:JSON.stringify({tool:action.name,arguments:action.arguments,success:event.success,output:event.output,error:event.error})}]});
+  session.remote.required_actions=[];session.remote.status='idle';
+  session.turns.find(value=>value.id===event.turn_id).status=event.success?'completed':'failed';
+  emit(session.id,{type:'agent.session.completed',session_id:session.id});
+}
 function message(session, text) {
   const turn = 'turn_' + (session.turns.length + 1);
   session.items.push({id: 'user_' + turn, type: 'message', role: 'user', turn_id: turn,
     content: [{type: 'input_text', text}]});
   messageCommits++;
+  if(text.includes('WORKFLOW_FIRST_DELEGATION')) {
+    session.turns.push({id:turn,status:'in_progress',session_id:session.id,subagent_id:null});
+    workflowAction(session,turn,'workflow_delegate',{role:'diagnose',text:'WORKFLOW_DIAGNOSIS: inspect the actual repository and run its test.',dependencies:[]});
+    return;
+  }
+  const savedResult=text.match(/^Saved workflow result (\S+) from assignment /);
+  if(savedResult) {
+    session.turns.push({id:turn,status:'in_progress',session_id:session.id,subagent_id:null});
+    workflowAction(session,turn,'workflow_read_result',{result_id:savedResult[1]});
+    return;
+  }
+  if(text.includes('WORKFLOW_DIAGNOSIS'))session.workflowMember=true;
   if (session.remote.environment.type === 'self_hosted') {
-    session.turns.push({id: turn, status: 'in_progress'});
+    session.turns.push({id: turn, status: 'in_progress',...(session.workflowMember?{session_id:session.id,subagent_id:null}:{})});
     session.remote.status = 'in_progress';
     const interrupted=text.startsWith('SANDBOX_LONG_COMMAND');
     const program = interrupted ? `const fs=require('node:fs');fs.writeFileSync('interrupted-started.json',JSON.stringify({pid:process.pid,stage:'running',job:process.argv[1]}));setInterval(()=>{},1000);` : `const fs=require('node:fs'),cp=require('node:child_process'),os=require('node:os');
@@ -267,6 +301,7 @@ http.createServer(async (req, res) => {
       object.keys.set(key, JSON.stringify(body));
       for (const event of body.events || []) {
         if (event.type === 'agent.session.input.message') message(object, event.input[0].content[0].text);
+        if (event.type === 'agent.session.input.tool_result') workflowOutput(object,event);
       }
     }
     if (control.loseInput) { control.loseInput = false; req.socket.destroy(); return; }

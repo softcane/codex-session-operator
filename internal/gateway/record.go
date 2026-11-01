@@ -6,12 +6,16 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
+	agentsv1alpha1 "github.com/softcane/codex-session-operator/api/v1alpha1"
 	"github.com/softcane/codex-session-operator/internal/openaiapi"
 )
 
 const (
+	_taskStart         = "start"
+	_taskRoleField     = "role"
 	_gatewayNoneStatus = "gateway.none"
 	_echoFunction      = "gateway_echo"
 	_noteFunction      = "gateway_record_note"
@@ -25,7 +29,7 @@ const (
 )
 
 const (
-	_recordVersion  = 3
+	_recordVersion  = 4
 	_maxSubmissions = 1000
 	_maxEvents      = 256
 	_maxRecordBytes = 16 << 20
@@ -76,15 +80,17 @@ type TimelineEvent struct {
 
 // Record is gateway application data. No field is copied to a CRD.
 type Record struct {
-	Archived     bool   `json:"archived,omitempty"`
-	DeliveryHeld bool   `json:"delivery_held,omitempty"`
-	Work         *Work  `json:"work,omitempty"`
-	Version      int    `json:"version"`
-	Namespace    string `json:"namespace"`
-	Name         string `json:"name"`
-	UID          string `json:"uid"`
-	RemoteID     string `json:"remote_id,omitempty"`
-	Closed       bool   `json:"closed"`
+	Task         *Task              `json:"task,omitempty"`
+	TaskMember   *TaskMemberBinding `json:"task_member,omitempty"`
+	Archived     bool               `json:"archived,omitempty"`
+	DeliveryHeld bool               `json:"delivery_held,omitempty"`
+	Work         *Work              `json:"work,omitempty"`
+	Version      int                `json:"version"`
+	Namespace    string             `json:"namespace"`
+	Name         string             `json:"name"`
+	UID          string             `json:"uid"`
+	RemoteID     string             `json:"remote_id,omitempty"`
+	Closed       bool               `json:"closed"`
 	// TerminalReason is a safe observation hint; Closed remains the input fence.
 	TerminalReason   string            `json:"terminal_reason,omitempty"`
 	InitialKey       string            `json:"initial_key,omitempty"`
@@ -140,7 +146,7 @@ func appendEvent(r *Record, data json.RawMessage) {
 }
 
 func inputEvent(text string) json.RawMessage {
-	raw, _ := json.Marshal(map[string]any{_typeField: "agent.session.input.message", "input": []any{map[string]any{"role": "user", "content": []any{map[string]any{_typeField: "input_text", "text": text}}}}})
+	raw, _ := json.Marshal(map[string]any{_typeField: "agent.session.input.message", "input": []any{map[string]any{_taskRoleField: "user", "content": []any{map[string]any{_typeField: "input_text", "text": text}}}}})
 	return raw
 }
 
@@ -163,4 +169,246 @@ func submissionDigest(submission Submission) string {
 		event = string(submission.Event)
 	}
 	return digestValue([]string{submission.Text, submission.TargetTurn, event})
+}
+
+// taskFreshEffect identifies admissions and one-time delivery/creation claims.
+// Observation and cleanup updates remain possible after stop.
+func taskFreshEffect(before, after Record) bool {
+	if after.Task != nil {
+		if before.Task == nil {
+			return true
+		}
+		if len(after.Task.Members) > len(before.Task.Members) || len(after.Task.Results) > len(before.Task.Results) {
+			return true
+		}
+		if len(after.Task.Events) > len(before.Task.Events) && after.Task.State == _taskOpen {
+			return true
+		}
+	}
+	if after.TaskMember == nil {
+		return false
+	}
+	if before.TaskMember == nil && after.Work != nil {
+		return true
+	}
+	if len(after.Submissions) > len(before.Submissions) && !taskCleanupCancellation(before, after) {
+		return true
+	}
+	for i, submission := range after.Submissions {
+		if i < len(before.Submissions) && (submission.Attempts > before.Submissions[i].Attempts || before.Submissions[i].AttemptedAt == nil && submission.AttemptedAt != nil) {
+			return true
+		}
+	}
+	for id, action := range after.Actions {
+		old := before.Actions[id]
+		if action.Decision != old.Decision {
+			return true
+		}
+		if old.AttemptedAt == nil && action.AttemptedAt != nil {
+			return true
+		}
+	}
+	if after.Work != nil {
+		if before.Work == nil || len(after.Work.Attempts) > len(before.Work.Attempts) {
+			return true
+		}
+		for i, attempt := range after.Work.Attempts {
+			if !before.Work.Attempts[i].CreationClaimed && attempt.CreationClaimed {
+				return true
+			}
+		}
+		if len(after.Work.Events) > len(before.Work.Events) && after.Work.State == _workOpen {
+			return true
+		}
+	}
+	return false
+}
+
+func taskAuthorityAllowed(parent Record, child Record) error {
+	binding := child.TaskMember
+	if binding == nil || parent.Task == nil || parent.UID != binding.TaskID || parent.Namespace != child.Namespace {
+		return errConflict
+	}
+	if parent.DeliveryHeld {
+		return errRestoreHeld
+	}
+	if parent.Task.State != _taskOpen {
+		return errClosed
+	}
+	for _, member := range parent.Task.Members {
+		if member.ID == binding.MemberID && member.Role == binding.Role {
+			if child.Work != nil && member.WorkID != child.UID {
+				return errConflict
+			}
+			return nil
+		}
+	}
+	return errConflict
+}
+
+func taskIdentityPreserved(before, after Record) bool {
+	if before.TaskMember != nil && digestValue(before.TaskMember) != digestValue(after.TaskMember) {
+		return false
+	}
+	if before.Task == nil {
+		return true
+	}
+	if after.Task == nil || before.Task.ID != after.Task.ID || digestValue(before.Task.Workflow) != digestValue(after.Task.Workflow) || digestValue(before.Task.Origin) != digestValue(after.Task.Origin) {
+		return false
+	}
+	if before.Task.State == _taskClosed && after.Task.State != _taskClosed || before.Task.State == _taskStopping && after.Task.State == _taskOpen {
+		return false
+	}
+	if len(after.Task.Members) < len(before.Task.Members) || len(after.Task.Results) < len(before.Task.Results) || len(after.Task.Events) < len(before.Task.Events) {
+		return false
+	}
+	for i, member := range before.Task.Members {
+		if digestValue(member) != digestValue(after.Task.Members[i]) {
+			return false
+		}
+	}
+	for i, result := range before.Task.Results {
+		next := after.Task.Results[i]
+		result.HandoffQueued = false
+		next.HandoffQueued = false
+		if digestValue(result) != digestValue(next) {
+			return false
+		}
+	}
+	for i, event := range before.Task.Events {
+		next := after.Task.Events[i]
+		event.Queued = false
+		next.Queued = false
+		if digestValue(event) != digestValue(next) {
+			return false
+		}
+	}
+	return true
+}
+
+// The reserved cancellation is cleanup, never caller input. Restore holds still apply.
+func taskCleanupCancellation(before, after Record) bool {
+	if !after.Closed || after.TaskMember == nil || len(after.Submissions) != len(before.Submissions)+1 {
+		return false
+	}
+	submission := after.Submissions[len(before.Submissions)]
+	return submission.Key == resultKey(after.UID, "cleanup-cancel") && submission.RemoteKey == wireKey(after.UID, submission.Key) && submission.Text == "" && submission.TargetTurn == "" && !submission.Initial && string(submission.Event) == `{"type":"agent.session.input.cancel"}`
+}
+
+func copyCleanupTask(task *Task) *Task {
+	if task == nil {
+		return nil
+	}
+	copy := *task
+	copy.State = _taskOpen
+	return &copy
+}
+
+func validateTaskRecord(record Record) error {
+	if record.TaskMember != nil && (record.TaskMember.TaskID == "" || record.TaskMember.MemberID == "" || record.TaskMember.Role == "") {
+		return errConflict
+	}
+	if record.Task == nil {
+		return nil
+	}
+	task := record.Task
+	if task.ID != record.UID || record.Work != nil || record.TaskMember != nil || task.State != _taskOpen && task.State != _taskStopping && task.State != _taskClosed {
+		return errConflict
+	}
+	if task.Origin.Subject == "" || task.Origin.Key == "" || task.ID != taskRecordID(record.Namespace, task.Origin.Subject, task.Origin.Key) {
+		return errConflict
+	}
+	workflow := task.Workflow
+	if workflow.Name == "" || workflow.UID == "" || workflow.Generation < 1 || workflow.ResourceVersion == "" || workflow.Digest != agentsv1alpha1.WorkflowTemplateSpecDigest(workflow.Spec) {
+		return errConflict
+	}
+	if err := agentsv1alpha1.ValidateWorkflowTemplateSpec(workflow.Spec); err != nil {
+		return errConflict
+	}
+	if len(task.Events) == 0 || len(task.Members) == 0 || !task.Members[0].IsCoordinator || task.Events[0].Kind != _taskStart || task.Events[0].Digest != task.Origin.Digest {
+		return errConflict
+	}
+	if task.Origin.Digest != taskDigest(TaskInput{Workflow: workflow.Name, Text: task.Events[0].Text}) {
+		return errConflict
+	}
+	if err := validateTaskMembers(record); err != nil {
+		return err
+	}
+	return validateTaskEvidence(*task)
+}
+
+func validateTaskMembers(record Record) error {
+	seen := make(map[string]bool)
+	for i, member := range record.Task.Members {
+		if seen[member.ID] || member.ID == "" || member.WorkID != taskWorkID(record.Namespace, record.UID, member.ID) || strings.TrimSpace(member.Text) == "" || member.CreatedAt.IsZero() {
+			return errConflict
+		}
+		if _, err := taskMemberInitialText(member); err != nil {
+			return errConflict
+		}
+		seen[member.ID] = true
+		if i > 0 && (member.IsCoordinator || member.Action.SessionUID == "" || member.Action.TurnID == "" || member.Action.CallID == "") {
+			return errConflict
+		}
+		expectedProfile := record.Task.Workflow.Spec.Coordinator.ProfileRef.Name
+		found := i == 0
+		for _, role := range record.Task.Workflow.Spec.Roles {
+			if !member.IsCoordinator && role.Name == member.Role {
+				expectedProfile = role.ProfileRef.Name
+				found = true
+				if !member.IsCoordinator {
+					if err := validateTaskDependencies(*record.Task, role.DependsOn, member.Dependencies); err != nil {
+						return errConflict
+					}
+				}
+			}
+		}
+		if !found || member.Route.ID != expectedProfile || member.Profile == nil || member.Profile.Name != expectedProfile {
+			return errConflict
+		}
+		attempt := WorkAttempt{Policy: member.Policy, Profile: member.Profile}
+		synthetic := Record{Namespace: record.Namespace, Work: &Work{RouteID: member.Route.ID, Conversation: &ConversationOrigin{}}}
+		if err := validateProfileProvenance(synthetic, attempt); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateTaskEvidence(task Task) error {
+	events := make(map[string]bool)
+	for i, event := range task.Events {
+		if event.ID == "" || events[event.ID] || event.Digest == "" || event.ReceivedAt.IsZero() || event.Kind != _taskStart && event.Kind != _taskMessage && event.Kind != _taskStop {
+			return errConflict
+		}
+		if i > 0 && (event.Kind == _taskStart || event.Digest != taskDigest([]string{event.Kind, event.Text})) {
+			return errConflict
+		}
+		events[event.ID] = true
+	}
+	results := make(map[string]bool)
+	for _, result := range task.Results {
+		member, ok := taskMember(task, result.MemberID)
+		sum := sha256.Sum256([]byte(result.Raw))
+		if !ok || results[result.ID] || result.ID != "result-"+taskDigest([]string{task.ID, member.ID}) || result.Role != member.Role || result.Action.SessionUID == "" || result.Action.TurnID == "" || result.Action.CallID == "" || result.ReceivedAt.IsZero() || hex.EncodeToString(sum[:]) != result.SHA256 {
+			return errConflict
+		}
+		var input WorkflowResultInput
+		if decodeWorkflowArguments(json.RawMessage(result.Raw), &input) != nil || input.Outcome != result.Outcome || result.Verification != "reported" {
+			return errConflict
+		}
+		if _, err := validateWorkflowResult(task, member, json.RawMessage(result.Raw), result.SourceEvidence); err != nil {
+			return errConflict
+		}
+		results[result.ID] = true
+	}
+	return nil
+}
+
+// Keep one bounded cleanup receipt available inside the existing record ceiling.
+func recordSizeLimit(record Record) int {
+	if record.Task != nil && record.Task.State == _taskOpen || record.TaskMember != nil && !closedForPurge(record) {
+		return _maxRecordBytes - 2048
+	}
+	return _maxRecordBytes
 }

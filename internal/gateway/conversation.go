@@ -27,6 +27,7 @@ const (
 	_maxConversationPage  = 100
 	_messagesSegment      = "messages"
 	_moreField            = "more"
+	_nextCursorField      = "next_cursor"
 )
 
 // ConversationInput selects trusted policy through a route and supplies first input.
@@ -153,7 +154,7 @@ func (g *Gateway) handleConversationList(w http.ResponseWriter, r *http.Request,
 	if more {
 		next = entries[len(entries)-1].Attempt.ConversationID
 	}
-	writeJSON(w, http.StatusOK, map[string]any{_conversationsSegment: items, _moreField: more, "next_cursor": next})
+	writeJSON(w, http.StatusOK, map[string]any{_conversationsSegment: items, _moreField: more, _nextCursorField: next})
 }
 
 func (g *Gateway) listConversationAttempts(ctx context.Context, namespace, after string, limit int) ([]ConversationEntry, error) {
@@ -317,6 +318,9 @@ func (g *Gateway) acceptConversationMutation(ctx context.Context, scope requestS
 	initial, _, err := g.lookupConversation(ctx, scope.Namespace, publicID)
 	if err != nil {
 		return Record{}, WorkEvent{}, err
+	}
+	if initial.TaskMember != nil {
+		return Record{}, WorkEvent{}, errConflict
 	}
 	// Every mutation can take a conversation gate followed by a Session gate.
 	g.workMu.Lock()

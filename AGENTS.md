@@ -6,7 +6,7 @@ Read [README.md](README.md) for the user workflow, [docs/architecture.md](docs/a
 
 | Path | Responsibility |
 | --- | --- |
-| `api/v1alpha1/` | The six namespaced CRD APIs: Agent, Environment, Profile, Vault, VaultCredential, Session. |
+| `api/v1alpha1/` | The seven namespaced CRD APIs: Agent, Environment, Profile, WorkflowTemplate, Vault, VaultCredential, Session. |
 | `internal/controller/` | Kubernetes reconciliation, remote identity, dependency snapshots, finalizers, Sandbox claim binding and cleanup. |
 | `internal/openaiapi/` | OpenAI SDK adapter, provider ownership checks, configuration conversion and error redaction. |
 | `internal/gateway/` | HTTP, Profile admission, durable conversations and history, approvals, PostgreSQL storage and worker fencing. |

@@ -61,6 +61,45 @@ class LifecycleFixtureContractTests(unittest.TestCase):
         self.assertEqual(self.read(SESSIONS+"/"+session["id"]+"/turns")["data"][0]["status"], "completed")
         command = next(value for value in self.read(SESSIONS+"/"+session["id"]+"/items")["data"] if value["type"] == "command_execution")
         self.assertEqual(command["output"], "actual fixture command output")
+    def test_workflow_actions_keep_parent_provenance_and_actual_command_evidence(self):
+        coordinator = self.post(SESSIONS, {"environment": {"type": "self_hosted"}})
+        path = SESSIONS + "/" + coordinator["id"]
+        self.request("POST", path + "/events", {"events": [{"type": "agent.session.input.message",
+            "input": [{"content": [{"text": "WORKFLOW_FIRST_DELEGATION"}]}]}]})
+        action = self.read(path)["required_actions"][0]
+        self.assertEqual(action["name"], "workflow_delegate")
+        turn = self.read(path + "/turns")["data"][0]
+        self.assertEqual(turn["session_id"], coordinator["id"])
+        self.assertIsNone(turn["subagent_id"])
+        member = self.post(SESSIONS, {"environment": {"type": "self_hosted"}})
+        member_path = SESSIONS + "/" + member["id"]
+        self.request("POST", member_path + "/events", {"events": [{"type": "agent.session.input.message",
+            "input": [{"content": [{"text": action["arguments"]["text"]}]}]}]})
+        self.assertEqual(self.read(member_path)["required_actions"], [])
+        environment = member["environment"]["id"]
+        job = self.read("/executor/commands?environment_id=" + environment)[0]
+        self.post("/executor/result", {"environment_id": environment, "id": job["id"],
+            "exit_code": 0, "output": "actual checkout test failed as expected", "cwd": "/workspace"})
+        result = self.read(member_path)["required_actions"][0]
+        self.assertEqual(result["name"], "workflow_result")
+        output = result["arguments"]["outputs"][0]
+        check = output["checks"][0]
+        command = next(item for item in self.read(member_path + "/items")["data"] if item["id"] == check["source_item_id"])
+        self.assertEqual(check["output"], command["output"])
+        self.assertEqual(check["command"], command["command"])
+        self.assertEqual(check["exit_code"], command["exit_code"])
+        event = {"type": "agent.session.input.tool_result", "turn_id": result["turn_id"],
+                 "call_id": result["call_id"], "success": True, "output": '{"id":"result-saved"}'}
+        self.request("POST", member_path + "/events", {"events": [event]})
+        self.assertEqual(self.read(member_path)["required_actions"], [])
+        self.request("POST", path + "/events", {"events": [{"type": "agent.session.input.tool_result",
+            "turn_id": action["turn_id"], "call_id": action["call_id"], "success": True, "output": '{}'}]})
+        self.request("POST", path + "/events", {"events": [{"type": "agent.session.input.message", "input": [{"content": [
+            {"text": "Saved workflow result result-saved from assignment member-saved (diagnose) has outcome success."}]}]}]})
+        read = self.read(path)["required_actions"][0]
+        self.assertEqual(read["name"], "workflow_read_result")
+        self.assertEqual(read["arguments"], {"result_id": "result-saved"})
+
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory(prefix="codex-lifecycle-fixture-")
         self.addCleanup(self.directory.cleanup)
@@ -99,7 +138,7 @@ class LifecycleFixtureContractTests(unittest.TestCase):
         request = urllib.request.Request(
             f"http://127.0.0.1:{self.port}" + path,
             data=None if body is None else json.dumps(body).encode(),
-            method=method, headers={"Content-Type": "application/json"},
+            method=method, headers={"Content-Type": "application/json", "Idempotency-Key": str(time.monotonic_ns())},
         )
         try:
             response = urllib.request.urlopen(request, timeout=3)

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run public conversations, six-CRD lifecycle and actual sandbox Pods in isolated Kind.
+"""Run public conversations, seven-CRD lifecycle and actual sandbox Pods in isolated Kind.
 
 No real API credentials or inference. --keep retains a successful demo for CLI
 inspection; failures and ordinary runs remove only their own cluster.
@@ -25,6 +25,7 @@ import lifecycle
 import sandbox
 import sandbox_resources
 import cli
+import workflow
 import faults
 
 ROOT = helpers.ROOT
@@ -389,7 +390,7 @@ def main():
         checks.kubectl("apply", "-f", "-", data=manifest)
         checks.kubectl("wait", "--for=condition=Established", "crd/agents.agents.softcane.io",
                        "crd/environments.agents.softcane.io", "crd/sessions.agents.softcane.io",
-                       "crd/vaults.agents.softcane.io", "crd/vaultcredentials.agents.softcane.io", "crd/profiles.agents.softcane.io", "--timeout=60s")
+                       "crd/vaults.agents.softcane.io", "crd/vaultcredentials.agents.softcane.io", "crd/profiles.agents.softcane.io", "crd/workflowtemplates.agents.softcane.io", "--timeout=60s")
         crd_before = lifecycle.crd_hashes(checks)
         report["crdSchemaHashes"] = crd_before
         checks.kubectl("wait", "pod/provider-fixture", "-n", NS, "--for=condition=Ready", "--timeout=90s")
@@ -483,6 +484,7 @@ def main():
         cli.run(checks, api, base, directory, certificate, report, evidence, run, replace_gateway, fixture_counts)
         evidence.protect(["lifecycle-secret-v1", "lifecycle-secret-v2"])
         sandbox.run(checks, api, base, report, evidence, sandbox_runtime, replace_gateway, fixture_counts)
+        workflow.run(checks, api, base, directory, certificate, report, evidence, run, sandbox_runtime, replace_gateway, fixture_counts)
         faults.run(checks, api, base, report, evidence, sandbox_runtime, fixture_counts)
         lifecycle.run(checks, api, base, report, replace_gateway, fixture_counts)
         ensure(lifecycle.crd_hashes(checks) == crd_before, "Acceptance changed shipped CRD schemas")

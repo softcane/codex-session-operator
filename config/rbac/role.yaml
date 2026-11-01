@@ -92,6 +92,7 @@ rules:
   - sessions/status
   - vaultcredentials/status
   - vaults/status
+  - workflowtemplates/status
   verbs:
   - get
   - patch
@@ -100,6 +101,7 @@ rules:
   - agents.softcane.io
   resources:
   - profiles
+  - workflowtemplates
   verbs:
   - get
   - list

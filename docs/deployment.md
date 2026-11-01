@@ -170,15 +170,25 @@ An ingress can terminate TLS. Direct gateway TLS uses `GATEWAY_CERT` and `GATEWA
 
 The `config/monitoring` overlay enables HTTPS metrics, ServiceMonitors and the dashboard. It requires Prometheus Operator and a `gateway-tls` Secret. That Secret belongs to monitoring and is not required by the default installation.
 
+## Configure workflow tasks
+
+Register the Profiles used by the coordinator and roles before starting a workflow task. WorkflowTemplate, Profile and dependency references resolve in the same namespace. The gateway needs read access to WorkflowTemplates and Profiles; the workflow controller observes Profile updates. Deploy matching controller and gateway versions with their generated CRDs and RBAC.
+
+The [Go bugfix example](../examples/workflows/go-bugfix.yaml) reuses the application `my-go-project` Profile. The [research example](../examples/workflows/research.yaml) supplies a Profile and Retain Environment using the existing application Agent and approved `my-go-project-v1` pool. Install those application prerequisites in the example namespace, inspect its explicit Unlimited spending choice, then apply the desired example. Applying configuration alone creates no Session or Pod.
+
+Each accepted self-hosted member needs a separate Session, Sandbox and workspace PVC. Capacity and storage must account for all members, which remain open until explicit stop. There is no task-level spending guarantee or runtime deadline; existing per-Session Profile policy applies. A retained workspace requires the Environment's explicit `selfHosted.workspace.deletionPolicy: Retain`; a workflow name does not choose cleanup policy.
+
+Use the [task CLI and HTTP reference](conversations.md#workflow-tasks) to start, continue, retrieve evidence and stop. Read cleanup state after stop and save results before Delete cleanup. The research configuration illustrates the later argument/experiment/review/synthesis pilot; it is not proof that the pilot has executed. Simulated-provider checks cover the tested transport and lifecycle only, without real-model or billing claims.
+
 ## Storage and recovery
 
-Manage PostgreSQL backups separately. The gateway requires `fsync`, `full_page_writes` and `synchronous_commit` enabled; these preserve accepted input across restarts.
+Manage PostgreSQL backups separately. Startup migrations preserve existing records, and logical backup/restore includes task snapshots, member intents, results and source evidence. The gateway requires `fsync`, `full_page_writes` and `synchronous_commit` enabled; these preserve accepted input across restarts.
 
-All replicas must use matching quotas: defaults are 32 active execution slots and 100,000 retained records, configured by `--gateway-max-active` and `--gateway-max-records`. Closed history consumes retention capacity. Replay identities persist after archive.
+All replicas must use matching quotas: defaults are 32 active execution slots and 100,000 retained records, configured by `--gateway-max-active` and `--gateway-max-records`. Closed history consumes retention capacity. Replay identities persist after archive. Task and member records share the existing 16 MiB record limit, with 2 KiB reserved for cleanup; result submissions have a separate 256 KiB encoded-JSON boundary. Capacity rejection preserves saved evidence.
 
 Use `/gateway-admin` from the gateway image in an offline maintenance Job with the gateway database Secret mounted. Treat backups as private conversation data. The commands below are separate maintenance operations; choose the one you need.
 
-If deployed quotas differ from the defaults, pass the matching `-max-active` and `-max-records` to this administrative command. Archive removes payloads from the selected closed record while retaining receipts, replay fingerprints, approval decisions and operation or cleanup identities. Conversation and Session records are archived separately, and backups retain their own copies.
+If deployed quotas differ from the defaults, pass the matching `-max-active` and `-max-records` to this administrative command. Archive removes payloads from the selected closed record while retaining receipts, replay fingerprints, approval decisions and operation or cleanup identities. Conversation and Session records are archived separately, and backups retain their own copies. Task records and their member records are protected: archive and purge are unsupported for them.
 
 ```sh
 /gateway-admin -action report -database-file /gateway-database/url
@@ -188,7 +198,7 @@ If deployed quotas differ from the defaults, pass the matching `-max-active` and
 /gateway-admin -action archive -database-file /gateway-database/url -path closed-record-uid
 ```
 
-Restore requires an empty database and disables fresh delivery. Before resuming, reconcile Kubernetes claims, provider outcomes and recovery logs, including remote actions missing from the backup. The audit needs one decision per reported record: `uid`, its current `digest`, a nonempty `reference`, and either `verified:true` or `blocked:true`. Unresolved records retain their claims and remain held. Reads and exact receipt replay stay available.
+Restore requires an empty database and disables fresh delivery and task effects. Before resuming, reconcile Kubernetes claims, provider outcomes and recovery logs, including remote actions missing from the backup. The audit needs one decision per reported record: `uid`, its current `digest`, a nonempty `reference`, and either `verified:true` or `blocked:true`. Unresolved records retain their claims and remain held. Reads and exact receipt replay stay available.
 
 Backup serialization buffers the dataset in memory. Primary-volume loss, standby promotion and production restore objectives require separate qualification. A successful process restart does not establish zero-loss database failover.
 

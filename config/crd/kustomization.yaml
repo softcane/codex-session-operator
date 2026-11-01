@@ -6,6 +6,7 @@ resources:
 - bases/agents.softcane.io_vaults.yaml
 - bases/agents.softcane.io_vaultcredentials.yaml
 - bases/agents.softcane.io_profiles.yaml
+- bases/agents.softcane.io_workflowtemplates.yaml
 # +kubebuilder:scaffold:crdkustomizeresource
 
 patches:

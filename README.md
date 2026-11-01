@@ -214,7 +214,13 @@ spec:
 
 Select the `sandbox` Profile when [sending a task](docs/getting-started.md#4-send-a-task). The gateway creates the `Session`; applying these CRs alone starts no task Pod. Follow-ups keep that Session and workspace. With the shown `Delete` policy, closing removes the workspace, so retrieve any changes first.
 
-Optional `Vault` and `VaultCredential` CRs supply credentials for connected provider tools. See the [resource reference](docs/resources.md) for all six CRs, other execution modes and update rules.
+Optional `Vault` and `VaultCredential` CRs supply credentials for connected provider tools. See the [resource reference](docs/resources.md) for all supported CRs, other execution modes and update rules.
+
+## Workflow tasks
+
+A `WorkflowTemplate` lets a coordinator choose assignments from configured roles. Each accepted member gets its own Session and workspace. Applying a template starts no execution. Roles and output names are application choices; a workflow does not automatically run every role.
+
+See the [Go bugfix](examples/workflows/go-bugfix.yaml) and [research](examples/workflows/research.yaml) configuration examples, then use the [task API and CLI](docs/conversations.md#workflow-tasks). Tasks preserve saved evidence and stay open until explicit stop. Each Session keeps its Profile spending and workspace policy. These examples do not establish a deployed multi-agent research result.
 
 ## Documentation
 

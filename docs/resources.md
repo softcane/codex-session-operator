@@ -1,6 +1,6 @@
 # Resource reference
 
-Codex Session Operator exposes six namespaced resources in `agents.softcane.io/v1alpha1`. Use this page to look up resource roles, common configuration, update rules and cleanup behavior. The generated [CRD schemas](../config/crd/bases/) define every accepted field and its validation for this checkout.
+Codex Session Operator exposes namespaced resources in `agents.softcane.io/v1alpha1`. Use this page to look up resource roles, common configuration, update rules and cleanup behavior. The generated [CRD schemas](../config/crd/bases/) define every accepted field and its validation for this checkout.
 
 These examples use the configured provider. Real OpenAI execution incurs charges. Start with [getting started](getting-started.md) for a complete local setup.
 
@@ -13,6 +13,7 @@ Enum values are case-sensitive. Operator-owned modes use `SelfHosted`, `OpenAIHo
 | `Agent` | Reusable model, instructions, reasoning and tools backed by an OpenAI Agent. | No. |
 | `Environment` | Reusable execution recipe: `None`, `OpenAIHosted` or `SelfHosted`. | No. |
 | `Profile` | Gateway-approved binding of one Agent, one Environment, optional Vaults and spend control. | No. |
+| `WorkflowTemplate` | Coordinator and available role Profile bindings, instructions, dependencies and named outputs. | No. |
 | `Vault` | Reusable remote credential container. | No. |
 | `VaultCredential` | Credential metadata and a protected same-namespace Secret reference. | No. |
 | `Session` | One remote conversation with frozen dependency identities. | A self-hosted Session creates a SandboxClaim; Agent Sandbox creates compute and storage. |
@@ -134,6 +135,38 @@ spec:
 
 Profile readiness means its selected policy resources are Ready. Starting a task through the conversation API freezes the Profile identity, policy and selected dependency identities before the gateway creates a Session.
 
+## WorkflowTemplate
+
+A WorkflowTemplate selects a coordinator Profile and a set of available roles in the same namespace. Each role has a name, Profile reference, instructions, optional `dependsOn` role names and optional `outputs` labels. Role and output labels are arbitrary nonempty names. Role names, dependencies and output labels must be distinct within their respective lists; dependencies must exist and form an acyclic graph.
+
+```yaml
+apiVersion: agents.softcane.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: investigation-team
+  namespace: codex-session-operator-system
+spec:
+  coordinator:
+    profileRef:
+      name: investigation
+    instructions: Choose useful assignments and cite saved result IDs.
+  roles:
+    - name: diagnosis
+      profileRef:
+        name: investigation
+      instructions: Save observations, supporting evidence and limitations.
+      outputs:
+        - diagnosis
+```
+
+Applying a template creates no Session or workspace. Its controller reports current Profile readiness and safe reference identities. Task start snapshots the template identity and content. Each assignment resolves its selected Ready Profile when accepted, so later Profile edits can affect assignments not yet accepted. Accepted members retain their policy and dependency identities; template edits affect new tasks.
+
+Roles are choices for the coordinator, not mandatory stages. A selected role with dependencies needs exact successful saved prerequisite result IDs from the same task. Repeated explicit assignments to a role are allowed; there is no automatic retry or rerun. Output labels describe application content, without a universal report/patch role taxonomy.
+
+Each member uses a distinct Session and, for self-hosted execution, its own Sandbox and workspace. The [Go bugfix](../examples/workflows/go-bugfix.yaml) example reuses the application `my-go-project` Profile. The [research](../examples/workflows/research.yaml) example supplies a `research` Profile and a SelfHosted Environment with `selfHosted.workspace.deletionPolicy: Retain`, reusing the application Agent and approved pool. Its shown spending policy is explicitly Unlimited; select an appropriate supported per-Session policy before real execution. WorkflowTemplate adds no task budget, timer or model selection; each accepted Session uses the existing Profile policy.
+
+See [workflow tasks](conversations.md#workflow-tasks) for assignment, result and stop semantics.
+
 ## Spending policy
 
 Profiles and Sessions require an explicit `spendControl`:
@@ -225,7 +258,7 @@ When one attached credential matches the MCP URL, the controller selects it. If 
 
 ## Deletion and ownership
 
-Reusable Agent, Environment, Vault and VaultCredential resources use explicit `Delete` or `Retain` policies. Profile deletion removes only the reusable binding. A Session always cleans up its owned remote conversation and, when self-hosted, its executor before its finalizer completes.
+Reusable Agent, Environment, Vault and VaultCredential resources use explicit `Delete` or `Retain` policies. Profile and WorkflowTemplate deletion remove only reusable configuration; they do not close accepted work. A Session always cleans up its owned remote conversation and, when self-hosted, its executor before its finalizer completes.
 
 Self-hosted workspace policy is set at `Environment.spec.selfHosted.workspace.deletionPolicy`:
 

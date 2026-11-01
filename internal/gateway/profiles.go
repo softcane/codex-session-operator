@@ -268,7 +268,7 @@ func (g *Gateway) handleProfiles(w http.ResponseWriter, r *http.Request, parts [
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{_callerSubjectField: scope.Subject,
-		_sourceField: g.profileSource(), "profiles": items, _moreField: next != "", "next_cursor": next})
+		_sourceField: g.profileSource(), "profiles": items, _moreField: next != "", _nextCursorField: next})
 }
 
 func (g *Gateway) profileSummary(ctx context.Context, namespace, name string) (ProfileSummary, error) {

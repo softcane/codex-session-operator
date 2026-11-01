@@ -86,7 +86,7 @@ func New(store Storage, reader client.Reader, provider Provider, subject string,
 	}
 	copied := make(map[string]Function, len(functions))
 	for name, function := range functions {
-		if name == _echoFunction || name == _noteFunction || function.Execute == nil || function.Consequential && !function.DownstreamDeduplicates {
+		if name == _echoFunction || name == _noteFunction || isWorkflowFunction(name) || function.Execute == nil || function.Consequential && !function.DownstreamDeduplicates {
 			return nil, errors.New("invalid function registration")
 		}
 		copied[name] = function
@@ -162,6 +162,17 @@ func (g *Gateway) runWorker(ctx context.Context) error {
 				return nil
 			}
 			if record.Closed || record.DeliveryHeld {
+				continue
+			}
+			if record.Task != nil {
+				if err := g.syncTask(ctx, record.UID); err != nil {
+					if writeErr := g.store.Update(ctx, record.UID, func(r *Record) error {
+						r.Task.LastError = "Team work or cleanup pending; inspect member state"
+						return nil
+					}); writeErr != nil {
+						return writeErr
+					}
+				}
 				continue
 			}
 			if record.Work != nil {
@@ -278,7 +289,12 @@ func (g *Gateway) Quiesce(ctx context.Context, uid, remoteID string) error {
 				return nil
 			}
 		}
-		if len(r.Submissions) >= _maxSubmissions {
+		capacity := _maxSubmissions
+		if r.TaskMember != nil {
+			// Ordinary input cannot consume this reserved cleanup entry.
+			capacity++
+		}
+		if len(r.Submissions) >= capacity {
 			return errors.New("cleanup submission capacity reached")
 		}
 		r.Submissions = append(r.Submissions, Submission{Key: key, RemoteKey: wireKey(uid, key), Event: event, CreatedAt: time.Now().UTC()})
@@ -709,7 +725,7 @@ func (g *Gateway) ValidateTools(ctx context.Context, fields map[string]any) erro
 			continue
 		}
 		name, _ := tool["name"].(string)
-		if name != _echoFunction && name != _noteFunction {
+		if name != _echoFunction && name != _noteFunction && !isWorkflowFunction(name) {
 			if _, ok := g.functions[name]; !ok {
 				return fmt.Errorf("function %q has no authorized gateway handler", name)
 			}
@@ -783,6 +799,9 @@ func (g *Gateway) processActions(ctx context.Context, uid string, history openai
 }
 
 func (g *Gateway) processFunction(ctx context.Context, uid, id string, pending openaiapi.PendingAction, action Action, namespace string) error {
+	if isWorkflowFunction(pending.Name) {
+		return g.processWorkflowFunction(ctx, uid, id, pending, action)
+	}
 
 	function, registered := g.functions[pending.Name]
 	consequential := g.consequentialFunction(pending.Name)
@@ -878,6 +897,9 @@ func (g *Gateway) processFunction(ctx context.Context, uid, id string, pending o
 }
 
 func (g *Gateway) consequentialFunction(name string) bool {
+	if isWorkflowFunction(name) {
+		return false
+	}
 	function, registered := g.functions[name]
 	return name == _noteFunction || function.Consequential || !registered && name != _echoFunction
 }

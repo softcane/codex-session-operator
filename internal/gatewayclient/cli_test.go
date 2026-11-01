@@ -84,7 +84,7 @@ func testIdentity(req *http.Request, subject string) map[string]string {
 
 func testReceipt(id string, attempt int) receipt {
 	return receipt{ConversationID: id, ConversationURL: "/v1/namespaces/team/conversations/" + id,
-		RouteID: "investigation", Attempt: attempt, EventID: "event-1", Acceptance: "committed"}
+		RouteID: "investigation", Attempt: attempt, EventID: "event-1", Acceptance: _acceptanceCommitted}
 }
 
 func testDetail(attempt int, turns string) map[string]any {
@@ -143,7 +143,7 @@ func TestRunLostAcceptanceResumesExactRequest(t *testing.T) {
 		writeTestJSON(t, w, 202, testReceipt(_testConversationID, 1))
 	})
 	code, output, diagnostic := cli.run(t, "first\r\nmessage", _commandStart, "--profile", "investigation",
-		"--text-file", "-", "--operation", "stable")
+		_textFileFlag, "-", _operationFlag, "stable")
 	if code != _exitAmbiguous || output != "" || !strings.Contains(diagnostic, "stable") {
 		t.Fatalf("lost acceptance: code=%d output=%s diagnostic=%s", code, output, diagnostic)
 	}
@@ -191,7 +191,7 @@ func TestRunReceiptMustPersistBeforeSuccess(t *testing.T) {
 		}
 		writeTestJSON(t, w, 202, testReceipt(_testConversationID, 1))
 	})
-	code, output, diagnostic := cli.run(t, "task", _commandStart, "--profile", "investigation", "--text-file", "-", "--operation", "persist")
+	code, output, diagnostic := cli.run(t, _commandTask, _commandStart, "--profile", "investigation", _textFileFlag, "-", _operationFlag, "persist")
 	if code != _exitAmbiguous || output != "" || !strings.Contains(diagnostic, "persistence failed") {
 		t.Fatalf("unpersisted receipt: %d %s %s", code, output, diagnostic)
 	}
@@ -236,7 +236,7 @@ func TestRunRefusesChangedOperationIdentity(t *testing.T) {
 				mu.Unlock()
 				writeTestJSON(t, w, 202, testReceipt(_testConversationID, 1))
 			})
-			code, _, diagnostic := cli.run(t, "original", "continue", _testConversationID, "--text-file", "-", "--operation", _testOperation)
+			code, _, diagnostic := cli.run(t, "original", _commandContinue, _testConversationID, _textFileFlag, "-", _operationFlag, _testOperation)
 			if code != 0 {
 				t.Fatalf("initial: %d %s", code, diagnostic)
 			}
@@ -257,7 +257,7 @@ func TestRunRefusesChangedOperationIdentity(t *testing.T) {
 					}
 				}
 			}
-			code, output, diagnostic := cli.run(t, input, "continue", target, "--text-file", "-", "--operation", _testOperation)
+			code, output, diagnostic := cli.run(t, input, _commandContinue, target, _textFileFlag, "-", _operationFlag, _testOperation)
 			if code != _exitFailure || output != "" || !strings.Contains(diagnostic, "conflicts") {
 				t.Fatalf("changed identity: %d %s %s", code, output, diagnostic)
 			}
@@ -291,7 +291,7 @@ func TestRunExpiredTokenKeepsOperation(t *testing.T) {
 		mu.Unlock()
 		writeTestJSON(t, w, 202, testReceipt(_testConversationID, 1))
 	})
-	code, _, _ := cli.run(t, "task", _commandStart, "--profile", "investigation", "--text-file", "-", "--operation", "expiry")
+	code, _, _ := cli.run(t, _commandTask, _commandStart, "--profile", "investigation", _textFileFlag, "-", _operationFlag, "expiry")
 	if code != 0 {
 		t.Fatal(code)
 	}
@@ -327,7 +327,7 @@ func TestRunProfilePaginationAndNamespace(t *testing.T) {
 		writeTestJSON(t, w, 200, map[string]any{_callerSubjectField: _testSubject, _testSourceField: "crd", "more": more,
 			"next_cursor": "opaque+cursor", _testProfilesField: []map[string]any{{"id": id, _namespaceField: _testNamespace, "ready": true}}})
 	})
-	code, output, diagnostic := cli.run(t, "", _testProfilesField, "list", "--limit", "1")
+	code, output, diagnostic := cli.run(t, "", _testProfilesField, _commandList, "--limit", "1")
 	if code != 0 || !strings.Contains(output, "beyond-first-page") {
 		t.Fatalf("pages: %d %s %s", code, output, diagnostic)
 	}
@@ -367,9 +367,9 @@ func TestRunRejectsNonKubernetesProfileName(t *testing.T) {
 	cli := newTestCLI(t, func(http.ResponseWriter, *http.Request) { requests++ })
 	for _, args := range [][]string{
 		{_testProfilesField, "show", _testInvalidProfile},
-		{_commandStart, "--profile", _testInvalidProfile, "--text-file", "-", "--operation", "invalid-profile"},
+		{_commandStart, "--profile", _testInvalidProfile, _textFileFlag, "-", _operationFlag, "invalid-profile"},
 	} {
-		code, _, _ := cli.run(t, "task", args...)
+		code, _, _ := cli.run(t, _commandTask, args...)
 		if code != _exitUsage {
 			t.Fatalf("invalid Profile name returned %d", code)
 		}
@@ -421,15 +421,15 @@ func TestRunStartFreshRequiresCleanupAndFreezesAttempt(t *testing.T) {
 		mu.Unlock()
 		writeTestJSON(t, w, 202, testReceipt("conv-second", 2))
 	})
-	args := []string{_commandFresh, _testConversationID, "--text-file", "-", "--operation", "fresh"}
-	code, _, _ := cli.run(t, "task", args...)
+	args := []string{_commandFresh, _testConversationID, _textFileFlag, "-", _operationFlag, "fresh"}
+	code, _, _ := cli.run(t, _commandTask, args...)
 	if code != _exitFailure {
 		t.Fatal("restart accepted without cleanup")
 	}
 	mu.Lock()
 	cleaned = true
 	mu.Unlock()
-	code, output, diagnostic := cli.run(t, "task", args...)
+	code, output, diagnostic := cli.run(t, _commandTask, args...)
 	if code != 0 || !strings.Contains(output, "conv-second") || !strings.Contains(output, "new workspace") {
 		t.Fatalf("fresh: %d %s %s", code, output, diagnostic)
 	}
@@ -480,14 +480,14 @@ func TestRunWatchDoesNotCountPriorRootsOrSubagents(t *testing.T) {
 		}
 		writeTestJSON(t, w, 200, testDetail(1, turns))
 	})
-	code, _, diagnostic := cli.run(t, "steering", "continue", _testConversationID, "--text-file", "-", "--operation", "steer")
+	code, _, diagnostic := cli.run(t, "steering", _commandContinue, _testConversationID, _textFileFlag, "-", _operationFlag, "steer")
 	if code != 0 {
 		t.Fatalf("continue: %d %s", code, diagnostic)
 	}
 	mu.Lock()
 	watching = true
 	mu.Unlock()
-	code, output, diagnostic := cli.run(t, "", "watch", _testConversationID, "--operation", "steer", "--timeout", "40ms", "--poll", "5ms")
+	code, output, diagnostic := cli.run(t, "", "watch", _testConversationID, _operationFlag, "steer", "--timeout", "40ms", "--poll", "5ms")
 	if code != _exitPending || strings.Contains(output, `"state":"observed_root_outcome"`) || strings.Contains(output, `"id":"child"`) {
 		t.Fatalf("old roots qualified: %d %s %s", code, output, diagnostic)
 	}
@@ -521,14 +521,14 @@ func TestRunWatchNewRootsRemainUncorrelated(t *testing.T) {
 		}
 		writeTestJSON(t, w, 200, testDetail(1, turns))
 	})
-	code, _, _ := cli.run(t, "follow-up", "continue", _testConversationID, "--text-file", "-", "--operation", "follow")
+	code, _, _ := cli.run(t, "follow-up", _commandContinue, _testConversationID, _textFileFlag, "-", _operationFlag, "follow")
 	if code != 0 {
 		t.Fatal(code)
 	}
 	mu.Lock()
 	watching = true
 	mu.Unlock()
-	code, output, diagnostic := cli.run(t, "", "watch", _testConversationID, "--operation", "follow", "--timeout", "1s", "--poll", "5ms")
+	code, output, diagnostic := cli.run(t, "", "watch", _testConversationID, _operationFlag, "follow", "--timeout", "1s", "--poll", "5ms")
 	if code != _exitAmbiguous || !strings.Contains(output, "concurrent-a") || !strings.Contains(output, "concurrent-b") || !strings.Contains(output, "cannot be attributed") {
 		t.Fatalf("concurrent roots: %d %s %s", code, output, diagnostic)
 	}
@@ -573,14 +573,14 @@ func TestRunWatchRejectsAnotherAttempt(t *testing.T) {
 		mu.Unlock()
 		writeTestJSON(t, w, 200, testDetail(selected, `[{"id":"root","status":"completed"}]`))
 	})
-	code, _, _ := cli.run(t, "task", "continue", _testConversationID, "--text-file", "-", "--operation", "attempt")
+	code, _, _ := cli.run(t, _commandTask, _commandContinue, _testConversationID, _textFileFlag, "-", _operationFlag, "attempt")
 	if code != 0 {
 		t.Fatal(code)
 	}
 	mu.Lock()
 	attempt = 2
 	mu.Unlock()
-	code, output, diagnostic := cli.run(t, "", "watch", _testConversationID, "--operation", "attempt")
+	code, output, diagnostic := cli.run(t, "", "watch", _testConversationID, _operationFlag, "attempt")
 	if code != _exitAmbiguous || output != "" || !strings.Contains(diagnostic, "attempt differs") {
 		t.Fatalf("another attempt observed: %d %s %s", code, output, diagnostic)
 	}
@@ -626,7 +626,7 @@ func TestRunBoundedRequestRetainsOperation(t *testing.T) {
 		}
 	})
 	cli.args = append(cli.args, "--request-timeout", "100ms")
-	code, output, _ := cli.run(t, "task", _commandStart, "--profile", "investigation", "--text-file", "-", "--operation", "timeout")
+	code, output, _ := cli.run(t, _commandTask, _commandStart, "--profile", "investigation", _textFileFlag, "-", _operationFlag, "timeout")
 	if code != _exitAmbiguous || output != "" {
 		t.Fatalf("request timeout: %d %s", code, output)
 	}
@@ -663,7 +663,7 @@ func TestRunResumeUsesIdentityWhileCatalogAndObservationAreUnavailable(t *testin
 		}
 		writeTestJSON(t, w, http.StatusAccepted, testReceipt(_testConversationID, 1))
 	})
-	code, output, diagnostic := cli.run(t, "task", _commandStart, "--profile", "retired-profile", "--text-file", "-", "--operation", "outage")
+	code, output, diagnostic := cli.run(t, _commandTask, _commandStart, "--profile", "retired-profile", _textFileFlag, "-", _operationFlag, "outage")
 	if code != _exitAmbiguous || output != "" {
 		t.Fatalf("uncertain acceptance: %d %s %s", code, output, diagnostic)
 	}
@@ -722,7 +722,7 @@ func TestRunProcessCrashBeforeAndAfterReceiptPersistence(t *testing.T) {
 				t.Fatal(err)
 			}
 			childArgs := append([]string{"-test.run=^TestClientCrashHelper$", "--"}, cli.args...)
-			childArgs = append(childArgs, _commandStart, "--profile", "investigation", "--text-file", "-", "--operation", "crash")
+			childArgs = append(childArgs, _commandStart, "--profile", "investigation", _textFileFlag, "-", _operationFlag, "crash")
 			child := exec.CommandContext(t.Context(), executable, childArgs...)
 			child.Env = append(os.Environ(), "GATEWAY_CLIENT_TEST_CHILD=1", "GATEWAY_CLIENT_TEST_CRASH_STAGE="+stage)
 			child.Stdin = strings.NewReader("durable task")

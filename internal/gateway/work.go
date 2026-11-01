@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
-	"reflect"
 	"strconv"
 	"strings"
 	"time"
@@ -62,6 +61,11 @@ func (g *Gateway) syncWork(ctx context.Context, id string) error {
 	}
 	if record.Work == nil {
 		return errors.New("work configuration required")
+	}
+	if record.TaskMember != nil && record.Work.State == _workOpen {
+		if err := g.taskMemberInputOpen(ctx, record.Namespace, record.TaskMember); err != nil {
+			return err
+		}
 	}
 	if record.Work.State == _workClosed {
 		return nil
@@ -230,10 +234,24 @@ func checkWorkOwnership(record Record, attempt WorkAttempt, session *agentsv1alp
 	if session.UID == "" || record.Namespace != session.Namespace || attempt.SessionName != session.Name ||
 		session.Annotations[_workAnnotation] != record.UID ||
 		(attempt.SessionUID != "" && attempt.SessionUID != string(session.UID)) ||
-		!reflect.DeepEqual(session.Spec, attempt.Policy) {
+		!sameSessionPolicy(session.Spec, attempt.Policy) {
 		return errors.New("work Session ownership or policy mismatch")
 	}
 	return nil
+}
+
+// Kubernetes normalizes opaque JSON schemas while persisting a Session. Compare
+// complete policy values without treating schema key order as an identity change.
+func sameSessionPolicy(a, b agentsv1alpha1.SessionSpec) bool {
+	left, err := json.Marshal(a)
+	if err != nil {
+		return false
+	}
+	right, err := json.Marshal(b)
+	if err != nil {
+		return false
+	}
+	return sameJSON(left, right)
 }
 
 // workRecord falls back to the durable attempt index if a marker is removed.
@@ -263,6 +281,9 @@ func (g *Gateway) workRecord(ctx context.Context, session *agentsv1alpha1.Sessio
 func (g *Gateway) validateWorkSession(ctx context.Context, session *agentsv1alpha1.Session, environment *agentsv1alpha1.SessionEnvironmentSnapshot) error {
 	record, found, err := g.workRecord(ctx, session)
 	if err != nil || !found {
+		return err
+	}
+	if err := g.taskMemberInputOpen(ctx, record.Namespace, record.TaskMember); err != nil {
 		return err
 	}
 	if record.Work == nil || record.Work.State != _workOpen || len(record.Work.Attempts) == 0 {

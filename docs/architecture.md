@@ -25,9 +25,9 @@ flowchart LR
 | Component | Owns |
 | --- | --- |
 | Controller | Remote identities, dependency snapshots, creation claims, finalizers and Session-owned SandboxClaims. |
-| Gateway | HTTP, Profile admission, saved input/history/approvals and delivery workers. |
+| Gateway | HTTP, Profile admission, durable tasks, member intents, saved evidence, input/history/approvals and delivery workers. |
 | Agent Sandbox | Sandbox templates and pools, Sandboxes, executor Pods and workspace PVCs. Installed separately. |
-| PostgreSQL | Durable conversations and replay receipts. Provisioned separately; local helpers supply a disposable instance. |
+| PostgreSQL | Durable conversations, tasks, member bindings, results and replay receipts. Provisioned separately; local helpers supply a disposable instance. |
 | Executor image | `codex exec-server`, Git and repository preparation. Application images add project tools; capability images supply skills or plugins. |
 
 The gateway serves HTTP by default. Your ingress, proxy or network policy supplies access control; the gateway has no caller authentication or roles. All callers reaching a namespace's routes share its conversations.
@@ -39,6 +39,16 @@ A `Profile` selects same-namespace Agent, Environment and optional Vault resourc
 The controller resolves Ready dependencies and freezes their remote IDs and creation settings before creating the OpenAI Session. A same-name replacement cannot substitute a different dependency. Supported later changes are listed in [Session update rules](resources.md#session-update-rules).
 
 In `None` mode, the controller waits for durable first input from the gateway and includes it in remote Session creation. In `SelfHosted` mode, it requests execution through the ownership chain `Session → SandboxClaim → Sandbox → Pod`, with a Sandbox-owned workspace PVC.
+
+## Workflow coordination
+
+A WorkflowTemplate publishes a coordinator Profile and available role Profile bindings. Its controller observes current Profile readiness and starts no execution. Task acceptance snapshots the template UID, generation, digest and content in PostgreSQL. The gateway resolves each selected Profile when accepting that assignment, preserving its current per-Session policy and dependency identities. Template edits affect future tasks; Profile edits may affect members not yet accepted.
+
+Each member is a distinct conversation and Session, with its own self-hosted Sandbox and workspace. Parallel members do not share a conversation's sequential attempt list. The task stores immutable member creation intents before workers create execution resources; restart and exact replay recover those identities.
+
+The coordinator chooses assignments from arbitrary configured roles. Declared dependencies gate selected assignments through exact successful saved result IDs. Results retain original JSON bytes, digests and verified source provenance in PostgreSQL, with durable handoffs to the coordinator. Provider action authority comes from verified root-turn/Session provenance. A result's existence, handoff acceptance, provider turn outcome and cleanup are separate facts.
+
+Workspaces remain available until explicit task stop. Stop blocks fresh work and requests cleanup for all known members. Existing per-Session workspace and spending policies apply; there is no task-level budget or deadline. See the [task contract](conversations.md#workflow-tasks) for result limits, replay and evidence retrieval.
 
 ## Execution readiness
 
@@ -55,7 +65,7 @@ Session conditions describe separate observations: `RemoteSessionCreated`, `Conf
 | Location | Stored state |
 | --- | --- |
 | Kubernetes | Desired configuration, remote IDs, conditions, safe snapshots, creation claims and finalizers. |
-| Gateway PostgreSQL | Messages, receipts, replay identities, pending input, attempt mappings, saved turns and approvals. |
+| Gateway PostgreSQL | Messages, receipts, replay identities, pending input, attempt mappings, saved turns, approvals, task configuration, member intents and result evidence. |
 | OpenAI | Managed Agent and Session identities and remote turns. |
 | Workspace PVC | Repository files, edits, commits and task artifacts. |
 
@@ -65,7 +75,7 @@ Conversation content and credential values stay out of CR status. PostgreSQL and
 
 Before remote creation, controllers persist a one-time claim. Agent, Session, Vault and VaultCredential recovery uses the Kubernetes UID and verified installation owner scope. Hosted Environment creation needs an independent audit after an uncertain result. Claims and finalizers remain until uncertain outcomes are resolved.
 
-Gateway replicas accept requests concurrently. A database lease elects one delivery worker, and an increasing ownership epoch prevents expired workers from saving results. External functions must deduplicate their saved operation IDs; a database transaction cannot make a remote side effect atomic. Gateway replicas initialize a fresh schema under a PostgreSQL advisory lock.
+Gateway replicas accept requests concurrently. A database lease elects one delivery worker, and an increasing ownership epoch prevents expired workers from saving results. External functions must deduplicate their saved operation IDs; a database transaction cannot make a remote side effect atomic. Gateway replicas initialize or migrate the schema under a PostgreSQL advisory lock, preserving existing records. Task state lives in the same backed-up record store. Task/member archive and purge are unsupported so they cannot erase coordination evidence.
 
 Closing stops fresh input and requests Session deletion. Cleanup always removes the owned remote Session. Workspace policy then controls execution-resource cleanup:
 

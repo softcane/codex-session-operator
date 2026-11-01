@@ -494,7 +494,8 @@ func TestPostgreSQLConversationReadersFailClosedForRecordVersions(t *testing.T) 
 	original := readConversationReceipt(t, conversationRequest(g, http.MethodPost, _conversationPath, "version-data", _postgresConversationInput))
 	id := conversationRecordID(_testNamespace, _testConversationSubject, "version-data")
 	record := readWorkRecord(t, store, id)
-	for _, version := range []int{1, 2, _recordVersion + 1} {
+	dropVersionConstraintForCorruptionTest(t, store, record)
+	for _, version := range []int{1, 2, 3, _recordVersion + 1} {
 		record.Version = version
 		if _, err := store.pool.Exec(t.Context(), "UPDATE gateway_records SET data=$1 WHERE uid=$2", mustJSON(t, record), id); err != nil {
 			t.Fatal("inject inconsistent record version", safeSQLError(err))

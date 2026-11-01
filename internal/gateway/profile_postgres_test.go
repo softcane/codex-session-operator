@@ -80,7 +80,8 @@ func TestPostgreSQLProfileProvenanceReplayRestoreArchiveAndVersionGates(t *testi
 	if replay := readConversationReceipt(t, conversationRequest(next, http.MethodPost, _conversationPath, "profile-durable", _profileTestBody)); !reflect.DeepEqual(receipt, replay) {
 		t.Fatal("archived Profile replay changed acceptance")
 	}
-	for _, version := range []int{1, 2, 4} {
+	dropVersionConstraintForCorruptionTest(t, reopened, archived)
+	for _, version := range []int{1, 2, 3, _recordVersion + 1} {
 		candidate := archived
 		candidate.Version = version
 		if _, err := reopened.pool.Exec(t.Context(), "UPDATE gateway_records SET data=$1 WHERE uid=$2", mustJSON(t, candidate), id); err != nil {

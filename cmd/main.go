@@ -271,6 +271,11 @@ func run() error {
 	}).SetupWithManager(mgr); err != nil {
 		return fmt.Errorf("create Profile controller: %w", err)
 	}
+	if err := (&controller.WorkflowTemplateReconciler{
+		Client: mgr.GetClient(), APIReader: mgr.GetAPIReader(),
+	}).SetupWithManager(mgr); err != nil {
+		return fmt.Errorf("create WorkflowTemplate controller: %w", err)
+	}
 	// +kubebuilder:scaffold:builder
 
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {

@@ -49,6 +49,13 @@ const _statePreparing = "preparing"
 const _usage = `gateway-client --origin HTTP_OR_HTTPS_ORIGIN --namespace NS [--ca-file FILE] [--state-dir DIR] COMMAND
 
 Commands:
+  workflows list [--limit 100] [--after CURSOR] / show NAME
+                                          Discover approved workflows
+  task start --workflow NAME --text-file FILE
+  task read TASK / result TASK RESULT [--output FILE]
+                                          Read task or export verified raw result
+  task continue TASK --text-file FILE      Continue a task
+  task stop TASK                           Stop fresh work and request cleanup
   profiles [list [--limit 100] | show NAME]  Discover approved profiles
   list [--limit 100] [--after CURSOR]       List conversation attempts
   start --profile NAME --text-file FILE    Start a conversation
@@ -122,9 +129,13 @@ func Run(ctx context.Context, args []string, in io.Reader, out, diagnostic io.Wr
 
 func (r *runner) run(ctx context.Context, args []string) (int, error) {
 	switch args[0] {
+	case _commandWorkflows:
+		return r.workflows(ctx, args[1:])
+	case _commandTask:
+		return r.task(ctx, args[1:])
 	case "profiles":
 		return r.profiles(ctx, args[1:])
-	case "list":
+	case _commandList:
 		return r.list(ctx, args[1:])
 	case "read":
 		if len(args) != 2 {
@@ -141,7 +152,7 @@ func (r *runner) run(ctx context.Context, args []string) (int, error) {
 		return 0, r.emit(detail)
 	case "watch":
 		return r.watch(ctx, args[1:])
-	case _commandStart, "continue", _commandClose, _commandFresh:
+	case _commandStart, _commandContinue, _commandClose, _commandFresh:
 		return r.mutate(ctx, args[0], args[1:])
 	case "resume":
 		return r.resume(ctx, args[1:])
@@ -185,7 +196,7 @@ func (r *runner) profiles(ctx context.Context, args []string) (int, error) {
 		}
 		return 0, r.emit(result)
 	}
-	if len(args) > 0 && args[0] == "list" {
+	if len(args) > 0 && args[0] == _commandList {
 		args = args[1:]
 	}
 	flags := commandFlags("profiles list")
@@ -234,7 +245,7 @@ func (r *runner) profiles(ctx context.Context, args []string) (int, error) {
 }
 
 func (r *runner) list(ctx context.Context, args []string) (int, error) {
-	flags := commandFlags("list")
+	flags := commandFlags(_commandList)
 	limit := flags.Int("limit", 100, "page size")
 	after := flags.String("after", "", "next_cursor from a prior listing")
 	if flags.Parse(args) != nil || flags.NArg() != 0 || *limit < 1 || *limit > 100 {
@@ -298,6 +309,9 @@ func (r *runner) mutate(ctx context.Context, command string, args []string) (int
 }
 
 func (r *runner) mutationRequest(command string, args []string) (operation, error) {
+	if strings.HasPrefix(command, "task-") {
+		return r.taskMutationRequest(command, args)
+	}
 	path := r.client.basePath() + "/conversations"
 	if command != _commandStart {
 		if len(args) == 0 {
@@ -360,13 +374,16 @@ func (r *runner) mutationRequest(command string, args []string) (operation, erro
 	}
 	op := operation{ID: id, Command: command, Path: path, Body: body}
 	if command != _commandStart {
-		suffix := map[string]string{"continue": "/messages", _commandClose: "/close", _commandFresh: "/restart"}[command]
+		suffix := map[string]string{_commandContinue: "/messages", _commandClose: "/close", _commandFresh: "/restart"}[command]
 		op.Path += suffix
 	}
 	return op, nil
 }
 
 func (r *runner) freezeBaseline(ctx context.Context, op operation) (operation, error) {
+	if strings.HasPrefix(op.Command, "task-") {
+		return op, nil
+	}
 	if op.Command == _commandStart {
 		op.Attempt = 1
 		return op, nil
@@ -447,8 +464,11 @@ func (r *runner) submit(ctx context.Context, j *journal, op operation) (int, err
 }
 
 func (r *runner) validateReceipt(op operation, value receipt) error {
+	if strings.HasPrefix(op.Command, "task-") {
+		return r.validateTaskReceipt(op, value)
+	}
 	path, err := r.conversationPath(value.ConversationID)
-	if err != nil || path != value.ConversationURL || value.EventID == "" || value.Acceptance != "committed" {
+	if err != nil || path != value.ConversationURL || value.EventID == "" || value.Acceptance != _acceptanceCommitted {
 		return errors.New("receipt identity invalid; retain and resume the saved operation")
 	}
 	expectedAttempt := op.Attempt
@@ -465,6 +485,13 @@ func (r *runner) validateReceipt(op operation, value receipt) error {
 }
 
 func (r *runner) emitReceipt(op operation, value receipt, saved bool) error {
+	if strings.HasPrefix(op.Command, "task-") {
+		return r.emit(map[string]any{_stateField: _stateAccepted, _operationIDField: op.ID,
+			"saved_receipt": saved, "receipt": map[string]any{
+				"task_id": value.TaskID, "task_url": value.TaskURL, "event_id": value.EventID,
+				"received_at": value.ReceivedAt, _acceptanceField: value.Acceptance,
+			}})
+	}
 	result := map[string]any{_stateField: _stateAccepted, _operationIDField: op.ID, "receipt": value,
 		_correlationField: _correlationUnavailable, "saved_receipt": saved}
 	if op.Command == _commandFresh {

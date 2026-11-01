@@ -1,0 +1,50 @@
+# Requires the my-go-project Profile and its application resources.
+# See examples/my-go-project/automation/k8s/. Apply creates no Session or Pod.
+# Execution uses the installation's configured provider; real OpenAI incurs charges.
+apiVersion: agents.softcane.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: go-bugfix
+  namespace: codex-session-operator-system
+spec:
+  coordinator:
+    profileRef:
+      name: my-go-project
+    instructions: |
+      Investigate the user's Go bug. Choose assignments as needed from these
+      roles; you do not need to run every role. Read saved results by exact ID.
+      Cite those IDs in your synthesis and distinguish observations from guesses.
+      Submit a result when useful; keep the task open for follow-up until stop.
+  roles:
+    - name: diagnosis
+      profileRef:
+        name: my-go-project
+      instructions: |
+        Reproduce the bug and identify its cause. Save the commands, observed
+        output, supporting history item IDs and limitations in the diagnosis.
+        Submit the diagnosis explicitly; a completed turn alone is insufficient.
+      outputs:
+        - diagnosis
+    - name: implementation
+      profileRef:
+        name: my-go-project
+      dependsOn:
+        - diagnosis
+      instructions: |
+        Read the exact successful diagnosis result assigned as your prerequisite.
+        Your workspace is separate: do not assume the diagnosis workspace's files
+        are present. Make the fix and return a patch with exact base revision,
+        patch bytes and digest, checks with saved history item IDs, and limitations.
+      outputs:
+        - patch
+    - name: review
+      profileRef:
+        name: my-go-project
+      dependsOn:
+        - implementation
+      instructions: |
+        Read the exact successful implementation result. Inspect the patch against
+        its base revision in your own workspace. Save findings, observed checks
+        with history item IDs, and limitations. Do not claim checks you did not run.
+      outputs:
+        - findings

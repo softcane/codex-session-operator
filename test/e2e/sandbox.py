@@ -95,6 +95,13 @@ def provider_control(checks, body):
     checks.kubectl("exec", "pod/provider-fixture", "-n", NS, "--", "node", "-e", program, json.dumps(body))
 
 
+def workspace_recipe(policy, commits):
+    """Reuse the installed immutable pool/template recipe for this policy."""
+    ensure(policy in ("Delete", "Retain"), "Unknown fixture workspace policy")
+    private = policy == "Retain"
+    return "sandbox-" + policy.lower(), commits["private" if private else "public"], private
+
+
 def profile(checks, name, image, architecture, commit, policy="Delete", private=False, repository_url=None):
     for resource in sandbox_resources.resources(name, NS, image, architecture,
             repository_url or (PRIVATE_URL if private else PUBLIC_URL), commit,
@@ -154,9 +161,8 @@ def run(checks, api, base, report, evidence, runtime, replace_gateway, fixture_c
         value = detail(path)
         return value if value and support.cleaned_up(value) else None
 
-    for policy, private in (("Delete", False), ("Retain", True)):
-        name = "sandbox-" + policy.lower()
-        commit = commits["private" if private else "public"]
+    for policy in ("Delete", "Retain"):
+        name, commit, private = workspace_recipe(policy, commits)
         profile(checks, name, image, architecture, commit, policy, private)
         body = {"route_id": name, "text": "SANDBOX_PROOF: inspect the prepared repository and proof.txt"}
         # Hold preparation before acceptance. The model fixture cannot execute until init qualifies.
@@ -290,6 +296,10 @@ def run(checks, api, base, report, evidence, runtime, replace_gateway, fixture_c
         ensure(checks.get("session", failed["metadata"]["name"]) is None, "Failed preparation left a Session")
         report["scenarios"].append({"id": name + "_held_and_closed_without_delivery", "status": "passed"})
         checks.kubectl("delete", "profile/" + name, "environment/" + name, "-n", NS, "--wait=true", "--timeout=120s")
+        if private:
+            # The rejection fixture deliberately replaced this Secret. Later
+            # journeys reuse the approved private recipe with the original token.
+            checks.secret("codex-repository", {"token": checks.keys["repository-token"]})
 
 
 def read_only_probe(checks, image, claim):

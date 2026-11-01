@@ -1,0 +1,81 @@
+# Requires the registered my-go-maintainer Agent and approved my-go-project-v1
+# SandboxWarmPool from examples/my-go-project/automation/k8s/ in this namespace.
+# Execution uses the configured provider; real OpenAI incurs charges.
+# Applying these resources starts no task. The research pilot is a configuration
+# target, not observed proof of argument/experiment/review/synthesis execution.
+apiVersion: agents.softcane.io/v1alpha1
+kind: Environment
+metadata:
+  name: research-retain
+  namespace: codex-session-operator-system
+spec:
+  mode: SelfHosted
+  deletionPolicy: Delete
+  selfHosted:
+    sandboxPoolRef:
+      name: my-go-project-v1
+    capabilityDirectories:
+      - /capabilities/my-go-project
+    workspace:
+      directory: /workspace
+      deletionPolicy: Retain
+---
+apiVersion: agents.softcane.io/v1alpha1
+kind: Profile
+metadata:
+  name: research
+  namespace: codex-session-operator-system
+spec:
+  agentRef:
+    name: my-go-maintainer
+  environmentRef:
+    name: research-retain
+  spendControl:
+    mode: Unlimited
+  vaultRefs: []
+---
+apiVersion: agents.softcane.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: research
+  namespace: codex-session-operator-system
+spec:
+  coordinator:
+    profileRef:
+      name: research
+    instructions: |
+      Check the supplied argument and reproduce its bounded numerical example.
+      Assign argument checking and numerical reproduction in parallel, then request
+      independent review of both saved results. Write the final synthesis yourself,
+      citing exact saved result IDs. Distinguish checked statements, numerical
+      observations, conjectures and unresolved gaps.
+      Keep workspaces available for follow-up until the user explicitly stops.
+  roles:
+    - name: argument
+      profileRef:
+        name: research
+      instructions: |
+        Check the supplied argument, its assumptions and each claimed step.
+        Save calculations, justified statements, conjectures and unresolved gaps.
+      outputs:
+        - argument
+    - name: experiment
+      profileRef:
+        name: research
+      instructions: |
+        Reproduce the supplied bounded numerical example in your own workspace.
+        Work independently of the argument checker. Save methods, observations, commands,
+        source history item IDs and limitations. Do not infer shared files.
+      outputs:
+        - observations
+    - name: review
+      profileRef:
+        name: research
+      dependsOn:
+        - argument
+        - experiment
+      instructions: |
+        Read both exact successful prerequisite results. Challenge assumptions,
+        methods and inferences. Save findings and the limits of the available evidence.
+      outputs:
+        - findings
