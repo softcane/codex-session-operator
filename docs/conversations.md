@@ -56,7 +56,7 @@ Each accepted Session keeps its Profile-derived workspace policy. `Delete` remov
 
 The 16 MiB stored-record boundary still applies. Open task and member records reserve 2 KiB for cleanup; member submission logs also reserve one cleanup cancellation beyond the ordinary input limit. Capacity failures hold fresh work without erasing earlier evidence. WorkflowTemplate adds no team budget or task deadline; spending remains per Session. Task and member records are included in logical backups and protected from archive/purge, which are explicitly unsupported for these records. Restore holds block fresh task effects while allowing reads and exact replay.
 
-The [Go bugfix](../examples/workflows/go-bugfix.yaml) and [research](../examples/workflows/research.yaml) files configure these choices. The full argument/experiment/review/synthesis research journey remains a later pilot target. Simulated-provider verification exercises transport and lifecycle behavior; it does not establish real-model collaboration, billing or production termination behavior.
+The [Go bugfix](../examples/workflows/go-bugfix.yaml) and [research](../examples/workflows/research.yaml) files configure these choices. The isolated suite dispatches argument and experiment assignments before either finishes, transfers their exact saved results to a separate reviewer, and saves coordinator synthesis referencing all three reports. It checks actual bounded computations and retained workspace files through the production CLI, gateway, PostgreSQL and Sandbox resources. Inference is controlled; this does not establish scientific validity, real-model collaboration, billing or production termination behavior.
 
 ## Profiles
 

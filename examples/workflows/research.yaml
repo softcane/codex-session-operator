@@ -1,8 +1,9 @@
 # Requires the registered my-go-maintainer Agent and approved my-go-project-v1
 # SandboxWarmPool from examples/my-go-project/automation/k8s/ in this namespace.
 # Execution uses the configured provider; real OpenAI incurs charges.
-# Applying these resources starts no task. The research pilot is a configuration
-# target, not observed proof of argument/experiment/review/synthesis execution.
+# Applying these resources starts no task. The isolated test suite exercises this
+# role/dependency shape with controlled inference and real workspaces/computation.
+# It does not establish scientific validity or live-model collaboration.
 apiVersion: agents.softcane.io/v1alpha1
 kind: Environment
 metadata:

@@ -9,6 +9,7 @@ import json
 import cli
 import sandbox
 import support
+import research
 
 NS, ensure = support.NS, support.ensure
 
@@ -189,3 +190,5 @@ def run(checks, api, base, directory, certificate, report, evidence, run_id, run
         checks.kubectl("delete", "workflowtemplate/" + workflow, "profile/" + name, "environment/" + name,
                        "-n", NS, "--wait=true", "--timeout=120s")
     report["checks"]["workflowFirstDelegationProductionCLIPostgreSQLSandbox"] = True
+
+    research.run(checks, api, base, directory, certificate, report, evidence, run_id, runtime, fixture_counts)

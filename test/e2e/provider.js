@@ -18,7 +18,13 @@ function finishJob(job, result, unknown=false) {
     content:[{type:'output_text',text:unknown?'Interrupted command outcome is unknown; no automatic replay':'Simulated executor observed actual Pod files and test output'}]});
   session.turns.find(turn=>turn.id===job.turn_id).status=unknown||result.exit_code!==0?'failed':'completed';
   session.remote.status='idle';executorCommands++;executorJobs.delete(job.id);
-  if(!unknown && session.workflowMember) {
+  if(!unknown && session.researchRole) {
+    workflowAction(session,job.turn_id,'workflow_result',{outcome:result.exit_code===0?'success':'failed',outputs:[{
+      name:{argument:'argument',experiment:'observations',review:'findings'}[session.researchRole],content:result.output,
+      checks:[{command:item.command,output:item.output,exit_code:result.exit_code,source_item_id:item.id}],
+      limitations:'Bounded integer fixture, controlled inference; no general scientific validation.'}],
+      references:session.researchReferences||[]});
+  } else if(!unknown && session.workflowMember) {
     const content='Actual workspace diagnosis: '+result.output;
     workflowAction(session,job.turn_id,'workflow_result',{outcome:'success',outputs:[{name:'diagnosis',content,
       checks:[{command:item.command,output:item.output,exit_code:result.exit_code,source_item_id:item.id}],
@@ -58,8 +64,9 @@ function publicAuth(auth) {
 // These branches replace only inference. Required actions travel through the same
 // provider API as model actions; the gateway still owns admission and all state.
 function workflowAction(session, turn, name, args) {
-  const call={type:'function_call',turn_id:turn,call_id:'call_'+turn+'_'+name,name,arguments:args};
-  session.remote.required_actions=[call];session.remote.status='requires_action';
+  session.callSequence=(session.callSequence||0)+1;
+  const call={type:'function_call',turn_id:turn,call_id:'call_'+turn+'_'+name+'_'+session.callSequence,name,arguments:args};
+  session.remote.required_actions.push(call);session.remote.status='requires_action';
   Object.assign(session.turns.find(value=>value.id===turn),{status:'requires_action',session_id:session.id,subagent_id:null});
   emit(session.id,{type:'agent.session.requires_action',session_id:session.id});
 }
@@ -68,22 +75,82 @@ function workflowOutput(session,event) {
   if(!action)return;
   session.items.push({id:'tool_'+event.call_id,type:'message',role:'assistant',turn_id:event.turn_id,
     content:[{type:'output_text',text:JSON.stringify({tool:action.name,arguments:action.arguments,success:event.success,output:event.output,error:event.error})}]});
-  session.remote.required_actions=[];session.remote.status='idle';
-  session.turns.find(value=>value.id===event.turn_id).status=event.success?'completed':'failed';
-  emit(session.id,{type:'agent.session.completed',session_id:session.id});
+  session.remote.required_actions=session.remote.required_actions.filter(value=>value!==action);
+  session.remote.status=session.remote.required_actions.length?'requires_action':'idle';
+  const pending=session.remote.required_actions.some(value=>value.turn_id===event.turn_id);
+  session.turns.find(value=>value.id===event.turn_id).status=pending?'requires_action':event.success?'completed':'failed';
+  if(event.success && action.name==='workflow_read_result' && session.researchCoordinator) {
+    const role=Object.keys(session.researchResults).find(key=>session.researchResults[key]===action.arguments.result_id);
+    session.researchRead[role]=event.output;
+    if(session.researchRead.argument && session.researchRead.experiment && !session.reviewDelegated) {
+      session.reviewDelegated=true;
+      const ids=[session.researchResults.argument,session.researchResults.experiment];
+      workflowAction(session,event.turn_id,'workflow_delegate',{role:'review',text:'RESEARCH_REVIEW '+JSON.stringify(ids),dependencies:ids});
+    }
+    if(role==='review' && !session.synthesisSubmitted) {
+      session.synthesisSubmitted=true;
+      workflowAction(session,event.turn_id,'workflow_result',{outcome:'success',outputs:[{name:'synthesis',
+        content:JSON.stringify({claim:'sum of first n odd integers = n squared',bounded_n:1000,
+          worker_results:session.researchResults,conclusion:'Bounded computations and supplied argument reviewed; controlled fixture only.'}),
+        limitations:'Controlled inference and finite computations do not prove arbitrary scientific claims.'}],
+        references:['argument','experiment','review'].map(key=>session.researchResults[key])});
+    }
+  }
+  if(event.success && action.name==='workflow_read_result' && session.researchRole==='review') {
+    session.researchRead[action.arguments.result_id]=event.output;
+    if(session.researchReferences.every(id=>id in session.researchRead) && !session.researchCommandQueued) {
+      session.researchCommandQueued=true;researchJob(session,event.turn_id);
+    }
+  }
+  if(!session.remote.required_actions.length && session.remote.status!=='in_progress')emit(session.id,{type:'agent.session.completed',session_id:session.id});
+}
+function researchJob(session,turn) {
+  const input={role:session.researchRole,references:session.researchReferences||[],evidence:session.researchRead||{}};
+  const program=`const fs=require('node:fs'),os=require('node:os');const input=${JSON.stringify(input)};
+const max=1000;let verified=true;const samples=[];
+for(let n=0;n<=max;n++){let value;
+ if(input.role==='argument'){value=n===0?0n:BigInt(n)*BigInt(n)-BigInt(n-1)*BigInt(n-1);if(n>0 && value!==2n*BigInt(n)-1n)verified=false;}
+ else {value=0n;for(let k=1;k<=n;k++)value+=2n*BigInt(k)-1n;if(value!==BigInt(n)*BigInt(n))verified=false;}
+ if([0,1,2,10,1000].includes(n))samples.push({n,value:String(value)});
+}
+if(input.role==='review')for(const id of input.references){const raw=JSON.parse(input.evidence[id]);const report=JSON.parse(raw.outputs[0].content);if(!report.verified||report.max_n!==max||report.case_count!==max+1)verified=false;for(const sample of report.samples){const n=BigInt(sample.n),expected=report.role==='argument'?(n===0n?0n:2n*n-1n):n*n;if(sample.value!==String(expected))verified=false;}}
+const report={role:input.role,hostname:os.hostname(),cwd:process.cwd(),claim:'sum of first n odd integers = n squared',max_n:max,case_count:max+1,verified,samples,references:input.references};
+fs.writeFileSync('research-report.json',JSON.stringify(report));console.log(JSON.stringify(report));if(!verified)process.exitCode=1;`;
+  session.turns.find(value=>value.id===turn).status='in_progress';session.remote.status='in_progress';
+  executorJobs.set(session.remote.environment.id+':'+turn,{id:session.remote.environment.id+':'+turn,
+    environment_id:session.remote.environment.id,session_id:session.id,turn_id:turn,
+    argv:['node','-e',program],timeout_ms:15000,claimed:false,started:false});
 }
 function message(session, text) {
   const turn = 'turn_' + (session.turns.length + 1);
   session.items.push({id: 'user_' + turn, type: 'message', role: 'user', turn_id: turn,
     content: [{type: 'input_text', text}]});
   messageCommits++;
+  if(text.includes('RESEARCH_PILOT')) {
+    session.researchCoordinator=true;session.researchResults={};session.researchRead={};
+    session.turns.push({id:turn,status:'in_progress',session_id:session.id,subagent_id:null});
+    for(const role of ['argument','experiment'])workflowAction(session,turn,'workflow_delegate',{
+      role,text:'RESEARCH_'+role.toUpperCase()+' supplied telescoping argument: 2k-1=k²-(k-1)²; compute n=0..1000.',dependencies:[]});
+    return;
+  }
+  const research=text.match(/^RESEARCH_(ARGUMENT|EXPERIMENT|REVIEW)\b/);
+  if(research) {
+    session.researchRole=research[1].toLowerCase();session.researchRead={};
+    session.turns.push({id:turn,status:'in_progress',session_id:session.id,subagent_id:null});
+    if(session.researchRole==='review') {
+      session.researchReferences=JSON.parse(text.split('\n',1)[0].slice('RESEARCH_REVIEW '.length));
+      for(const id of session.researchReferences)workflowAction(session,turn,'workflow_read_result',{result_id:id});
+    } else researchJob(session,turn);
+    return;
+  }
   if(text.includes('WORKFLOW_FIRST_DELEGATION')) {
     session.turns.push({id:turn,status:'in_progress',session_id:session.id,subagent_id:null});
     workflowAction(session,turn,'workflow_delegate',{role:'diagnose',text:'WORKFLOW_DIAGNOSIS: inspect the actual repository and run its test.',dependencies:[]});
     return;
   }
-  const savedResult=text.match(/^Saved workflow result (\S+) from assignment /);
+  const savedResult=text.match(/^Saved workflow result (\S+) from assignment \S+ \(([^)]+)\)/);
   if(savedResult) {
+    if(session.researchCoordinator)session.researchResults[savedResult[2]]=savedResult[1];
     session.turns.push({id:turn,status:'in_progress',session_id:session.id,subagent_id:null});
     workflowAction(session,turn,'workflow_read_result',{result_id:savedResult[1]});
     return;

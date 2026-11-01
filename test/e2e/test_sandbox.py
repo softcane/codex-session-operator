@@ -21,9 +21,29 @@ import reporting
 import support
 import sandbox
 import workflow
+import research
 
 
 class SandboxEvidenceTests(unittest.TestCase):
+    def test_research_report_preserves_newlines_and_exact_reference_scope(self):
+        actual = {"role": "review", "hostname": "review-pod", "cwd": "/workspace", "verified": True,
+                  "max_n": 1000, "case_count": 1001, "references": ["arg", "exp"], "note": "line one\nline two",
+                  "samples": [{"n": n, "value": str(n*n)} for n in (0, 1, 2, 10, 1000)]}
+        command = {"output": json.dumps(actual) + "\n", "exit_code": 0}
+        research.check_report(actual, command, "review", "review-pod", ["arg", "exp"])
+        for refs in (["arg"], ["exp", "arg"], ["arg", "foreign"]):
+            with self.assertRaisesRegex(RuntimeError, "Research saved command differs"):
+                research.check_report(actual, command, "review", "review-pod", refs)
+        for field, value in (("verified", False), ("max_n", 999), ("case_count", 1000),
+                             ("samples", [{"n": 1000, "value": "999999"}])):
+            changed = dict(actual, **{field: value})
+            with self.assertRaisesRegex(RuntimeError, "Research saved command differs"):
+                research.check_report(changed, {"output": json.dumps(changed), "exit_code": 0},
+                                      "review", "review-pod", ["arg", "exp"])
+        changed = dict(actual, note="truncated")
+        with self.assertRaisesRegex(RuntimeError, "Research saved command differs"):
+            research.check_report(changed, command, "review", "review-pod", ["arg", "exp"])
+
     def test_baseline_and_workflow_reuse_exact_immutable_workspace_recipes(self):
         commits = {"public": "public-commit", "private": "private-commit"}
         self.assertEqual(sandbox.workspace_recipe("Delete", commits), ("sandbox-delete", "public-commit", False))

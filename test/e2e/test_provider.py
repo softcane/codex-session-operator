@@ -100,6 +100,109 @@ class LifecycleFixtureContractTests(unittest.TestCase):
         self.assertEqual(read["name"], "workflow_read_result")
         self.assertEqual(read["arguments"], {"result_id": "result-saved"})
 
+    def test_research_parallel_actions_review_reads_and_synthesis_exact_references(self):
+        def create():
+            session = self.post(SESSIONS, {"environment": {"type": "self_hosted"}})
+            return session, SESSIONS + "/" + session["id"]
+
+        def message(path, text):
+            self.request("POST", path + "/events", {"events": [{"type": "agent.session.input.message",
+                "input": [{"content": [{"text": text}]}]}]})
+
+        def answer(path, action, output):
+            self.request("POST", path + "/events", {"events": [{"type": "agent.session.input.tool_result",
+                "turn_id": action["turn_id"], "call_id": action["call_id"], "success": True, "output": output}]})
+
+        def compute(session, path):
+            job = self.read("/executor/commands?environment_id=" + session["environment"]["id"])[0]
+            completed = subprocess.run(job["argv"], cwd=self.directory.name, capture_output=True, text=True, timeout=10)
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            actual = json.loads((Path(self.directory.name) / "research-report.json").read_text())
+            self.assertEqual(json.loads(completed.stdout), actual)
+            self.post("/executor/result", {"environment_id": session["environment"]["id"], "id": job["id"],
+                "exit_code": completed.returncode, "output": completed.stdout, "cwd": self.directory.name})
+            action = self.read(path)["required_actions"][0]
+            self.assertEqual(action["name"], "workflow_result")
+            self.assertTrue(json.loads(action["arguments"]["outputs"][0]["content"])["verified"])
+            return action
+
+        coordinator, path = create()
+        message(path, "RESEARCH_PILOT")
+        delegates = self.read(path)["required_actions"]
+        self.assertEqual([item["arguments"]["role"] for item in delegates], ["argument", "experiment"])
+        self.assertNotEqual(delegates[0]["call_id"], delegates[1]["call_id"])
+        self.assertEqual(delegates[0]["turn_id"], delegates[1]["turn_id"])
+        answer(path, delegates[0], '{}')
+        self.assertEqual(self.read(path)["required_actions"], [delegates[1]])
+        answer(path, delegates[1], '{}')
+        workers = []
+        for delegate in delegates:
+            worker, worker_path = create()
+            message(worker_path, delegate["arguments"]["text"])
+            workers.append((worker, worker_path))
+        self.assertEqual(len(self.read("/counts")["jobs"]), 2)
+        results = {}
+        review_delegate = None
+        for index, (worker, worker_path) in enumerate(workers):
+            role = delegates[index]["arguments"]["role"]
+            action = compute(worker, worker_path)
+            identifier = "result-" + role
+            raw = json.dumps(action["arguments"], separators=(",", ":"))
+            results[identifier] = raw
+            answer(worker_path, action, json.dumps({"result_id": identifier}))
+            message(path, f"Saved workflow result {identifier} from assignment member-{role} ({role}) has outcome success.")
+            read = self.read(path)["required_actions"][0]
+            self.assertEqual(read["arguments"], {"result_id": identifier})
+            answer(path, read, raw)
+            if index == 0:
+                self.assertEqual(self.read(path)["required_actions"], [])
+            else:
+                review_delegate = self.read(path)["required_actions"][0]
+        self.assertEqual(review_delegate["arguments"]["dependencies"], ["result-argument", "result-experiment"])
+        answer(path, review_delegate, '{}')
+        reviewer, reviewer_path = create()
+        reviewer_input = review_delegate["arguments"]["text"] + ("\n\nExact prerequisite saved result IDs: " +
+            json.dumps(["result-argument", "result-experiment"]) + ". Read these with workflow_read_result before using their evidence.")
+        message(reviewer_path, reviewer_input)
+        reads = self.read(reviewer_path)["required_actions"]
+        self.assertEqual({item["arguments"]["result_id"] for item in reads}, set(results))
+        self.assertNotEqual(reads[0]["call_id"], reads[1]["call_id"])
+        answer(reviewer_path, reads[0], results[reads[0]["arguments"]["result_id"]])
+        self.assertEqual(self.read(reviewer_path)["required_actions"], [reads[1]])
+        answer(reviewer_path, reads[1], results[reads[1]["arguments"]["result_id"]])
+        review = compute(reviewer, reviewer_path)
+        self.assertEqual(review["arguments"]["references"], ["result-argument", "result-experiment"])
+        answer(reviewer_path, review, '{"result_id":"result-review"}')
+        message(path, "Saved workflow result result-review from assignment member-review (review) has outcome success.")
+        read = self.read(path)["required_actions"][0]
+        answer(path, read, json.dumps(review["arguments"]))
+        synthesis = self.read(path)["required_actions"][0]
+        self.assertEqual(synthesis["name"], "workflow_result")
+        self.assertEqual(synthesis["arguments"]["references"], ["result-argument", "result-experiment", "result-review"])
+        self.assertEqual(synthesis["arguments"]["outputs"][0]["name"], "synthesis")
+        # Execute the same reviewer with corrupt referenced evidence. This must
+        # fail even when the worker claimed success and the current computation
+        # itself still matches the supplied bounded mathematical claim.
+        for corruption in ("verified", "sample"):
+            bad, bad_path = create()
+            message(bad_path, reviewer_input)
+            bad_reads = self.read(bad_path)["required_actions"]
+            changed = json.loads(results["result-experiment"])
+            report = json.loads(changed["outputs"][0]["content"])
+            if corruption == "verified":
+                report["verified"] = False
+            else:
+                report["samples"][-1]["value"] = "999999"
+            changed["outputs"][0]["content"] = json.dumps(report)
+            for read_action in bad_reads:
+                result_id = read_action["arguments"]["result_id"]
+                answer(bad_path, read_action, json.dumps(changed) if result_id == "result-experiment" else results[result_id])
+            job = self.read("/executor/commands?environment_id=" + bad["environment"]["id"])[0]
+            failed = subprocess.run(job["argv"], cwd=self.directory.name, capture_output=True, text=True, timeout=10)
+            self.assertEqual(failed.returncode, 1, failed.stderr)
+            self.assertFalse(json.loads(failed.stdout)["verified"])
+
+
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory(prefix="codex-lifecycle-fixture-")
         self.addCleanup(self.directory.cleanup)

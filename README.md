@@ -220,7 +220,7 @@ Optional `Vault` and `VaultCredential` CRs supply credentials for connected prov
 
 A `WorkflowTemplate` lets a coordinator choose assignments from configured roles. Each accepted member gets its own Session and workspace. Applying a template starts no execution. Roles and output names are application choices; a workflow does not automatically run every role.
 
-See the [Go bugfix](examples/workflows/go-bugfix.yaml) and [research](examples/workflows/research.yaml) configuration examples, then use the [task API and CLI](docs/conversations.md#workflow-tasks). Tasks preserve saved evidence and stay open until explicit stop. Each Session keeps its Profile spending and workspace policy. These examples do not establish a deployed multi-agent research result.
+See the [Go bugfix](examples/workflows/go-bugfix.yaml) and [research](examples/workflows/research.yaml) configuration examples, then use the [task API and CLI](docs/conversations.md#workflow-tasks). Tasks preserve saved evidence and stay open until explicit stop. Each Session keeps its Profile spending and workspace policy. The isolated suite verifies parallel research assignments, independent review, coordinator synthesis and retained files with controlled inference; it does not qualify live-model collaboration or scientific validity.
 
 ## Documentation
 
