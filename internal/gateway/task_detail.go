@@ -21,6 +21,11 @@ func (g *Gateway) taskDetail(ctx context.Context, record Record) (any, error) {
 	if record.Task == nil {
 		return nil, errors.New("task required")
 	}
+	deliveryErr := g.deliveryEnabled(ctx)
+	if deliveryErr != nil && !errors.Is(deliveryErr, errRestoreHeld) {
+		return nil, deliveryErr
+	}
+	deliveryHeld := record.DeliveryHeld || errors.Is(deliveryErr, errRestoreHeld)
 	task := record.Task
 	members := make([]map[string]any, 0, len(task.Members))
 	results := make([]map[string]any, 0, len(task.Results))
@@ -76,7 +81,7 @@ func (g *Gateway) taskDetail(ctx context.Context, record Record) (any, error) {
 			}
 			detail["provider_status"] = history.History.Status
 			detail["provider_turns"] = taskTurnSummaries(history.History.Turns)
-			detail["recovery_required"] = history.RecoveryRequired || child.DeliveryHeld || history.DeliveryHeld
+			detail["recovery_required"] = conversationRecovery(attempt, ConversationDetail{RecoveryRequired: history.RecoveryRequired}, history).Required || child.DeliveryHeld || history.DeliveryHeld
 			if history.LastError != "" {
 				detail["last_error"] = history.LastError
 			}
@@ -113,7 +118,7 @@ func (g *Gateway) taskDetail(ctx context.Context, record Record) (any, error) {
 		}
 		members = append(members, detail)
 	}
-	return map[string]any{"id": task.ID, "state": task.State, "workflow": map[string]any{"name": task.Workflow.Name, "uid": task.Workflow.UID, "generation": task.Workflow.Generation, "digest": task.Workflow.Digest}, "members": members, "results": results, "last_error": task.LastError, "delivery_held": record.DeliveryHeld}, nil
+	return map[string]any{"id": task.ID, "state": task.State, "workflow": map[string]any{"name": task.Workflow.Name, "uid": task.Workflow.UID, "generation": task.Workflow.Generation, "digest": task.Workflow.Digest}, "members": members, "results": results, "last_error": task.LastError, "delivery_held": deliveryHeld}, nil
 }
 
 func taskTurnSummaries(turns []json.RawMessage) []map[string]string {

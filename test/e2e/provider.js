@@ -4,6 +4,7 @@ const agents = new Map(), vaults = new Map(), sessions = new Map();
 const templates = new Map(), runtimes = new Map(), credentials = new Map();
 const executorJobs = new Map();
 const eventStreams = new Map();
+const heldToolResponses = new Map(), toolResultCommits = new Map();
 let executorCommands = 0, executorStarts = 0;
 function finishJob(job, result, unknown=false) {
   const session=sessions.get(job.session_id);
@@ -26,7 +27,7 @@ function finishJob(job, result, unknown=false) {
       references:session.researchReferences||[]});
   } else if(!unknown && session.workflowMember) {
     const content='Actual workspace diagnosis: '+result.output;
-    workflowAction(session,job.turn_id,'workflow_result',{outcome:'success',outputs:[{name:'diagnosis',content,
+    workflowAction(session,job.turn_id,'workflow_result',{outcome:result.exit_code===0?'success':'failed',outputs:[{name:'diagnosis',content,
       checks:[{command:item.command,output:item.output,exit_code:result.exit_code,source_item_id:item.id}],
       limitations:'Controlled model fixture; command output is from the deployed executor.'}]});
   } else if(!unknown)emit(session.id,{type:'agent.session.completed',session_id:session.id});
@@ -79,6 +80,9 @@ function workflowOutput(session,event) {
   session.remote.status=session.remote.required_actions.length?'requires_action':'idle';
   const pending=session.remote.required_actions.some(value=>value.turn_id===event.turn_id);
   session.turns.find(value=>value.id===event.turn_id).status=pending?'requires_action':event.success?'completed':'failed';
+  if(event.success && action.name==='workflow_read_result' && session.workflowFault==='FAIL') {
+    workflowAction(session,event.turn_id,'workflow_delegate',{role:'review',text:'Review the failed diagnosis.',dependencies:[action.arguments.result_id]});
+  }
   if(event.success && action.name==='workflow_read_result' && session.researchCoordinator) {
     const role=Object.keys(session.researchResults).find(key=>session.researchResults[key]===action.arguments.result_id);
     session.researchRead[role]=event.output;
@@ -126,6 +130,15 @@ function message(session, text) {
   session.items.push({id: 'user_' + turn, type: 'message', role: 'user', turn_id: turn,
     content: [{type: 'input_text', text}]});
   messageCommits++;
+  const workflowFault=text.match(/^WORKFLOW_FAULT_(ACK|PENDING|LONG|STOP|OBSERVE|MISSING|FAIL)\b/);
+  if(workflowFault) {
+    session.workflowFault=workflowFault[1];
+    session.turns.push({id:turn,status:'in_progress',session_id:session.id,subagent_id:null});
+    if(session.workflowFault==='PENDING')Object.assign(control,{sessionGetStatus:503,sessionFaultID:session.id});
+    const text=['LONG','STOP'].includes(session.workflowFault)?'SANDBOX_LONG_COMMAND WORKFLOW_DIAGNOSIS':
+      session.workflowFault==='FAIL'?'WORKFLOW_DIAGNOSIS_FAIL':'WORKFLOW_DIAGNOSIS: inspect actual repository';
+    workflowAction(session,turn,'workflow_delegate',{role:'diagnose',text,dependencies:[]});return;
+  }
   if(text.includes('RESEARCH_PILOT')) {
     session.researchCoordinator=true;session.researchResults={};session.researchRead={};
     session.turns.push({id:turn,status:'in_progress',session_id:session.id,subagent_id:null});
@@ -156,6 +169,7 @@ function message(session, text) {
     return;
   }
   if(text.includes('WORKFLOW_DIAGNOSIS'))session.workflowMember=true;
+  if(text.includes('WORKFLOW_DIAGNOSIS_FAIL'))session.workflowFail=true;
   if (session.remote.environment.type === 'self_hosted') {
     session.turns.push({id: turn, status: 'in_progress',...(session.workflowMember?{session_id:session.id,subagent_id:null}:{})});
     session.remote.status = 'in_progress';
@@ -165,9 +179,10 @@ const nonce=fs.existsSync('proof.txt')?fs.readFileSync('proof.txt','utf8'):'';
 const baseline=cp.spawnSync('node',['--test','checkout.test.js'],{encoding:'utf8'});
 const value={nonce,hostname:os.hostname(),cwd:process.cwd(),test_exit:baseline.status,output:baseline.stdout+baseline.stderr};
 fs.writeFileSync('fixture-report.json',JSON.stringify(value));console.log(JSON.stringify(value));`;
+    const actualProgram=program+(session.workflowFail?'\nprocess.exitCode=1;':'');
     executorJobs.set(session.remote.environment.id + ':' + turn, {id:session.remote.environment.id + ':' + turn,
       environment_id:session.remote.environment.id,session_id:session.id,turn_id:turn,
-      argv:['node','-e',program,session.remote.environment.id+':'+turn],timeout_ms:interrupted?30000:15000,claimed:false,started:false});
+      argv:['node','-e',actualProgram,session.remote.environment.id+':'+turn],timeout_ms:interrupted?(session.workflowMember?120000:30000):15000,claimed:false,started:false});
     return;
   }
   session.items.push({id: 'assistant_' + turn, type: 'message', role: 'assistant', turn_id: turn,
@@ -222,6 +237,10 @@ http.createServer(async (req, res) => {
     return reply(res,200,{ok:true});
   }
   if (url.pathname === '/control') {
+    if (body.releaseToolResponses || body.reset) {
+      for(const responses of heldToolResponses.values())for(const response of responses)response.destroy();
+      heldToolResponses.clear();control.heldToolIdentity=null;
+    }
     if (body.reset) control = {};
     control = {...control, ...body};
     if (body.dropStreams) for (const streams of eventStreams.values()) for (const response of streams) response.destroy();
@@ -233,6 +252,8 @@ http.createServer(async (req, res) => {
   }
   if (url.pathname === '/counts') return reply(res, 200, {creates, deletes, eventPosts, messageCommits,
     agentCreates, vaultCreates, templateCreates, credentialCreates, credentialWrites, executorCommands, executorStarts,
+    toolResultCommits:[...toolResultCommits.values()],heldToolResponses:[...heldToolResponses.keys()],
+    pendingWorkflowActions:[...sessions.values()].flatMap(session=>session.remote.required_actions.filter(action=>action.name.startsWith('workflow_')).map(action=>({session_id:session.id,call_id:action.call_id,turn_id:action.turn_id,name:action.name}))),
     jobs:[...executorJobs.values()].map(job=>({id:job.id,session_id:job.session_id,turn_id:job.turn_id,started:job.started,instance:job.instance})),
     agents: [...agents.values()].map(a => ({id: a.id, name: a.name, metadata: a.metadata})),
     vaults: [...vaults.values()].map(v => ({id: v.id, metadata: v.metadata})),
@@ -368,8 +389,20 @@ http.createServer(async (req, res) => {
       object.keys.set(key, JSON.stringify(body));
       for (const event of body.events || []) {
         if (event.type === 'agent.session.input.message') message(object, event.input[0].content[0].text);
-        if (event.type === 'agent.session.input.tool_result') workflowOutput(object,event);
+        if (event.type === 'agent.session.input.tool_result') {
+          const action=object.remote.required_actions.find(value=>value.call_id===event.call_id);
+          const identity=object.id+':'+event.call_id;
+          toolResultCommits.set(identity,{session_id:object.id,call_id:event.call_id,turn_id:event.turn_id,name:action?.name||'',accepted:(toolResultCommits.get(identity)?.accepted||0)+1});
+          workflowOutput(object,event);
+        }
       }
+    }
+    const toolEvent=(body.events||[]).find(event=>event.type==='agent.session.input.tool_result');
+    const committed=toolEvent && toolResultCommits.get(object.id+':'+toolEvent.call_id);
+    if(committed && ((!previous && control.holdToolResultName===committed.name) || control.heldToolIdentity===object.id+':'+toolEvent.call_id)) {
+      control.holdToolResultName=null;control.heldToolIdentity=object.id+':'+toolEvent.call_id;
+      if(!heldToolResponses.has(control.heldToolIdentity))heldToolResponses.set(control.heldToolIdentity,new Set());
+      heldToolResponses.get(control.heldToolIdentity).add(res);return;
     }
     if (control.loseInput) { control.loseInput = false; req.socket.destroy(); return; }
     res.writeHead(204); res.end(); return;

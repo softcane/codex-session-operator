@@ -22,9 +22,114 @@ import support
 import sandbox
 import workflow
 import research
+import workflow_faults
 
 
 class SandboxEvidenceTests(unittest.TestCase):
+    def test_workflow_ack_requires_matching_attempted_unaccepted_tool_submission(self):
+        pending = {"event": {"call_id": "call"}, "accepted": False, "attempted_at": "timestamp"}
+        self.assertEqual(workflow_faults.unacknowledged_tool({"submissions": [pending]}, "call"), pending)
+        for value in (dict(pending, accepted=True), dict(pending, attempted_at=None),
+                      dict(pending, event={"call_id": "other"})):
+            self.assertIsNone(workflow_faults.unacknowledged_tool({"submissions": [value]}, "call"))
+
+    def test_research_intents_wait_for_all_public_mappings_without_inventing_readiness(self):
+        intents = {"members": [{"id": "coordinator", "is_coordinator": True},
+                               {"id": "argument", "is_coordinator": False},
+                               {"id": "experiment", "is_coordinator": False}]}
+        self.assertIsNone(research.mapped_task(intents, 3))
+        mapped = {"members": [dict(member, conversation_url="/conversations/conv-" + member["id"],
+                                   session_uid="uid-" + member["id"], execution_ready=False)
+                               for member in intents["members"]]}
+        self.assertEqual(research.mapped_task(mapped, 3), mapped)
+        for index in range(3):
+            for field in ("conversation_url", "session_uid"):
+                partial = {"members": [dict(member) for member in mapped["members"]]}
+                partial["members"][index].pop(field)
+                self.assertIsNone(research.mapped_task(partial, 3))
+                partial["members"][index][field] = ""
+                self.assertIsNone(research.mapped_task(partial, 3))
+        for value in (None, {}, {"members": None}, {"members": []}):
+            self.assertIsNone(research.mapped_task(value, 3))
+        self.assertIsNone(research.mapped_task(mapped, 4))
+
+    def test_fault_history_polling_waits_for_nullable_and_exact_saved_root(self):
+        job = {"id": "job", "session_id": "remote", "turn_id": "turn", "started": False}
+        snapshot = {"jobs": [job]}
+        for detail in (None, {}, {"history": None}, {"history": {}}, {"history": {"turns": None}}, {"history": {"turns": []}}):
+            self.assertIsNone(workflow_faults.held_worker_input(detail, snapshot, "remote"))
+        detail = {"history": {"turns": [{"id": "turn", "status": "in_progress"}]}}
+        self.assertEqual(workflow_faults.held_worker_input(detail, snapshot, "remote")["job"], job)
+        for changed in ({"jobs": []}, {"jobs": None}, {"jobs": [dict(job, started=True)]},
+                        {"jobs": [dict(job, session_id="other")]}, {"jobs": [dict(job, turn_id="other")]},
+                        {"jobs": [job, dict(job)]}):
+            self.assertIsNone(workflow_faults.held_worker_input(detail, changed, "remote"))
+        self.assertIsNone(workflow_faults.held_worker_input({"history": {"turns": [{"id": "turn", "status": "completed"}]}}, snapshot, "remote"))
+
+    def test_nullable_history_items_and_submissions_are_pending_not_proof(self):
+        original = {"key": "key", "event": {"call_id": "call"}}
+        for detail in (None, {}, {"submissions": None}, {"history": None}, {"history": {"items": None}},
+                       {"history": {"items": []}}, {"history": {"items": [{"content": None}]}}):
+            self.assertEqual(research.tool_reads(detail), {})
+            self.assertIsNone(research.delegated_dependencies(detail, "review"))
+            self.assertIsNone(workflow_faults.failed_prerequisite_rejection(detail))
+            self.assertIsNone(workflow_faults.unacknowledged_tool(detail, "call"))
+            self.assertIsNone(workflow_faults.blocked_tool(detail, original))
+        tool = {"tool": "workflow_delegate", "success": False, "error": "dependency requires an explicit saved successful result"}
+        detail = {"history": {"items": [{"content": [{"text": json.dumps(tool)}]}]}}
+        self.assertEqual(workflow_faults.failed_prerequisite_rejection(detail), detail)
+        for changed in (dict(tool, success=True), dict(tool, error=None), dict(tool, tool="other")):
+            wrong = {"history": {"items": [{"content": [{"text": json.dumps(changed)}]}]}}
+            self.assertIsNone(workflow_faults.failed_prerequisite_rejection(wrong))
+        read = {"tool": "workflow_read_result", "success": True, "arguments": None, "output": "raw"}
+        self.assertEqual(research.tool_reads({"history": {"items": [{"content": [{"text": json.dumps(read)}]}]}}), {})
+        read["arguments"] = {"result_id": "result"}
+        self.assertEqual(research.tool_reads({"history": {"items": [{"content": [{"text": json.dumps(read)}]}]}}), {"result": "raw"})
+        delegated = {"tool": "workflow_delegate", "success": True, "arguments": {"role": "review", "dependencies": ["result"]}}
+        self.assertEqual(research.delegated_dependencies({"history": {"items": [{"content": [{"text": json.dumps(delegated)}]}]}}, "review"), ["result"])
+
+
+    def test_missing_remote_fence_uses_structured_state_despite_redacted_error(self):
+        actual = {"recovery_required": True, "last_error": "Recovery or delivery pending; remote details withheld",
+                  "lifecycle": {"reason": "RemoteSessionMissing", "actions": {"continue": False}, "execution_ready": False}}
+        self.assertNotIn("missing", actual["last_error"].lower())  # Previous prose check falsely failed.
+        self.assertTrue(workflow_faults.missing_remote_fence(actual))
+        misleading = dict(actual, last_error="Remote Session missing", lifecycle={**actual["lifecycle"], "reason": "Provisioning"})
+        self.assertFalse(workflow_faults.missing_remote_fence(misleading))
+        for field, value in (("actions", {"continue": True}), ("execution_ready", True)):
+            changed = {**actual, "lifecycle": {**actual["lifecycle"], field: value}}
+            self.assertFalse(workflow_faults.missing_remote_fence(changed))
+        self.assertFalse(workflow_faults.missing_remote_fence({**actual, "recovery_required": False}))
+
+    def test_provider_observation_hold_allows_physically_ready_executor(self):
+        session = {"metadata": {"generation": 3}, "status": {"conditions": [
+            {"type": "Ready", "reason": "ObservationFailed", "status": "False", "observedGeneration": 3}]}}
+        detail = {"last_error": "Recovery or delivery pending; remote details withheld",
+                  "lifecycle": {"execution_ready": True, "delivery_held": False}}
+        self.assertEqual(workflow_faults.observation_hold(session, detail), {"session": session, "detail": detail})
+        self.assertIsNone(workflow_faults.observation_hold(session, {**detail, "last_error": ""}))
+        stale = {**session, "metadata": {"generation": 4}}
+        self.assertIsNone(workflow_faults.observation_hold(stale, detail))
+        unrelated = {**session, "status": {"conditions": [{"type": "WorkspacePrepared", "reason": "ObservationFailed",
+            "status": "False", "observedGeneration": 3}]}}
+        self.assertIsNone(workflow_faults.observation_hold(unrelated, detail))
+
+    def test_consumed_tool_action_keeps_unknown_receipt_and_immutable_submission(self):
+        original = {"key": "action-key", "remote_key": "wire-key", "event": {"call_id": "call", "output": "saved"},
+                    "attempted_at": "timestamp", "attempts": 1, "accepted": False}
+        current = dict(original, blocked="Action no longer pending; result delivery will not be replayed")
+        detail = {"submissions": [current], "lifecycle": {"recovery": {"required": True, "reason": "DeliveryAuditRequired"}}}
+        self.assertEqual(workflow_faults.blocked_tool(detail, original), current)
+        for field, value in (("accepted", True), ("key", "changed"), ("remote_key", "changed"),
+                             ("event", {"call_id": "call", "output": "changed"}),
+                             ("attempted_at", "changed"), ("attempts", 2)):
+            changed = {**detail, "submissions": [dict(current, **{field: value})]}
+            with self.assertRaisesRegex(RuntimeError, "Lost tool ACK changed"):
+                workflow_faults.blocked_tool(changed, original)
+        with self.assertRaisesRegex(RuntimeError, "delivery audit"):
+            workflow_faults.blocked_tool({**detail, "lifecycle": {"recovery": {"required": False}}}, original)
+        self.assertIsNone(workflow_faults.blocked_tool({"submissions": [original]}, original))
+
     def test_research_report_preserves_newlines_and_exact_reference_scope(self):
         actual = {"role": "review", "hostname": "review-pod", "cwd": "/workspace", "verified": True,
                   "max_n": 1000, "case_count": 1001, "references": ["arg", "exp"], "note": "line one\nline two",

@@ -13,6 +13,7 @@ import (
 
 const (
 	_testTaskDetailWork      = "work-detail"
+	_testTaskDetailAuditWork = "audit-work"
 	_testTaskDetailCompleted = "completed"
 )
 
@@ -89,5 +90,106 @@ func TestTaskDetailRetainsAcceptedConfigurationBeforeProvisioning(t *testing.T) 
 		if !strings.Contains(string(raw), want) {
 			t.Fatalf("missing accepted provenance %s: %s", want, raw)
 		}
+	}
+}
+
+// taskDetailDeliveryStore models installation status through the production interface.
+type taskDetailDeliveryStore struct {
+	Storage
+	deliveryErr error
+}
+
+func (s taskDetailDeliveryStore) DeliveryAllowed(context.Context) error { return s.deliveryErr }
+func (s taskDetailDeliveryStore) ClaimWorker(context.Context) (Storage, func(), error) {
+	return nil, nil, errUnavailable
+}
+
+func TestTaskDetailProjectsInstallationAndRecordDeliveryHolds(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		local  bool
+		global error
+		want   bool
+	}{
+		{name: "no holds"},
+		{name: "record hold", local: true, want: true},
+		{name: "installation restore hold", global: errRestoreHeld, want: true},
+		{name: "both holds", local: true, global: errRestoreHeld, want: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := testStore(t)
+			g, _, _ := profileGateway(t, store)
+			g.store = taskDetailDeliveryStore{Storage: store, deliveryErr: tc.global}
+			detail, err := g.taskDetail(t.Context(), Record{DeliveryHeld: tc.local, Task: &Task{ID: "hold-observation", State: _taskOpen}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			projection, ok := detail.(map[string]any)
+			if !ok {
+				t.Fatal("unexpected task detail shape")
+			}
+			if held, ok := projection["delivery_held"].(bool); !ok || held != tc.want {
+				t.Fatalf("delivery_held=%v; want %v", projection["delivery_held"], tc.want)
+			}
+		})
+	}
+}
+
+func TestTaskDetailPropagatesUnknownInstallationDeliveryStatus(t *testing.T) {
+	store := testStore(t)
+	g, _, _ := profileGateway(t, store)
+	g.store = taskDetailDeliveryStore{Storage: store, deliveryErr: errUnavailable}
+	detail, err := g.taskDetail(t.Context(), Record{Task: &Task{ID: "unknown-hold-observation", State: _taskOpen}})
+	if !errors.Is(err, errUnavailable) || detail != nil {
+		t.Fatalf("unknown delivery status projected as known: detail=%v err=%v", detail, err)
+	}
+}
+
+func TestTaskDetailIncludesExistingConversationAuditRecovery(t *testing.T) {
+	for _, tc := range []struct {
+		name            string
+		historyRecovery bool
+		workHeld        bool
+		historyHeld     bool
+		submissions     []Submission
+		actions         map[string]Action
+		want            bool
+	}{
+		{name: "no fence"},
+		{name: "history stream recovery", historyRecovery: true, want: true},
+		{name: "work record hold", workHeld: true, want: true},
+		{name: "history record hold", historyHeld: true, want: true},
+		{name: "blocked delivery", submissions: []Submission{{Key: "ack-output", Blocked: "Action no longer pending; result delivery will not be replayed"}}, want: true},
+		{name: "accepted blocked delivery", submissions: []Submission{{Key: "ack-output", Blocked: "audited", Accepted: true}}},
+		{name: "blocked action", actions: map[string]Action{"audit-blocked-call": {Blocked: "audit required"}}, want: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := testStore(t)
+			g, _, _ := profileGateway(t, store)
+			task := Record{Namespace: _testNamespace, Task: &Task{ID: "task-audit-observation", State: _taskOpen, Members: []TaskMember{{ID: "audit-member", WorkID: _testTaskDetailAuditWork}}}}
+			attempt := WorkAttempt{Number: 1, SessionName: "audit-session", SessionUID: "audit-session-uid", ConversationID: "audit-conversation"}
+			child := Record{DeliveryHeld: tc.workHeld, UID: _testTaskDetailAuditWork, Namespace: _testNamespace, Work: &Work{ID: _testTaskDetailAuditWork, State: _workOpen, Attempts: []WorkAttempt{attempt}}}
+			if err := store.Update(t.Context(), child.UID, func(r *Record) error { *r = child; return nil }); err != nil {
+				t.Fatal(err)
+			}
+			if err := store.Update(t.Context(), attempt.SessionUID, func(r *Record) error {
+				r.Namespace = _testNamespace
+				r.Submissions = tc.submissions
+				r.Actions = tc.actions
+				r.RecoveryRequired = tc.historyRecovery
+				r.DeliveryHeld = tc.historyHeld
+				return nil
+			}); err != nil {
+				t.Fatal(err)
+			}
+			detail, err := g.taskDetail(t.Context(), task)
+			if err != nil {
+				t.Fatal(err)
+			}
+			members := detail.(map[string]any)["members"].([]map[string]any)
+			if got := members[0]["recovery_required"]; got != tc.want {
+				t.Fatalf("recovery_required=%v; want %v", got, tc.want)
+			}
+		})
 	}
 }

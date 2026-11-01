@@ -22,29 +22,49 @@ def invoke_json(checks, prefix, private, *arguments):
     return values[-1]
 
 
+def mapped_task(value, count):
+    """Accepted member intents precede Work, conversation and Session mappings.
+
+    This only establishes public identity mapping. Executor readiness still needs
+    the independent wait_executor/ownership checks before any resource reads.
+    """
+    members = (value or {}).get("members") or []
+    if len(members) == count and all(member.get("conversation_url") and member.get("session_uid") for member in members):
+        return value
+    return None
+
+
+def history_values(detail, field):
+    """Unsaved provider history is legitimately missing or null during polling."""
+    return ((detail or {}).get("history") or {}).get(field) or []
+
+
 def tool_reads(detail):
     reads = {}
-    for item in detail["history"]["items"]:
-        for content in item.get("content", []):
+    for item in history_values(detail, "items"):
+        for content in item.get("content") or []:
             try:
                 value = json.loads(content.get("text", ""))
             except (TypeError, ValueError):
                 continue
             if isinstance(value, dict) and value.get("tool") == "workflow_read_result" and value.get("success"):
-                reads[value["arguments"]["result_id"]] = value["output"]
+                arguments = value.get("arguments") or {}
+                if isinstance(arguments, dict) and isinstance(arguments.get("result_id"), str) and isinstance(value.get("output"), str):
+                    reads[arguments["result_id"]] = value["output"]
     return reads
 
 
 def delegated_dependencies(detail, role):
-    for item in detail["history"]["items"]:
-        for content in item.get("content", []):
+    for item in history_values(detail, "items"):
+        for content in item.get("content") or []:
             try:
                 value = json.loads(content.get("text", ""))
             except (TypeError, ValueError):
                 continue
-            if (isinstance(value, dict) and value.get("tool") == "workflow_delegate" and value.get("success") and
-                    value["arguments"]["role"] == role):
-                return value["arguments"].get("dependencies", [])
+            if isinstance(value, dict) and value.get("tool") == "workflow_delegate" and value.get("success"):
+                arguments = value.get("arguments") or {}
+                if isinstance(arguments, dict) and arguments.get("role") == role:
+                    return arguments.get("dependencies") or []
     return None
 
 
@@ -88,7 +108,7 @@ def run(checks, api, base, directory, certificate, report, evidence, run_id, run
 
     def task_with_members(count):
         value = get(path)
-        return value if value and len(value["members"]) == count else None
+        return mapped_task(value, count)
 
     before = fixture_counts()
     sandbox.provider_control(checks, {"executorHold": True})
@@ -98,7 +118,7 @@ def run(checks, api, base, directory, certificate, report, evidence, run_id, run
         receipt = started["receipt"]
         ensure(started["state"] == "accepted" and receipt["acceptance"] == "committed", "Research start lacks durable acceptance")
         path, identifier = receipt["task_url"], receipt["task_id"]
-        concurrent = checks.wait("research both independent assignments accepted", lambda: task_with_members(3), 240)
+        concurrent = checks.wait("research independent assignments mapped to public conversations and Sessions", lambda: task_with_members(3), 240)
         pairs = {}
         for member in concurrent["members"]:
             if member["is_coordinator"]:

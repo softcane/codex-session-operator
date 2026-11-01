@@ -5,6 +5,8 @@ or real credentials, and never import the fixture's implementation as an oracle.
 """
 
 import json
+import concurrent.futures
+import http.client
 import os
 from pathlib import Path
 import socket
@@ -203,6 +205,73 @@ class LifecycleFixtureContractTests(unittest.TestCase):
             self.assertFalse(json.loads(failed.stdout)["verified"])
 
 
+    def test_workflow_tool_ack_barrier_deduplicates_commits_and_releases_lost_response(self):
+        session = self.post(SESSIONS, {"environment": {"type": "self_hosted"}, "input": "WORKFLOW_FAULT_ACK"})
+        path = SESSIONS + "/" + session["id"]
+        action = self.read(path)["required_actions"][0]
+        self.post("/control", {"holdToolResultName": "workflow_delegate"})
+        event = {"events": [{"type": "agent.session.input.tool_result", "turn_id": action["turn_id"],
+                            "call_id": action["call_id"], "success": True, "output": '{}'}]}
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            future = pool.submit(self.request, "POST", path + "/events", event, "same-result-key")
+            try:
+                deadline = time.monotonic() + 2
+                while time.monotonic() < deadline:
+                    snapshot = self.read("/counts")
+                    if snapshot["heldToolResponses"]:
+                        break
+                    time.sleep(0.01)
+                self.assertEqual(len(snapshot["heldToolResponses"]), 1)
+                self.assertEqual(snapshot["toolResultCommits"][0]["accepted"], 1)
+                self.assertFalse(future.done())
+                retry = pool.submit(self.request, "POST", path + "/events", event, "same-result-key")
+                # The held key applies to retries too; no duplicate output event
+                # is committed while the gateway still lacks an ACK.
+                time.sleep(0.05)
+                self.assertFalse(retry.done())
+                self.assertEqual(self.read("/counts")["toolResultCommits"][0]["accepted"], 1)
+                self.assertEqual(self.read(path)["required_actions"], [])
+            finally:
+                self.post("/control", {"releaseToolResponses": True})
+            for response in (future, retry):
+                with self.assertRaises((OSError, http.client.HTTPException)):
+                    response.result(timeout=3)
+        self.assertEqual(self.request("POST", path + "/events", event, "same-result-key")[0], 204)
+        self.assertEqual(self.read("/counts")["toolResultCommits"][0]["accepted"], 1)
+        self.assertEqual(self.read("/counts")["heldToolResponses"], [])
+
+    def test_workflow_fault_pending_long_and_failed_actions_remain_explicit(self):
+        pending = self.post(SESSIONS, {"environment": {"type": "self_hosted"}, "input": "WORKFLOW_FAULT_PENDING"})
+        self.assertEqual(self.request("GET", SESSIONS + "/" + pending["id"])[0], 503)
+        self.assertEqual(self.read("/counts")["pendingWorkflowActions"][0]["name"], "workflow_delegate")
+        self.post("/control", {"reset": True})
+        for mode, expected_timeout in (("LONG", 120000), ("FAIL", 15000)):
+            coordinator = self.post(SESSIONS, {"environment": {"type": "self_hosted"}, "input": "WORKFLOW_FAULT_" + mode})
+            path = SESSIONS + "/" + coordinator["id"]
+            delegate = self.read(path)["required_actions"][0]
+            worker = self.post(SESSIONS, {"environment": {"type": "self_hosted"}, "input": delegate["arguments"]["text"]})
+            worker_path = SESSIONS + "/" + worker["id"]
+            job = self.read("/executor/commands?environment_id=" + worker["environment"]["id"])[0]
+            self.assertEqual(job["timeout_ms"], expected_timeout)
+            if mode == "LONG":
+                self.assertIn("interrupted-started.json", job["argv"][2])
+                continue
+            completed = subprocess.run(job["argv"], cwd=self.directory.name, capture_output=True, text=True, timeout=10)
+            self.assertEqual(completed.returncode, 1)
+            self.post("/executor/result", {"environment_id": worker["environment"]["id"], "id": job["id"],
+                "exit_code": completed.returncode, "output": completed.stdout})
+            result = self.read(worker_path)["required_actions"][0]
+            self.assertEqual(result["arguments"]["outcome"], "failed")
+            self.request("POST", path + "/events", {"events": [{"type": "agent.session.input.tool_result",
+                "turn_id": delegate["turn_id"], "call_id": delegate["call_id"], "success": True, "output": '{}'}]})
+            self.request("POST", path + "/events", {"events": [{"type": "agent.session.input.message", "input": [{"content": [
+                {"text": "Saved workflow result result-failed from assignment member-failed (diagnose) has outcome failed."}]}]}]})
+            read = self.read(path)["required_actions"][0]
+            self.request("POST", path + "/events", {"events": [{"type": "agent.session.input.tool_result",
+                "turn_id": read["turn_id"], "call_id": read["call_id"], "success": True, "output": json.dumps(result["arguments"])}]})
+            review = self.read(path)["required_actions"][0]
+            self.assertEqual(review["arguments"]["dependencies"], ["result-failed"])
+
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory(prefix="codex-lifecycle-fixture-")
         self.addCleanup(self.directory.cleanup)
@@ -237,11 +306,11 @@ class LifecycleFixtureContractTests(unittest.TestCase):
             self.process.kill()
             self.process.wait(timeout=5)
 
-    def request(self, method, path, body=None):
+    def request(self, method, path, body=None, key=None):
         request = urllib.request.Request(
             f"http://127.0.0.1:{self.port}" + path,
             data=None if body is None else json.dumps(body).encode(),
-            method=method, headers={"Content-Type": "application/json", "Idempotency-Key": str(time.monotonic_ns())},
+            method=method, headers={"Content-Type": "application/json", "Idempotency-Key": key or str(time.monotonic_ns())},
         )
         try:
             response = urllib.request.urlopen(request, timeout=3)

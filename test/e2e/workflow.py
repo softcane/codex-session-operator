@@ -10,6 +10,7 @@ import cli
 import sandbox
 import support
 import research
+import workflow_faults
 
 NS, ensure = support.NS, support.ensure
 
@@ -192,3 +193,5 @@ def run(checks, api, base, directory, certificate, report, evidence, run_id, run
     report["checks"]["workflowFirstDelegationProductionCLIPostgreSQLSandbox"] = True
 
     research.run(checks, api, base, directory, certificate, report, evidence, run_id, runtime, fixture_counts)
+
+    workflow_faults.run(checks, api, base, directory, certificate, report, evidence, run_id, runtime, replace_gateway, fixture_counts)
